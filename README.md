@@ -1,11 +1,15 @@
 # Strait
 
-<table>
-  <tr>
-    <td valign="middle"><img src="nat-tunnel/assets/logo/strait-logo-tile.png" alt="Strait logo" width="160"></td>
-    <td valign="middle"><b>Use another person's home internet connection, directly, from your own device.</b></td>
-  </tr>
-</table>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="nat-tunnel/assets/logo/strait-logo-dark.png">
+  <img src="nat-tunnel/assets/logo/strait-logo-light.png" alt="Strait logo" width="170" align="left">
+</picture>
+
+<br><br><br>
+
+**Use another person's home internet connection, directly, from your own device.**
+
+<br clear="left">
 
 ## What is Strait?
 
