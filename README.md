@@ -1,4 +1,4 @@
-<img src="nat-tunnel/assets/logo/strait-logo.png" alt="Strait logo" width="88" align="left">
+<img src="nat-tunnel/assets/logo/strait-logo-tile.png" alt="Strait logo" width="88" align="left">
 
 # Strait
 
