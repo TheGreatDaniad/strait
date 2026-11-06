@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="nat-tunnel/assets/logo/strait-logo.png" alt="Strait logo" width="220">
+</p>
+
 # Strait
 
 **Use another person's home internet connection, directly, from your own device.**
