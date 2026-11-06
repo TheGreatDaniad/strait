@@ -1,0 +1,7 @@
+// The ONLY file to edit for a device build (or pass these as env/xcodebuild settings, see device-test.sh).
+// Free personal Apple IDs cannot use the Network Extension packet-tunnel entitlement: a paid
+// Apple Developer Program team is required.
+DEVELOPMENT_TEAM = 
+// Reverse-DNS prefix you control. App = $(STRAIT_BUNDLE_BASE), extension = $(STRAIT_BUNDLE_BASE).PacketTunnel,
+// app group = group.$(STRAIT_BUNDLE_BASE).
+STRAIT_BUNDLE_BASE = org.reactjs.native.example.StraitMobile

@@ -1,0 +1,27 @@
+# Full configuration fixture used by tests/integration.rs
+
+wireguard:
+  listen_port: 51820
+  private_key: "test-private-key"
+  public_key: "test-public-key"
+  allowed_ips: "10.0.0.0/24"
+  endpoint: "198.51.100.7:51820"
+
+nat_traversal:
+  turn_server: "turn.example.com"
+  turn_port: 3478
+  turn_username: "turn-user"
+  turn_password: "turn-pass"
+  stun_server: "stun.example.com"
+  stun_port: 3478
+  use_turn: false
+
+remote_access:
+  port: 9001
+  max_connections: 8
+  device_name: "test-device"
+  device_id: "test-device-0001"
+
+logging:
+  level: "debug"
+  log_file: null

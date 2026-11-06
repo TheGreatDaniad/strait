@@ -1,0 +1,33 @@
+{
+  "migIndex": 1,
+  "data": [
+    {
+      "path": "src/assets/fonts/Fraunces-600.ttf",
+      "sha1": "adee1cf456b4f4b7d6f0c87ab3c9872ae69df0a9"
+    },
+    {
+      "path": "src/assets/fonts/Inter-400.ttf",
+      "sha1": "8689d6da8d63c09afe0e12e7d4a04b08951c093e"
+    },
+    {
+      "path": "src/assets/fonts/Inter-500.ttf",
+      "sha1": "43d582ed43ef32163932bcd069c8785c183a5453"
+    },
+    {
+      "path": "src/assets/fonts/Inter-600.ttf",
+      "sha1": "a9e3932f2dcb57f27d637961fdc86f73c440ee1d"
+    },
+    {
+      "path": "src/assets/fonts/Inter-700.ttf",
+      "sha1": "49bcb8aae04e666cd88f562be364706d8f7c0477"
+    },
+    {
+      "path": "src/assets/fonts/JetBrainsMono-400.ttf",
+      "sha1": "9fc00e8d856fcd01ba269a24b6d7227cce2408e5"
+    },
+    {
+      "path": "src/assets/fonts/JetBrainsMono-500.ttf",
+      "sha1": "6b7d7e5ba998c924f51d936e74dec1d8405530f0"
+    }
+  ]
+}

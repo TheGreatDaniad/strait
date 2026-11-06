@@ -1,0 +1,77 @@
+{
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "flow": "",
+            "id": "22847d9d-4c7a-4676-bc2d-0b8f3c9ab2e0"
+          }
+        ],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": false
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "privateKey": "oNtoEG08dozxg8VEfxtn1gs6lsmQYu9hR8lK8mT-k1o",
+          "serverNames": [
+            "www.example.org"
+          ],
+          "shortIds": [
+            "75406c0596d6c37f"
+          ],
+          "target": "127.0.0.1:8443"
+        },
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "auto",
+          "path": "/c48f92869a665906"
+        }
+      },
+      "tag": "in-reality"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "error": "/run/strait/xray.log",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [
+          {
+            "action": "allow",
+            "ip": [
+              "127.0.0.1"
+            ],
+            "network": "udp",
+            "port": "7100"
+          },
+          {
+            "action": "block"
+          }
+        ],
+        "redirect": "127.0.0.1:7100"
+      },
+      "tag": "to-strait"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "inboundTag": [
+          "in-reality"
+        ],
+        "outboundTag": "to-strait"
+      }
+    ]
+  }
+}

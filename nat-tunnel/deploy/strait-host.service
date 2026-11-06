@@ -1,0 +1,71 @@
+# Multiplexed host: one UDP port, many clients. Default exit is userspace (--userspace):
+# TCP/UDP from clients is terminated inside the process and re-dialled from this machine,
+# so no TUN device, no capabilities, no NAT rules. No --relay: no relay, no default server.
+# The invite (which contains the key) lives in /etc/strait/host.env, never in this file.
+# STRAIT_HOST_ARGS (also in host.env) selects the mode; --tun only selects the multiplexed
+# mode (its address is forced to 10.7.0.1/16), --userspace skips the kernel device.
+#
+# TUN exit (opt-in, kernel routing): in host.env use
+#   STRAIT_HOST_ARGS=--tun 10.7.0.1/16 --max-clients 8
+# and edit this unit: comment out the "userspace" lines marked [U], uncomment the lines
+# marked [T], then `sysctl -w net.ipv4.ip_forward=1` (persist in /etc/sysctl.d/) and add NAT:
+#   nft add table ip strait; nft 'add chain ip strait post { type nat hook postrouting priority 100; }'
+#   nft add rule ip strait post ip saddr 10.7.0.0/16 oifname "eth0" masquerade   (eth0 = uplink)
+# The binary does not set up forwarding or NAT itself.
+[Unit]
+Description=Strait host (multiplexed, direct UDP, invite-based)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/strait/host.env
+ExecStart=/usr/local/bin/nat-tunnel host --invite ${STRAIT_INVITE} $STRAIT_HOST_ARGS
+# Throwaway uid per start; owns nothing on disk.
+DynamicUser=yes
+Restart=on-failure
+RestartSec=2
+# Caps a runaway or abusive flow count (userspace exit holds per-flow state).
+MemoryMax=256M
+TasksMax=512
+# setuid binaries cannot raise privileges.
+NoNewPrivileges=yes
+# [U] userspace exit needs no capability at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# [T] TUN exit: CAP_NET_ADMIN to create tun0 and run `ip route/rule`.
+#CapabilityBoundingSet=CAP_NET_ADMIN
+#AmbientCapabilities=CAP_NET_ADMIN
+# [T] ...and the device node (PrivateDevices below must then be "no"; `ip` must be installed).
+#DeviceAllow=/dev/net/tun rw
+#DevicePolicy=closed
+# Read-only OS tree; the host writes nothing.
+ProtectSystem=strict
+# No access to /home, /root.
+ProtectHome=yes
+# Private /tmp.
+PrivateTmp=yes
+# [U] hides /dev except null/zero/random (getrandom needs none). [T] set to "no".
+PrivateDevices=yes
+# Blocks writes to /proc/sys, /sys; /proc/net/route (UPnP gateway lookup) stays readable.
+ProtectKernelTunables=yes
+# No module loading.
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# UDP/TCP over v4+v6 (dual-stack bind, STUN, SSDP/NAT-PMP, exit dials, DNS).
+# [T] TUN exit also needs AF_NETLINK: `ip route/rule` talk to the kernel over netlink.
+RestrictAddressFamilies=AF_INET AF_INET6
+#RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+# No new namespaces (no container escapes through clone).
+RestrictNamespaces=yes
+LockPersonality=yes
+# Allowlist of ordinary service syscalls (socket, epoll, getrandom, futex, ...).
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# W^X: the Rust binary has no JIT. If the service dies with SIGSYS/SIGSEGV at start, remove first.
+MemoryDenyWriteExecute=yes
+# NOT set on purpose: IPAddressDeny/IPAddressAllow. The userspace exit dials arbitrary
+# TCP/UDP destinations on behalf of clients, and STUN/UPnP/DNS go anywhere/LAN.
+# NOT set: ProcSubset=pid (would hide /proc/net/route), PrivateNetwork (needs the network).
+
+[Install]
+WantedBy=multi-user.target

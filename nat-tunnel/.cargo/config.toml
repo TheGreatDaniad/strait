@@ -1,0 +1,5 @@
+# Applies to processes cargo starts (tests, `cargo run`), never to an installed binary.
+# The test suite and the labs run every peer on loopback / private addresses, which the
+# rendezvous candidate filter (transport::candidate_ok) refuses by default.
+[env]
+NAT_TUNNEL_RV_ALLOW_LOCAL = "1"

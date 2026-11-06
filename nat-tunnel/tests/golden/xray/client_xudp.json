@@ -1,0 +1,53 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10800,
+      "protocol": "tunnel",
+      "settings": {
+        "allowedNetwork": "udp",
+        "rewriteAddress": "127.0.0.1",
+        "rewritePort": 7100
+      },
+      "tag": "in-strait"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "error": "/run/strait/xray.log",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "mux": {
+        "concurrency": -1,
+        "enabled": true,
+        "xudpConcurrency": 8,
+        "xudpProxyUDP443": "reject"
+      },
+      "protocol": "vless",
+      "settings": {
+        "address": "203.0.113.7",
+        "encryption": "none",
+        "flow": "",
+        "id": "22847d9d-4c7a-4676-bc2d-0b8f3c9ab2e0",
+        "port": 443
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "realitySettings": {
+          "fingerprint": "firefox",
+          "publicKey": "tlannVY4XPvuZ3yLdVXXlCMll1_uYWyOrOwvi1smEVc",
+          "serverName": "www.example.org",
+          "shortId": "75406c0596d6c37f"
+        },
+        "security": "reality",
+        "xhttpSettings": {
+          "mode": "stream-one",
+          "path": "/c48f92869a665906"
+        }
+      },
+      "tag": "out"
+    }
+  ]
+}

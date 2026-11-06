@@ -1,0 +1,42 @@
+# Optional rendezvous server. NOT enabled by default; see SELF_HOSTING.md.
+# Uses the `relay` subcommand (current name); switch to `signal` if/when the alias lands.
+[Unit]
+Description=Strait signaling server (UDP rendezvous only, never forwards payload)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nat-tunnel relay --port 7000
+DynamicUser=yes
+Restart=on-failure
+RestartSec=2
+MemoryMax=64M
+TasksMax=64
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# The server only does IPv4 UDP (the signaling protocol cannot carry IPv6).
+RestrictAddressFamilies=AF_INET
+# Optional rate-limit / room-expiry knobs (RATE = PING msgs/s per IP, BURST, EXPIRY = seconds; placeholders, defaults in src/relay.rs):
+#Environment=STRAIT_SIGNAL_RATE=20
+#Environment=STRAIT_SIGNAL_BURST=40
+#Environment=STRAIT_SIGNAL_EXPIRY=45
+# It only answers public peers; no link-local or multicast traffic. (Do not add an
+# IPAddressAllow=any: allow-list entries win over IPAddressDeny.)
+IPAddressDeny=link-local multicast
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Reasons: no caps (above), no /home, read-only OS, no kernel knobs, no namespaces, @system-service allowlist.
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

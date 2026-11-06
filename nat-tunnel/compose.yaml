@@ -1,0 +1,173 @@
+name: nat-tunnel-e2e
+
+x-nat-tunnel: &nat-tunnel
+  image: nat-tunnel:dev
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+
+services:
+  # Stands in for the public internet: three separate L3 links, no NAT.
+  # Without this hop Docker's own bridges can short-circuit packets between
+  # the two WAN interfaces, which would fake a direct path.
+  internet:
+    <<: *nat-tunnel
+    entrypoint: ["/usr/local/bin/internet-entrypoint.sh"]
+    privileged: true
+    networks:
+      wan_a:
+        ipv4_address: 172.29.0.254
+      wan_b:
+        ipv4_address: 172.30.0.254
+      public:
+        ipv4_address: 172.31.0.254
+
+  router-a:
+    <<: *nat-tunnel
+    entrypoint: ["/usr/local/bin/router-entrypoint.sh"]
+    privileged: true
+    environment:
+      WAN_ADDR: "172.29.0.2/24"
+      WAN_GATEWAY: "172.29.0.254"
+      LAN_CIDR: "172.28.1.0/24"
+      PEER_PUBLIC: "172.30.0.2"
+      BLOCK_DIRECT: "${BLOCK_DIRECT:-0}"
+      DELAY_MS: "${DELAY_MS:-}"
+      LOSS_PCT: "${LOSS_PCT:-}"
+    networks:
+      net_a:
+        ipv4_address: 172.28.1.254
+      wan_a:
+        ipv4_address: 172.29.0.2
+
+  router-b:
+    <<: *nat-tunnel
+    entrypoint: ["/usr/local/bin/router-entrypoint.sh"]
+    privileged: true
+    environment:
+      WAN_ADDR: "172.30.0.2/24"
+      WAN_GATEWAY: "172.30.0.254"
+      LAN_CIDR: "172.28.2.0/24"
+      PEER_PUBLIC: "172.29.0.2"
+      BLOCK_DIRECT: "${BLOCK_DIRECT:-0}"
+      # Multi-client lab: extra LAN hosts whose WAN-side NETMAP addresses
+      # need a route via the LAN interface.
+      EXTRA_LAN_HOSTS: "${EXTRA_LAN_HOSTS:-}"
+    networks:
+      net_b:
+        ipv4_address: 172.28.2.254
+      wan_b:
+        ipv4_address: 172.30.0.2
+
+  relay:
+    <<: *nat-tunnel
+    command: ["relay", "--port", "7000"]
+    # Exposed so a native macOS client can join the same lab.
+    ports:
+      - "127.0.0.1:7000:7000/udp"
+    environment:
+      RUST_LOG: "${RUST_LOG:-info}"
+    networks:
+      public:
+        ipv4_address: 172.31.0.2
+
+  peer-a:
+    <<: *nat-tunnel
+    entrypoint: ["/usr/local/bin/peer-entrypoint-a.sh"]
+    # TUN mode needs to create an interface and rewrite routes.
+    privileged: true
+    environment:
+      TUN: "${TUN:-0}"
+      ROOM: "${ROOM:-e2e}"
+      MAX_CLIENTS: "${MAX_CLIENTS:-1}"
+      NAT_TUNNEL_RELAY_ONLY: "${NAT_TUNNEL_RELAY_ONLY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    depends_on:
+      - relay
+    networks:
+      net_a:
+        ipv4_address: 172.28.1.2
+
+  peer-b:
+    <<: *nat-tunnel
+    entrypoint: ["/usr/local/bin/peer-entrypoint-b.sh"]
+    privileged: true
+    environment:
+      TUN: "${TUN:-0}"
+      ROOM: "${ROOM:-e2e}"
+      TUN_ADDR: "10.7.0.2/24"
+      GATEWAY: "10.7.0.1"
+      NAT_TUNNEL_NO_PROBE: "1"
+      NAT_TUNNEL_RELAY_ONLY: "${NAT_TUNNEL_RELAY_ONLY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    depends_on:
+      - relay
+    networks:
+      net_b:
+        ipv4_address: 172.28.2.2
+
+  # Extra clients for the max-clients test; only started with --profile multi.
+  peer-b2:
+    <<: *nat-tunnel
+    profiles: ["multi"]
+    entrypoint: ["/usr/local/bin/peer-entrypoint-b.sh"]
+    privileged: true
+    environment:
+      TUN: "1"
+      ROOM: "e2e-2"
+      TUN_ADDR: "10.7.1.2/24"
+      GATEWAY: "10.7.1.1"
+      NAT_TUNNEL_NO_PROBE: "1"
+      NAT_TUNNEL_RELAY_ONLY: "${NAT_TUNNEL_RELAY_ONLY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    depends_on:
+      - relay
+    networks:
+      net_b:
+        ipv4_address: 172.28.2.4
+
+  # A client beyond the configured lane count: must never get a session.
+  peer-b3:
+    <<: *nat-tunnel
+    profiles: ["multi"]
+    entrypoint: ["/usr/local/bin/peer-entrypoint-b.sh"]
+    privileged: true
+    environment:
+      TUN: "1"
+      ROOM: "e2e-3"
+      TUN_ADDR: "10.7.2.2/24"
+      GATEWAY: "10.7.2.1"
+      NAT_TUNNEL_RELAY_ONLY: "${NAT_TUNNEL_RELAY_ONLY:-}"
+      RUST_LOG: "${RUST_LOG:-info}"
+    depends_on:
+      - relay
+    networks:
+      net_b:
+        ipv4_address: 172.28.2.5
+
+networks:
+  net_a:
+    name: nat-tunnel-e2e-net_a
+    ipam:
+      config:
+        - subnet: 172.28.1.0/24
+  net_b:
+    name: nat-tunnel-e2e-net_b
+    ipam:
+      config:
+        - subnet: 172.28.2.0/24
+  wan_a:
+    name: nat-tunnel-e2e-wan_a
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+  wan_b:
+    name: nat-tunnel-e2e-wan_b
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  public:
+    name: nat-tunnel-e2e-public
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

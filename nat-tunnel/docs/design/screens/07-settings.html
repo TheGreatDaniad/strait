@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Settings</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@1,9..144,600&amp;family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap">
+<style>
+body{margin:0;background:#F5F8FA}
+a{color:#0E5A7A}a:hover{color:#0A4560}
+.tab:hover{color:#0F1C24 !important}
+a:focus-visible,input:focus-visible{outline:2px solid #0E5A7A;outline-offset:2px}
+.sw{appearance:none;-webkit-appearance:none;margin:0;flex:none;width:40px;height:24px;border-radius:12px;background:#B9C7D0;position:relative;cursor:pointer}
+.sw::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#FFFFFF;box-shadow:0 1px 2px rgba(15,28,36,0.2);transition:left .15s}
+.sw:checked{background:#0E5A7A}
+.sw:checked::after{left:19px}
+</style>
+</head>
+<body>
+<div style="width: 420px; height: 560px; box-sizing: border-box; display: flex; flex-direction: column; background: #F5F8FA; color: #0F1C24; font-family: Inter, system-ui, sans-serif; font-size: 14px">
+  <header style="display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 0">
+    <span style="display: flex; align-items: center; gap: 8px; font-family: Fraunces, Georgia, serif; font-style: italic; font-weight: 600; font-size: 19px; letter-spacing: -0.01em"><svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="st-g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0E5A7A"></stop><stop offset="1" stop-color="#0F9D8A"></stop></linearGradient></defs><path d="M17 5.5C13 3.5 7 5 7.5 9S16.5 13 16.5 16.5 10 21 6.5 18.5" stroke="url(#st-g)" stroke-width="2.8" fill="none" stroke-linecap="round"></path><circle cx="17.5" cy="5.6" r="2.5" fill="#0E5A7A"></circle><circle cx="6.3" cy="18.4" r="2.5" fill="#0F9D8A"></circle></svg>Strait</span>
+    <span style="display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 13px; background: #E9EFF3; color: #576773; font-size: 12px; font-weight: 600"><span style="width: 7px; height: 7px; border-radius: 50%; background: #8A9AA6"></span>Idle</span>
+  </header>
+  <nav aria-label="Main" style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; margin: 12px 20px 0; padding: 4px; border-radius: 12px; background: #E9EFF3">
+    <a href="01-connect-idle.html" class="tab" style="display: flex; align-items: center; justify-content: center; height: 36px; border-radius: 9px; color: #576773; text-decoration: none; font-weight: 500">Connect</a>
+    <a href="05-host-not-sharing.html" class="tab" style="display: flex; align-items: center; justify-content: center; height: 36px; border-radius: 9px; color: #576773; text-decoration: none; font-weight: 500">Host</a>
+    <a href="#" aria-current="page" style="display: flex; align-items: center; justify-content: center; height: 36px; border-radius: 9px; background: #FFFFFF; box-shadow: 0 1px 2px rgba(15,28,36,0.1); color: #0F1C24; text-decoration: none; font-weight: 600">Settings</a>
+  </nav>
+
+  <div style="padding: 20px; display: flex; flex-direction: column; gap: 20px">
+    <section style="display: flex; flex-direction: column; gap: 8px">
+      <h1 style="margin: 0; font-size: 13px; font-weight: 600; color: #33424D">Privacy</h1>
+      <div style="background: #FFFFFF; border: 1px solid #DFE7EC; border-radius: 12px">
+        <label style="display: flex; align-items: center; gap: 16px; padding: 14px 16px; border-bottom: 1px solid #EEF3F6; cursor: pointer">
+          <span style="flex: 1; display: flex; flex-direction: column; gap: 2px"><span style="font-weight: 500">Kill switch</span><span style="font-size: 13px; color: #576773">Block traffic if the tunnel drops</span></span>
+          <input class="sw" type="checkbox" checked>
+        </label>
+        <label style="display: flex; align-items: center; gap: 16px; padding: 14px 16px; cursor: pointer">
+          <span style="flex: 1; display: flex; flex-direction: column; gap: 2px"><span style="font-weight: 500">Block IPv6</span><span style="font-size: 13px; color: #576773">Prevents leaks around the tunnel</span></span>
+          <input class="sw" type="checkbox" checked>
+        </label>
+      </div>
+    </section>
+    <section style="display: flex; flex-direction: column; gap: 8px">
+      <label for="relay" style="font-size: 13px; font-weight: 600; color: #33424D">Relay server</label>
+      <input id="relay" type="text" value="relay.example.com:7000" style="height: 44px; box-sizing: border-box; padding: 0 14px; border: 1px solid #CCD7DE; border-radius: 10px; background: #FFFFFF; color: #0F1C24; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 13px">
+      <span style="font-size: 13px; color: #576773">Used when you host. Included in your invite code.</span>
+    </section>
+  </div>
+
+  <p style="margin: auto 0 0; padding: 20px; text-align: center; font-size: 12px; color: #576773">Strait [VERSION]</p>
+</div>
+</body>
+</html>

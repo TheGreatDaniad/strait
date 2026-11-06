@@ -1,0 +1,86 @@
+[package]
+name = "nat-tunnel"
+version = "0.3.0"
+edition = "2021"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["gui", "rv-sig", "rv-trk", "rv-nostr", "rv-dht", "rv-ntfy", "rv-mqtt"]
+gui = ["dep:eframe"]
+# C ABI for the iOS Network Extension (include/strait.h); on macOS it also swaps the TUN backend for the fd one (harness only).
+ffi = []
+# Rendezvous backends. `rv-sig` is compiled unconditionally (no extra deps); the others are
+# placeholders that backend implementers wire to their own optional deps.
+rv-sig = []
+rv-trk = []
+rv-nostr = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:secp256k1"]
+rv-dht = ["dep:mainline"]
+rv-ntfy = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+rv-mqtt = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+# Carrier placeholders (docs/TUNNEL_CARRIERS.md); each gets its deps when implemented. Not in default yet.
+cr-ss = ["dep:shadowsocks"]
+cr-ws = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:tokio-tungstenite", "dep:rcgen"]
+cr-awg = []
+cr-xray = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+log = "0.4"
+env_logger = "0.10"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+async-trait = "0.1"
+tokio-util = "0.7"
+tun = { version = "0.8.14", features = ["async"] }
+socket2 = "0.6.5"
+libc = "0.2.191"
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+eframe = { version = "0.37.0", optional = true }
+futures = "0.3"
+netstack-smoltcp = "0.2.4"
+x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+zeroize = "1"
+# Shared TLS for the rv-nostr / rv-ntfy / rv-mqtt backends: rustls + ring (no OpenSSL, no aws-lc: Android/Windows build).
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+# BIP-340 Schnorr for rv-nostr (C libsecp256k1 vendored; no rand crate: key bytes come from OsRng).
+secp256k1 = { version = "0.29", default-features = false, features = ["std"], optional = true }
+# rv-dht: Mainline DHT (BEP 44), client mode only. Pinned exactly.
+# cr-ws: own WebSocket carrier. Same tungstenite as the dev-dependency (the dev line below stays valid); rcgen builds the
+# self-signed identity cert that is a pure function of the invite key (ring backend, no pem / aws-lc).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"], optional = true }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"], optional = true }
+mainline = { version = "=8.0.1", optional = true, default-features = false, features = ["async"] }
+# cr-ss: embedded Shadowsocks-2022 (UDP relay only; no server/local binaries, no TLS).
+shadowsocks = { version = "=1.25.0", optional = true, default-features = false, features = ["aead-cipher-2022"] }
+
+[dev-dependencies]
+# test-only fake Nostr relay (WebSocket server side)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Dev/test builds: same optimisation level but no fat LTO and parallel codegen. Roughly 3-5x faster
+# to build and much smaller test binaries (the release profile's LTO relinks every test binary).
+# Use: cargo test --profile fast ...   (artifacts land in target/fast/, not target/release/)
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
+incremental = false

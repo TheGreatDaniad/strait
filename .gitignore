@@ -1,0 +1,14 @@
+target/
+node_modules/
+build/
+Pods/
+.gradle/
+.cxx/
+DerivedData/
+*.apk
+*.aab
+*.keystore
+*.log
+.env
+.env.*
+.DS_Store

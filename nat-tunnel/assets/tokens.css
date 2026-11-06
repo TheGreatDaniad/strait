@@ -1,0 +1,63 @@
+/* Strait design tokens — mirrors tokens.json */
+:root {
+  /* Neutrals */
+  --st-bg: #F5F8FA;
+  --st-surface: #FFFFFF;
+  --st-subtle: #EEF3F6;
+  --st-track: #E9EFF3;
+  --st-field-disabled: #F6F9FB;
+  --st-border: #DFE7EC;
+  --st-border-strong: #CCD7DE;
+  --st-line: #B9C7D0;
+  --st-icon-muted: #8A9AA6;
+  --st-text-muted: #576773;
+  --st-text-label: #33424D;
+  --st-text: #0F1C24;
+
+  /* Deep sea — you, actions, sharing/connecting */
+  --st-sea: #0E5A7A;
+  --st-sea-hover: #0A4560;
+  --st-sea-strong: #083B52;
+  --st-sea-line: #9CC3D6;
+  --st-sea-border: #C3DCE8;
+  --st-sea-tint: #E3EFF5;
+
+  /* Lagoon — peer, connected */
+  --st-lagoon: #0F9D8A;
+  --st-lagoon-text: #0B7666;
+  --st-lagoon-strong: #075E52;
+  --st-lagoon-line: #8FD6CA;
+  --st-lagoon-border: #BCE7DF;
+  --st-lagoon-tint: #E0F5F1;
+  --st-lagoon-on-sea: #7FE3D3;
+
+  /* Ember — errors, disconnect */
+  --st-ember: #C2410C;
+  --st-ember-text: #9A3412;
+  --st-ember-border: #F5CDB5;
+  --st-ember-tint: #FDEBE1;
+  --st-danger-text: #B43C0D;
+  --st-danger-border: #F1C2A6;
+
+  --st-on-primary: #FFFFFF;
+
+  /* Type */
+  --st-font-brand: 'Fraunces', Georgia, serif;
+  --st-font-ui: 'Inter', system-ui, sans-serif;
+  --st-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* Radii */
+  --st-r-tab: 9px;
+  --st-r-input: 10px;
+  --st-r-button: 12px;
+  --st-r-chip: 13px;
+  --st-r-card: 16px;
+
+  /* Sizes */
+  --st-h-button: 48px;
+  --st-h-input: 44px;
+  --st-h-tab: 36px;
+  --st-h-chip: 26px;
+  --st-node: 52px;
+  --st-pad-window: 20px;
+}
