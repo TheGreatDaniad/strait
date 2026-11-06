@@ -30,7 +30,7 @@ for networks that block or inspect traffic:
 
 Two devices behind home routers cannot normally find each other. When a signaling step is needed, Strait uses public services
 (BitTorrent trackers, Nostr relays, the BitTorrent DHT, ntfy, MQTT brokers), so you do not have to run a signaling server.
-The host decides which ones to use, and they only ever see an encrypted blob, never your traffic.
+The host decides which ones to use, and they only ever see an encrypted blob. They are used just for the first meeting: once the tunnel is connected, your traffic does not pass through them at all, it goes straight between the two devices.
 
 ## In the end
 
