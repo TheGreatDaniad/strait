@@ -94,4 +94,8 @@ symmetric NAT) cannot connect directly, and the app says so instead of falling b
 
 - Example addresses use documentation ranges (`203.0.113.0/24`) and the example key `0123456789abcdef0123456789abcdef`.
   Generate your own key; never reuse an example.
-- No license has been chosen yet.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). You may use, modify, fork and redistribute Strait, commercially or not.
+Please keep the [NOTICE](NOTICE) file and the license text with any copy or fork: that is how credit is preserved.

@@ -1,6 +1,8 @@
 {
   "name": "StraitMobile",
   "version": "0.0.1",
+  "license": "Apache-2.0",
+  "repository": "https://github.com/TheGreatDaniad/strait",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
