@@ -1,31 +1,75 @@
 # Strait
 
-Peer-to-peer internet sharing through NAT, with no relay. One device (the host) shares its connection; another (the client)
-uses it. The two find each other, punch through their NATs, and talk directly over UDP.
+**Use another person's home internet connection, directly, from your own device.**
 
-A strait is a narrow passage between two shores: the shores are the two peers, the passage is the tunnel.
+## What is Strait?
+
+Strait is software that two people run on their home computers or phones. One of them (the **host**) shares their internet
+connection, and the other (the **client**) uses it, through a tunnel between the two devices. The server end of the tunnel is
+simply a home device.
+
+That is the problem it solves: getting online through someone you trust, with their connection and their IP address, without
+renting a server and without setting one up.
+
+## Easy to use
+
+- One click to run, no configuration. The host starts sharing and gets an invite code; the client pastes it and connects.
+- The app checks your network for you and tells you plainly what will and will not work.
+
+## Flexible tunnels
+
+The two peers can choose how they connect. Besides the built-in encrypted UDP tunnel, Strait supports other transports,
+for networks that block or inspect traffic:
+
+- Shadowsocks-2022
+- AmneziaWG (obfuscated WireGuard)
+- WebSocket over TLS
+- Xray (VLESS + REALITY)
+
+## No server of your own
+
+Two devices behind home routers cannot normally find each other. When a signaling step is needed, Strait uses public services
+(BitTorrent trackers, Nostr relays, the BitTorrent DHT, ntfy, MQTT brokers), so you do not have to run a signaling server.
+The host decides which ones to use, and they only ever see an encrypted blob, never your traffic.
+
+## In the end
+
+Strait connects device A to device B **peer to peer, with no server in the middle**. Traffic goes only between the two devices,
+and A reaches the internet with B's IP address. If a direct connection is not possible, Strait says so with the reason instead of
+quietly routing through a third party.
+
+---
+
+## Quick start
+
+```bash
+cd nat-tunnel
+cargo run --release -- gui     # desktop app; the full tunnel needs admin/root
+```
+
+1. **Host:** open the Host tab, check connectivity, choose how to be found, press **Start sharing**, copy the invite.
+2. **Client:** paste the invite on the Connect tab and press **Connect**.
 
 ## Principles
 
-- **Payload only travels between the two peers.** There is no relay or TURN fallback, ever.
-- **The invite string is the capability.** Whoever holds it can connect; nothing else is trusted.
-- **Failure is explicit**, with a reason (no usable rendezvous, symmetric NAT on both sides, host full, ...).
-- **Servers only help peers find each other.** They see a sealed address blob, never your traffic or the key.
+- Payload only travels between the two peers. There is no relay or TURN fallback, ever.
+- The invite string is the capability: whoever holds it can connect.
+- Failure is explicit, with a reason.
+- Servers only help peers find each other. They see a sealed address blob, never your traffic or the key.
 
 ## What is here
 
 | Path | What it is |
 |---|---|
-| `nat-tunnel/` | Rust core: CLI (`host`, `guest`, `check-host`, `rv-test`, `recover`), desktop GUI (egui), rendezvous layer, carriers, deploy scripts, docs. The crate and binary are called `nat-tunnel`. |
+| `nat-tunnel/` | Rust core: CLI (`host`, `guest`, `check-host`, `rv-test`, `recover`), desktop GUI, rendezvous layer, transports, deploy scripts, docs. |
 | `strait-mobile/` | React Native app (Android, iOS) over the same Rust library. |
-| `nat-tunnel/docs/` | Design (`RENDEZVOUS_DESIGN.md`, `TUNNEL_CARRIERS.md`), plans and roadmap. |
-| `nat-tunnel/docs/design/` | The visual design handoff (palette, mark, screens). |
+| `nat-tunnel/docs/` | Design (`RENDEZVOUS_DESIGN.md`, `TUNNEL_CARRIERS.md`), plans and roadmap, and the visual design handoff. |
 
 ## How peers find each other
 
-The host chooses which rendezvous methods to use; nothing is on by default. Each shows what it can see before you pick it:
-UDP signal server (`sig`), BitTorrent trackers (`trk`), Nostr relays, Mainline DHT, ntfy, public MQTT. All derive their room from
-the invite key with HKDF and publish only ChaCha20-Poly1305 sealed endpoints. See `nat-tunnel/docs/RENDEZVOUS_DESIGN.md`.
+The host chooses the methods; nothing is on by default, and each one shows what it can see before you pick it: a UDP signal
+server (`sig`), BitTorrent trackers (`trk`), Nostr relays, the Mainline DHT, ntfy, and public MQTT. Rooms are derived from the
+invite key with HKDF, and only ChaCha20-Poly1305 sealed endpoints are published. See `nat-tunnel/docs/RENDEZVOUS_DESIGN.md`.
 
 ## Build and test
 
@@ -33,18 +77,18 @@ the invite key with HKDF and publish only ChaCha20-Poly1305 sealed endpoints. Se
 cd nat-tunnel
 cargo build --release                      # CLI + GUI
 cargo test --no-default-features           # headless suite (some live-network tests are #[ignore])
-cargo run --release -- gui                 # desktop GUI; the full tunnel needs root
-cargo run --release -- check-host          # what kind of NAT are you behind, who can reach you
+cargo run --release -- check-host          # what NAT you are behind and who can reach you
 ```
 
-Mobile: `cd strait-mobile && npm install && npx jest`. Device builds are described in `strait-mobile/ios/README_DEVICE_TESTING.md`.
+The Shadowsocks, AmneziaWG, WebSocket and Xray transports are opt-in build features (`cr-ss`, `cr-awg`, `cr-ws`, `cr-xray`).
+Mobile: `cd strait-mobile && npm install && npx jest`. Device builds are in `strait-mobile/ios/README_DEVICE_TESTING.md`.
 A packet-tunnel VPN on iOS needs a paid Apple Developer team.
 
 ## Status
 
 Alpha. Verified on macOS, Windows 11 ARM and Android (emulator) against a real internet host, over every rendezvous method.
-iOS runs in the simulator; the system VPN is untested on a device. Hole punching cannot succeed when the host is port-restricted
-and the client is symmetric (needs birthday probing, not implemented): the app says so instead of falling back.
+iOS runs in the simulator; the system VPN is untested on a device. Some network combinations (for example both peers behind
+symmetric NAT) cannot connect directly, and the app says so instead of falling back to a relay.
 
 ## Notes
 
