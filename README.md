@@ -99,3 +99,12 @@ symmetric NAT) cannot connect directly, and the app says so instead of falling b
 
 Licensed under the [Apache License 2.0](LICENSE). You may use, modify, fork and redistribute Strait, commercially or not.
 Please keep the [NOTICE](NOTICE) file and the license text with any copy or fork: that is how credit is preserved.
+
+## Disclaimer
+
+Strait is experimental software. It is early work, has not been security-audited, and may contain bugs, flaws and security issues. It is provided **as is**, without warranty of any kind, as stated in the [license](LICENSE). **Use it at your own risk.** The authors are not liable for any damage, data loss, or other consequences of using it.
+
+- **Hosting shares your IP.** When you host, the client's traffic reaches the internet from your connection and appears to come from your IP address. Only share with people you trust, and you stay responsible for what is done through it.
+- **Follow the rules that apply to you.** Check your local laws and your internet provider's terms before sharing or using a connection.
+- **It is not an anonymity tool.** Strait connects two devices directly, so the two peers see each other's IP addresses.
+- **Don't rely on it for anything critical** while it is in this state.
