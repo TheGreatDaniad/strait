@@ -106,6 +106,9 @@ impl FrameIo for UdpCarrier {
     fn udp(&self) -> Option<&UdpSocket> {
         Some(&self.sock)
     }
+    async fn sibling(&self) -> Option<Arc<dyn FrameIo>> {
+        Some(Arc::new(UdpCarrier::bind(None).await.ok()?.with_max_frame(self.max_frame)))
+    }
 }
 
 pub struct UdpFactory;

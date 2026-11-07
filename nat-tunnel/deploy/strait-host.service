@@ -1,7 +1,8 @@
 # Multiplexed host: one UDP port, many clients. Default exit is userspace (--userspace):
 # TCP/UDP from clients is terminated inside the process and re-dialled from this machine,
 # so no TUN device, no capabilities, no NAT rules. No --relay: no relay, no default server.
-# The invite (which contains the key) lives in /etc/strait/host.env, never in this file.
+# The invite (which contains the key) lives in /etc/strait/host.env, never in this file or in
+# the command line (visible in `ps`): the binary reads STRAIT_INVITE from the environment itself.
 # STRAIT_HOST_ARGS (also in host.env) selects the mode; --tun only selects the multiplexed
 # mode (its address is forced to 10.7.0.1/16), --userspace skips the kernel device.
 #
@@ -19,7 +20,7 @@ Wants=network-online.target
 
 [Service]
 EnvironmentFile=/etc/strait/host.env
-ExecStart=/usr/local/bin/nat-tunnel host --invite ${STRAIT_INVITE} $STRAIT_HOST_ARGS
+ExecStart=/usr/local/bin/nat-tunnel host $STRAIT_HOST_ARGS
 # Throwaway uid per start; owns nothing on disk.
 DynamicUser=yes
 Restart=on-failure

@@ -242,7 +242,8 @@ impl RunDir {
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-        b.create(&p)?; // fails if it exists: no squatting
+        b.recursive(true).create(base)?; // a configured run base need not exist yet
+        b.recursive(false).create(&p)?; // fails if it exists: no squatting
         Ok(Self(p))
     }
     fn write(&self, name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
@@ -436,6 +437,14 @@ async fn launch(spec: &CarrierSpec, c: Ctx, mut cfg: serde_json::Value, role: Ro
     let mut sc = SidecarConfig::new(&c.bin);
     sc.args = vec![OsString::from("run"), OsString::from("-c"), path.into_os_string()];
     sc.working_dir = Some(c.dir.0.clone());
+    // The environment is cleared; a Go program on Windows then fails at its first socket
+    // (Winsock needs SystemRoot), which showed as "sidecar exited (Some(-1))".
+    #[cfg(windows)]
+    for k in ["SystemRoot", "windir", "SystemDrive", "TEMP", "TMP"] {
+        if let Ok(v) = std::env::var(k) {
+            sc.env.push((k.to_string(), v));
+        }
+    }
     sc.health = health;
     sc.start_timeout = Duration::from_millis(num(spec, "xray_start_timeout_ms", 10_000));
     sc.monitor_interval = Some(Duration::from_millis(num(spec, "xray_monitor_ms", 2_000)));
@@ -518,6 +527,10 @@ impl CarrierFactory for XrayFactory {
         // A real Xray listens on TCP: the public port answering on loopback is the ready signal
         // (and the hang monitor). A log file is used, so there is no stdout readiness line.
         let health = HealthCheck::Tcp(SocketAddr::from(([127, 0, 0, 1], c.params.public_port)));
+        // Report only (never kill): a stale sidecar of an earlier, killed run keeps the port busy.
+        if std::net::TcpListener::bind(("0.0.0.0", c.params.public_port)).is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse) {
+            log::warn!("xray: TCP port {} is already in use (a stale xray sidecar of an earlier run?); the new sidecar will probably fail to start. Stop the old process", c.params.public_port);
+        }
         let t0 = Instant::now();
         let g = launch(spec, c, cfg, Role::Host, health).await?;
         // Xray's REALITY server spends its first ~8 s learning the target's post-handshake record

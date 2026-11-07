@@ -285,3 +285,41 @@ async fn host_bind_on_taken_port_fails_with_port_in_use() {
     };
     assert!(matches!(ConnectError::from_io(&e), Some(ConnectError::PortInUse(p)) if *p == port), "{e}");
 }
+
+fn data_dgram(a: &Joined, slot: &[u8], plain: &[u8]) -> Vec<u8> {
+    let mut c = hs_session(KEY, &a.dh, &a.cn, &a.hn, &a.cpub, &a.hpub, false);
+    let mut d = vec![0xF4, slot[0], slot[1]];
+    d.extend_from_slice(&c.seal(plain));
+    d
+}
+
+/// After a host restart the `seen` set is empty, so a captured JOIN is accepted again. It must not
+/// hold a slot: only a packet under the new session key (which a replayer cannot make) confirms
+/// one, unconfirmed joins give way to real clients and expire.
+#[tokio::test]
+async fn replayed_join_after_host_restart_cannot_hold_a_slot() {
+    let mut h = MuxHost::bind(KEY, MuxConfig { bind_port: Some(0), max_clients: 2, ..Default::default() })
+        .await
+        .unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", h.local_port().unwrap()).parse().unwrap();
+    let (replayer, legit) = (sock().await, sock().await);
+    // Two captured JOINs (valid MACs, replayed from a fresh host's point of view) fill the host.
+    for n in 0..2u8 {
+        let (_, cpub) = hs_keypair();
+        let j = hs_join(KEY, &[n + 1; 16], &cpub);
+        assert!(exchange_some(&mut h, &replayer, addr, &j).await.is_some());
+    }
+    assert_eq!(h.peer_count(), 2);
+    // A real client still gets in, and proves itself with a packet under its session key.
+    let a = do_join(&mut h, &legit, addr, KEY).await.expect("legitimate client joins a 'full' host");
+    assert_eq!(h.peer_count(), 2);
+    legit.send_to(&data_dgram(&a, &a.accept[1..3], &[0xC1]), addr).await.unwrap();
+    // The surviving replayed join never confirms and expires; the real one stays.
+    let end = std::time::Instant::now() + Duration::from_millis(20600);
+    while std::time::Instant::now() < end {
+        while h.try_recv().await.unwrap().is_some() {}
+        h.tick().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(h.peer_count(), 1, "replayed join expired, confirmed client kept");
+}

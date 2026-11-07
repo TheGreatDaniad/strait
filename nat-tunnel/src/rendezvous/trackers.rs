@@ -42,13 +42,13 @@ impl Trackers {
         Self { cfg: cfg.clone() }
     }
 
-    fn entries(&self) -> Vec<String> {
-        let mine: Vec<String> = self.cfg.trackers.iter().filter_map(|t| entry(t)).collect();
-        if mine.is_empty() {
-            DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect()
-        } else {
-            mine
+    /// The configured list, or the defaults only when none was configured. A configured list with
+    /// an unusable entry is an error, never a silent fallback to public trackers.
+    fn entries(&self) -> Result<Vec<String>, String> {
+        if self.cfg.trackers.is_empty() {
+            return Ok(DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect());
         }
+        self.cfg.trackers.iter().map(|t| entry(t).ok_or_else(|| format!("tracker '{t}' is not usable (use udp://host:port)"))).collect()
     }
 }
 
@@ -279,7 +279,11 @@ impl Rendezvous for Trackers {
     }
 
     async fn probe(&self, timeout: Duration) -> ProbeStatus {
-        let addrs = resolve(&self.entries()).await;
+        let entries = match self.entries() {
+            Ok(e) => e,
+            Err(e) => return ProbeStatus::Error(e),
+        };
+        let addrs = resolve(&entries).await;
         if addrs.is_empty() {
             return ProbeStatus::Error("no resolvable tracker".into());
         }
@@ -318,7 +322,8 @@ impl Rendezvous for Trackers {
         let Some(port) = ctx.local.iter().find(|a| a.is_ipv4()).map(|a| a.port()) else {
             return Err(RvError::Failed("no mapped address".into()));
         };
-        let addrs = resolve(&self.entries()).await;
+        let entries = self.entries().map_err(RvError::Failed)?;
+        let addrs = resolve(&entries).await;
         if addrs.is_empty() {
             return Err(RvError::Blocked("no resolvable tracker".into()));
         }
@@ -392,5 +397,19 @@ impl Rendezvous for Trackers {
                 return Err(if blocked { RvError::Blocked(m) } else { RvError::Failed(m) });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_list_never_falls_back_to_defaults() {
+        let t = |l: &[&str]| Trackers::new(&RvConfig { trackers: l.iter().map(|s| s.to_string()).collect(), ..Default::default() }).entries();
+        assert_eq!(t(&[]).unwrap().len(), DEFAULT_TRACKERS.len());
+        assert_eq!(t(&["udp://t.example:6969/announce"]).unwrap(), vec!["t.example:6969"]);
+        assert!(t(&["https://t.example/announce"]).is_err());
+        assert!(t(&["t.example:6969", "http://x"]).is_err());
     }
 }

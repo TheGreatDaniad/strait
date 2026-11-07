@@ -167,7 +167,7 @@ async fn conn(tcp: tokio::net::TcpStream, st: Arc<Mutex<St>>, mode: Mode, bc: br
             e = rx.recv() => {
                 if let (Ok(e), Some(f)) = (e, &filt) {
                     if matches(f, &e) {
-                        let _ = w.send(Message::text(json!(["EVENT", "strait", e]).to_string())).await;
+                        let _ = w.send(Message::text(json!(["EVENT", "r", e]).to_string())).await;
                     }
                 }
             }

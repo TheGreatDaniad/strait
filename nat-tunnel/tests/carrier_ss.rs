@@ -254,7 +254,7 @@ fn key_is_distinct_and_pinned() {
     assert_eq!(p, derive_psk(&k));
     assert_ne!(p, derive_psk(&parse_key(KEY2).unwrap()));
     let d = Derived::new(&k);
-    for other in [&d.seal_key, &d.room, &d.dht_host_seed, &d.dht_client_seed] {
+    for other in [&d.seal_key, &d.room_trk, &d.room_mqtt, &d.room_ntfy, &d.room_nostr, &d.dht_host_seed, &d.dht_client_seed] {
         assert_ne!(&p[..], &other[..16]);
     }
     assert_eq!(nat_tunnel::rendezvous::derive::hex(&p), "fedfdaed5ba45ab84f96bb0c7cfcb98b");

@@ -7,7 +7,7 @@
 //!
 //! Politeness: one PUT per role every ~4.5 min (plus one at each window rollover, two early
 //! re-PUTs at +12 s and +32 s, and up to three low-replica retries); GETs at
-//! 2, 3, 5, 8, 12, then every 20 s. Readers look in the current and previous window, and in the
+//! 1, 1, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 8, 8, 12, 12, then every 20 s. Readers look in the current and previous window, and in the
 //! next one during the last 90 s of a window (the writer's clock may be ahead). `ctx.local` is fixed for one `run`, so "re-publish when local
 //! changes" is done by the runner restarting `run`.
 //!
@@ -57,6 +57,11 @@ pub struct Tune {
     pub retry: Duration,
 }
 
+/// A host that has learned a client's candidate is being used: stop the frequent re-announcing.
+fn joined(role: Role, seen: &HashSet<SocketAddr>) -> bool {
+    role == Role::Host && !seen.is_empty()
+}
+
 /// What to wait before the next PUT and why (pure, so the schedule is testable).
 #[derive(Default, Debug)]
 pub struct PutSchedule {
@@ -81,7 +86,7 @@ impl PutSchedule {
 impl Default for Tune {
     fn default() -> Self {
         Self {
-            poll_steps: [2, 3, 5, 8, 12, 20].map(Duration::from_secs).to_vec(),
+            poll_steps: [1, 1, 2, 2, 2, 2, 3, 3, 3, 5, 5, 5, 8, 8, 12, 12, 20].map(Duration::from_secs).to_vec(),
             republish: Duration::from_secs(270),
             bootstrap_timeout: Duration::from_secs(20),
             early: vec![Duration::from_secs(12), Duration::from_secs(20)],
@@ -215,6 +220,7 @@ impl Rendezvous for Dht {
         let mut seq = unix_now() as i64; // time-based so a restart never goes below a stored seq
         let mut cas: Option<i64> = None;
         let mut published_window: Option<u64> = None;
+        let mut put_ok = false; // at least one PUT was acknowledged
         let mut next_pub = Instant::now();
         let mut sched = PutSchedule::default();
         let mut poll_i = 0usize;
@@ -237,7 +243,10 @@ impl Rendezvous for Dht {
                     Ok(o) => {
                         log::info!("dht: published, acknowledged by {} nodes", o.stored_at);
                         cas = Some(seq);
-                        next_pub = Instant::now() + sched.after_put(&self.tune, o.stored_at);
+                        put_ok = true;
+                        let wait = sched.after_put(&self.tune, o.stored_at);
+                        // A host a client already found only re-announces slowly (for reconnects).
+                        next_pub = Instant::now() + if joined(ctx.role, &seen) { self.tune.republish } else { wait };
                         ctx.status.set(Status::Publishing);
                     }
                     Err(e) => {
@@ -289,8 +298,26 @@ impl Rendezvous for Dht {
                     return Ok(());
                 }
             }
+            if joined(ctx.role, &seen) && put_ok {
+                // The early/retry PUTs are no longer needed: push the next one out to the slow rate.
+                next_pub = next_pub.max(Instant::now() + self.tune.republish);
+            }
             poll_i = (poll_i + 1).min(self.tune.poll_steps.len() - 1);
             next_poll = Instant::now() + self.tune.poll_steps[poll_i];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_host_that_met_a_client_goes_quiet() {
+        let mut seen = HashSet::new();
+        assert!(!joined(Role::Host, &seen));
+        seen.insert("1.2.3.4:5".parse().unwrap());
+        assert!(joined(Role::Host, &seen));
+        assert!(!joined(Role::Client, &seen), "a client keeps its early PUTs");
     }
 }

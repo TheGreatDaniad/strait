@@ -141,6 +141,8 @@ struct Sess {
 struct Table {
     by_sid: HashMap<u64, Sess>,
     by_peer: HashMap<SocketAddr, u64>,
+    /// Shared-socket port: told which sources authenticated (see `Port::limit_unauth`).
+    port: Option<Arc<Port>>,
 }
 
 enum Role {
@@ -155,8 +157,11 @@ enum Role {
 #[derive(Default)]
 struct Tap {
     servers: Mutex<Vec<SocketAddr>>,
-    mapped: Mutex<Option<SocketAddr>>,
+    /// (server, mapping it reported), one entry per server.
+    mapped: Mutex<Vec<(SocketAddr, SocketAddr)>>,
     notify: Notify,
+    /// Source of the datagram read last (the recv loop is the only reader).
+    last: Mutex<Option<SocketAddr>>,
 }
 
 impl Tap {
@@ -165,7 +170,10 @@ impl Tap {
             return false;
         }
         let Some(m) = crate::tunnel::stun::mapped_from_response(d) else { return false };
-        *self.mapped.lock().unwrap() = Some(m);
+        let mut v = self.mapped.lock().unwrap();
+        v.retain(|(s, _)| *s != from);
+        v.push((from, m));
+        drop(v);
         self.notify.notify_one();
         true
     }
@@ -206,6 +214,7 @@ impl DatagramReceive for PortSock {
                     other => return other,
                 };
                 if !tap.offer(from, &buf.filled()[before..]) {
+                    *tap.last.lock().unwrap() = Some(from);
                     return Poll::Ready(Ok(from));
                 }
                 buf.set_filled(before);
@@ -256,6 +265,7 @@ struct Shared {
     notify: Notify,
     closed: AtomicBool,
     down: Mutex<Option<String>>,
+    rejected: super::Rejects,
 }
 
 impl Shared {
@@ -278,6 +288,11 @@ impl Shared {
         if let Some(s) = t.by_sid.get_mut(&c.client_session_id) {
             if !s.win.accept(c.packet_id) {
                 return;
+            }
+            if s.real != src {
+                if let Some(p) = &t.port {
+                    p.mark_known(src);
+                }
             }
             s.real = src;
             s.seen = Instant::now();
@@ -304,6 +319,9 @@ impl Shared {
         let server_sid = u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()) | 1;
         t.by_sid.insert(sid, Sess { peer: src, real: src, server_sid, next_pid: 0, win, seen: Instant::now() });
         t.by_peer.insert(src, sid);
+        if let Some(p) = &t.port {
+            p.mark_known(src);
+        }
         self.push(buf, src);
     }
 
@@ -321,7 +339,13 @@ impl Shared {
                     }
                 },
                 // Bad key, garbage, truncated, stale timestamp: not ours, drop quietly.
-                Err(ProxySocketError::ProtocolErrorWithPeer(..) | ProxySocketError::ProtocolError(_)) => {}
+                Err(ProxySocketError::ProtocolErrorWithPeer(..) | ProxySocketError::ProtocolError(_)) => {
+                    if let (Role::Client { .. }, Some((_, tap))) = (&self.role, &self.stun) {
+                        if let Some(from) = *tap.last.lock().unwrap() {
+                            self.rejected.note(from);
+                        }
+                    }
+                }
                 Err(ProxySocketError::IoError(e))
                     if matches!(e.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset | io::ErrorKind::Interrupted) =>
                 {
@@ -339,6 +363,8 @@ impl Shared {
 pub struct SsCarrier {
     sh: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
+    /// How a rendezvous client (no endpoint) was dialed, so the fan-out can dial siblings.
+    spec: Option<CarrierSpec>,
 }
 
 impl Drop for SsCarrier {
@@ -352,8 +378,10 @@ impl SsCarrier {
     /// 32-hex invite key.
     pub fn over(port: Arc<Port>, invite_key: &str) -> Result<Self, CarrierError> {
         let cfg = cfg_for_key(invite_key, PLACEHOLDER)?;
+        port.limit_unauth();
+        let table = Table { port: Some(port.clone()), ..Table::default() };
         let sock = ProxySocket::from_socket(UdpSocketType::Server, Context::new_shared(ServerType::Server), &cfg, PortSock::Shared(port));
-        Ok(Self::start(sock, None, Role::Host(Mutex::new(Table::default()))))
+        Ok(Self::start(sock, None, Role::Host(Mutex::new(table))))
     }
 
     fn start(sock: ProxySocket<PortSock>, stun: Option<(Arc<ShadowUdpSocket>, Arc<Tap>)>, role: Role) -> Self {
@@ -365,9 +393,10 @@ impl SsCarrier {
             notify: Notify::new(),
             closed: AtomicBool::new(false),
             down: Mutex::new(None),
+            rejected: Default::default(),
         });
         let task = tokio::spawn(sh.clone().recv_loop());
-        Self { sh, task }
+        Self { sh, task, spec: None }
     }
 }
 
@@ -439,22 +468,42 @@ impl FrameIo for SsCarrier {
             self.sh.notify.notified().await;
         }
     }
-    async fn stun_mapped(&self, servers: &[SocketAddr], wait: Duration) -> Option<SocketAddr> {
-        let (sock, tap) = self.sh.stun.as_ref()?;
+    fn take_rejected(&self) -> Vec<SocketAddr> {
+        self.sh.rejected.take()
+    }
+    async fn stun_mapped(&self, servers: &[SocketAddr], wait: Duration) -> Vec<SocketAddr> {
+        let Some((sock, tap)) = self.sh.stun.as_ref() else { return Vec::new() };
         *tap.servers.lock().unwrap() = servers.to_vec();
         let deadline = tokio::time::Instant::now() + wait;
-        // One request per server and round (a lost one is asked again), until an answer is tapped.
-        while tokio::time::Instant::now() < deadline {
-            for s in servers {
+        let mut first_answer: Option<tokio::time::Instant> = None;
+        // One request per server and round (a lost one is asked again) until every server has
+        // answered; once one has, the others get 600 ms more (a symmetric NAT shows in the answers).
+        loop {
+            let got = tap.mapped.lock().unwrap().clone();
+            if got.len() >= servers.len() || tokio::time::Instant::now() >= deadline {
+                return got.into_iter().map(|(_, m)| m).collect();
+            }
+            let stop = match (first_answer, got.is_empty()) {
+                (None, false) => {
+                    first_answer = Some(tokio::time::Instant::now());
+                    deadline.min(first_answer.unwrap() + Duration::from_millis(600))
+                }
+                (Some(t), _) => deadline.min(t + Duration::from_millis(600)),
+                _ => deadline,
+            };
+            if tokio::time::Instant::now() >= stop {
+                return got.into_iter().map(|(_, m)| m).collect();
+            }
+            for s in servers.iter().filter(|s| !got.iter().any(|(g, _)| g == *s)) {
                 let _ = crate::tunnel::stun::poke(sock, *s).await;
             }
-            let round = Duration::from_millis(500).min(deadline - tokio::time::Instant::now());
+            let round = Duration::from_millis(500).min(stop - tokio::time::Instant::now());
             let _ = tokio::time::timeout(round, tap.notify.notified()).await;
-            if let Some(m) = *tap.mapped.lock().unwrap() {
-                return Some(m);
-            }
         }
-        None
+    }
+    async fn sibling(&self) -> Option<Arc<dyn FrameIo>> {
+        let spec = self.spec.as_ref()?;
+        SsFactory.dial(&CarrierSpec { bind_port: None, ..spec.clone() }).await.ok()
     }
     fn health(&self) -> Health {
         match self.sh.down.lock().unwrap().clone() {
@@ -555,7 +604,9 @@ impl CarrierFactory for SsFactory {
             None => PLACEHOLDER,
         };
         let role = Role::Client { host, sid, next_pid: AtomicU64::new(0), win: Mutex::new(Window::default()), target };
-        Ok(Arc::new(SsCarrier::start(ps, Some((sock, tap)), role)))
+        let mut c = SsCarrier::start(ps, Some((sock, tap)), role);
+        c.spec = host.is_none().then(|| spec.clone());
+        Ok(Arc::new(c))
     }
 }
 

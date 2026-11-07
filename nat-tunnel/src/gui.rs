@@ -489,6 +489,8 @@ impl Settings {
         let Some(path) = Self::path() else {
             return Self::default();
         };
+        // Files written by older builds may be 0644.
+        restrict_perms(&path);
         std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
@@ -500,14 +502,41 @@ impl Settings {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        // The file holds invites (they contain the key), so it is created 0600, never 0644.
+        // shortcut: plain file, not the OS keychain (no dependency); upgrade to Keychain /
+        // Secret Service / DPAPI when a keyring crate is acceptable. Windows relies on the
+        // per-user %APPDATA% ACL.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+            f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
         }
+        #[cfg(not(unix))]
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        restrict_perms(&path);
         Ok(())
     }
+}
+
+/// Unix: file 0600 and its directory 0700 (fixes modes left by older builds). No-op elsewhere.
+fn restrict_perms(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |p: &std::path::Path, m| {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        };
+        if path.exists() {
+            set(path, 0o600);
+            if let Some(dir) = path.parent() {
+                set(dir, 0o700);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Reads the macOS "Reduce motion" accessibility preference once at startup.
@@ -4293,6 +4322,22 @@ mod tests {
     use super::*;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_perms_fixes_loose_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("strait-gui-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gui.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        restrict_perms(&file);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&file), mode(&dir)), (0o600, 0o700));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn verdict(json: &str) -> Verdict {
         let line = json.lines().rev().find(|l| l.trim_start().starts_with('{')).unwrap();

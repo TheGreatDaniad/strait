@@ -10,7 +10,7 @@
 //! at start, then every 6 s for the first 30 s, then every 30 s, i.e. never more than 1 per 6 s.
 //! HTTP 429 is honoured (`Retry-After`, default 10 s); a third 429 in a row, or 403/451, stops
 //! the method for the session (`Blocked`). Stream reconnects wait >= 1 s with exponential backoff.
-//! User-Agent is the fixed string `strait-rendezvous`.
+//! User-Agent is the generic string `Mozilla/5.0`.
 //!
 //! The HTTP/1.1 client is deliberately tiny (Connection: close, chunked/length/EOF bodies) to
 //! avoid pulling in hyper/reqwest; TLS is rustls + webpki roots.
@@ -32,7 +32,7 @@ use super::derive::{open, seal};
 use super::{Candidate, Disclosure, ProbeStatus, Rendezvous, RvConfig, RvCtx, RvError, Status};
 
 const DEFAULT_BASE: &str = "https://ntfy.sh";
-const UA: &str = "strait-rendezvous";
+const UA: &str = "Mozilla/5.0";
 
 /// Intervals; `Default` is the production schedule. Tests scale them down.
 #[derive(Debug, Clone, Copy)]
@@ -501,7 +501,7 @@ impl Rendezvous for Ntfy {
 
     async fn run(&self, ctx: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
         let h = self.http()?;
-        let topic = ctx.derived().room_topic();
+        let topic = ctx.derived().ntfy_topic();
         let sh = Shared { got_peer: AtomicBool::new(false) };
         // Dropping the futures on cancel closes their sockets at once.
         tokio::select! {

@@ -92,7 +92,7 @@ export function ConnectScreen({
     : connecting
       ? 'Looking for the host…'
       : isBlocked
-        ? `The tunnel stopped (${error || 'unknown reason'}). The kill switch is blocking all network traffic on this device. Tap Disconnect to unblock.`
+        ? `Reason: ${(error || 'unknown').replace(/[.\s]+$/, '')}. The kill switch is blocking all network traffic on this device. Tap Disconnect to unblock.`
         : failed
         ? `Failed: ${error || 'Host unreachable - check the invite or UDP reachability.'}`
         : "Paste a host's invite code to get online.";

@@ -68,6 +68,38 @@ use crate::rendezvous::{Disclosure, ProbeStatus};
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_PENDING_HANDSHAKES: usize = 256;
+/// Pending handshakes one source address may hold (a NAT with a few guests still fits).
+const MAX_PENDING_PER_IP: u8 = 8;
+
+/// Per-source count of pending handshakes; the guard gives its slot back on drop.
+#[derive(Default, Clone)]
+struct PendingByIp(Arc<Mutex<std::collections::HashMap<std::net::IpAddr, u8>>>);
+
+struct PendingSlot(PendingByIp, std::net::IpAddr);
+
+impl PendingByIp {
+    fn take(&self, ip: std::net::IpAddr) -> Option<PendingSlot> {
+        let mut m = self.0.lock().unwrap();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= MAX_PENDING_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(PendingSlot(self.clone(), ip))
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        let mut m = (self.0).0.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
 /// TUN MTU the integration should use on this carrier to limit TCP-in-TCP head-of-line cost
 /// (`max_frame` 1335 gives `Caps::tun_mtu` 1300).
 pub const RECOMMENDED_TUN_MTU: usize = 1300;
@@ -222,17 +254,20 @@ pub struct Identity {
     pub path: String,
     pub token: String,
     seed: [u8; 32],
+    serial: [u8; 16],
 }
 
 impl Identity {
     pub fn derive(key: &[u8]) -> Identity {
         let hk = Hkdf::<Sha256>::new(None, key);
         let out = |label: &str, buf: &mut [u8]| hk.expand(format!("strait-ws-v1:{label}").as_bytes(), buf).expect("hkdf length");
-        let (mut p, mut t, mut seed) = ([0u8; 8], [0u8; 24], [0u8; 32]);
+        let (mut p, mut t, mut seed, mut serial) = ([0u8; 8], [0u8; 24], [0u8; 32], [0u8; 16]);
         out("path", &mut p);
         out("token", &mut t);
         out("tls-seed", &mut seed);
-        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed }
+        out("tls-serial", &mut serial);
+        serial[0] &= 0x7f; // positive DER INTEGER
+        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial }
     }
 
     /// The deterministic self-signed certificate (DER) and its signing key (PKCS#8 DER).
@@ -245,7 +280,7 @@ impl Identity {
             .map_err(err)?;
         let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(err)?;
         p.distinguished_name.push(rcgen::DnType::CommonName, "localhost");
-        p.serial_number = Some(rcgen::SerialNumber::from_slice(&self.seed[..16]));
+        p.serial_number = Some(rcgen::SerialNumber::from_slice(&self.serial));
         p.not_before = rcgen::date_time_ymd(2024, 1, 1);
         p.not_after = rcgen::date_time_ymd(2124, 1, 1);
         let cert = p.self_signed(&kp).map_err(err)?;
@@ -554,6 +589,7 @@ pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
     let h = tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
         let ctr = Arc::new(AtomicU16::new(0));
+        let by_ip = PendingByIp::default();
         loop {
             let (tcp, remote) = match l.accept().await {
                 Ok(x) => x,
@@ -563,9 +599,19 @@ pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
                 }
             };
             let Ok(permit) = sem.clone().try_acquire_owned() else { continue };
+            // A reverse proxy on loopback fronts many guests with one address: no per-IP cap there.
+            let ip = norm(remote).ip();
+            let slot = if ip.is_loopback() {
+                None
+            } else {
+                match by_ip.take(ip) {
+                    Some(sl) => Some(sl),
+                    None => continue,
+                }
+            };
             let (tls, path, token, weak, ctr) = (tls.clone(), path.clone(), token.clone(), weak.clone(), ctr.clone());
             tokio::spawn(async move {
-                let _permit = permit;
+                let (_permit, _slot) = (permit, slot);
                 let _ = tcp.set_nodelay(true);
                 limit_unsent(&tcp, lowat);
                 let ws = tokio::time::timeout(HEAD_TIMEOUT, async {
@@ -767,5 +813,30 @@ impl CarrierFactory for WsFactory {
     }
     async fn dial(&self, spec: &CarrierSpec) -> Result<Arc<dyn FrameIo>, CarrierError> {
         Ok(Arc::new(dial_ws(spec).await?))
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    #[test]
+    fn per_ip_cap_frees_on_drop() {
+        let by = PendingByIp::default();
+        let (a, b): (std::net::IpAddr, std::net::IpAddr) = ("9.9.9.9".parse().unwrap(), "9.9.9.10".parse().unwrap());
+        let held: Vec<_> = (0..MAX_PENDING_PER_IP).map(|_| by.take(a).expect("slot")).collect();
+        assert!(by.take(a).is_none(), "ninth from one address is refused");
+        assert!(by.take(b).is_some(), "another address is unaffected");
+        drop(held);
+        assert!(by.take(a).is_some());
+        assert!(by.0.lock().unwrap().len() <= 1, "no leaked entries");
+    }
+
+    #[test]
+    fn serial_is_not_seed_material_and_deterministic() {
+        let (a, b) = (Identity::derive(b"k"), Identity::derive(b"k"));
+        assert_eq!(a.serial, b.serial);
+        assert_ne!(a.serial, a.seed[..16]);
+        assert_eq!(a.pin_hex(), b.pin_hex());
     }
 }

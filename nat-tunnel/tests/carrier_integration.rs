@@ -266,9 +266,9 @@ fn ss_scenario() -> Scenario {
 #[tokio::test]
 async fn ss_carrier_end_to_end() {
     let caps = run_scenario(&ss_scenario()).await;
-    // 1414 byte frames: the TUN MTU shrinks below today's 1400
-    assert_eq!(effective_mtu(&[caps]), caps.max_frame - 35);
-    assert_eq!(caps.tun_mtu(), 1379);
+    // 1414 byte frames; a wrapped datagram stays within plain UDP's 1435 B: 1435 - 58 - 35
+    assert_eq!(effective_mtu(&[caps]), caps.tun_mtu());
+    assert_eq!(caps.tun_mtu(), 1342);
 }
 
 #[cfg(feature = "cr-ss")]
@@ -590,7 +590,7 @@ async fn one_host_serves_udp_and_ss_together() {
     let (ios, _) = app::start_carriers(&[sc.host.clone()], KEY, &sc.cfg).await;
     let (host, udp_port) = start_host(true, ios, |_| {}).await;
     assert_eq!(host.caps.iter().map(|c| c.id).collect::<Vec<_>>(), [CarrierId::Udp, CarrierId::Ss]);
-    assert_eq!(host.tun_mtu, 1379, "the smaller carrier decides");
+    assert_eq!(host.tun_mtu, 1342, "the smaller carrier decides");
 
     let mut over_udp = Tunnel::connect(ConnectOpts {
         signal: None,
@@ -807,10 +807,10 @@ async fn all_carriers_failing_gives_the_exact_summary() {
         Ok(_) => panic!("connected"),
     };
     let ConnectError::CarriersFailed(summary) = &e else { panic!("{e}") };
-    assert_eq!(summary, "udp: no punch; awg: disabled on this device; dns: not supported by this build; ss: timed out");
+    assert_eq!(summary, "udp: timed out (no reply from the host's UDP address); awg: disabled on this device; dns: not supported by this build; ss: timed out");
     assert_eq!(
         e.to_string(),
-        "Could not connect with any of the ways listed in the invite: udp: no punch; awg: disabled on this device; dns: not supported by this build; ss: timed out."
+        "Could not connect with any of the ways listed in the invite: udp: timed out (no reply from the host's UDP address); awg: disabled on this device; dns: not supported by this build; ss: timed out."
     );
     assert!(!tmp.file("last_carrier").exists());
 }

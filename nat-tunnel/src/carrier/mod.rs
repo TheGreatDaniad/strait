@@ -314,7 +314,14 @@ impl Caps {
     pub const SEAL_OVERHEAD: usize = 35;
     /// Largest IP packet the TUN may carry over this carrier.
     pub fn tun_mtu(&self) -> usize {
-        self.max_frame.saturating_sub(Self::SEAL_OVERHEAD).min(1400)
+        let mut m = self.max_frame.saturating_sub(Self::SEAL_OVERHEAD).min(1400);
+        if self.reliable_stream {
+            m = m.min(1300); // a stream carrier sits on top of a TCP MSS the path may shrink
+        } else if self.overhead > 0 {
+            // A wrapped datagram must not outgrow the biggest plain UDP one (1435 B sealed).
+            m = m.min(1435usize.saturating_sub(self.overhead + Self::SEAL_OVERHEAD));
+        }
+        m
     }
 }
 
@@ -400,13 +407,47 @@ pub trait FrameIo: Send + Sync + 'static {
     }
     /// STUN mapping of a socket this carrier owns when `udp()` is `None` (ss as a rendezvous
     /// client: the answers must be read before the carrier's own decoder sees them).
-    async fn stun_mapped(&self, _servers: &[SocketAddr], _wait: Duration) -> Option<SocketAddr> {
+    /// One mapping per answering server (more than one distinct value = symmetric NAT).
+    async fn stun_mapped(&self, _servers: &[SocketAddr], _wait: Duration) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+    /// A hole-punch probe (JOIN) of a birthday scan or fan-out: like `send_to`, but a carrier
+    /// whose first frame to a new destination costs more (awg junk burst) skips that.
+    async fn send_probe(&self, frame: &[u8], to: SocketAddr) -> io::Result<usize> {
+        self.send_to(frame, to).await
+    }
+    /// A fresh carrier of the same kind and keys on a new socket (new NAT mapping), for the
+    /// birthday fan-out. `None` when the carrier cannot be duplicated.
+    async fn sibling(&self) -> Option<Arc<dyn FrameIo>> {
         None
+    }
+    /// Sources of datagrams this carrier's codec rejected since the last call (a rendezvous client
+    /// only; at most [`Rejects::MAX`]). The host's plain punch is such a datagram for ss / awg: the
+    /// transport probes the source with a valid JOIN (the source alone authenticates nothing).
+    fn take_rejected(&self) -> Vec<SocketAddr> {
+        Vec::new()
     }
     fn health(&self) -> Health {
         Health::Ok
     }
     async fn close(&self) {}
+}
+
+/// Distinct sources of rejected datagrams, bounded (see [`FrameIo::take_rejected`]).
+#[derive(Default)]
+pub struct Rejects(std::sync::Mutex<Vec<SocketAddr>>);
+
+impl Rejects {
+    pub const MAX: usize = 16;
+    pub fn note(&self, from: SocketAddr) {
+        let mut v = self.0.lock().unwrap();
+        if v.len() < Self::MAX && !v.contains(&from) {
+            v.push(from);
+        }
+    }
+    pub fn take(&self) -> Vec<SocketAddr> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
 }
 
 /// Parameters for building a carrier. Secrets are derived by the carrier from the invite key.

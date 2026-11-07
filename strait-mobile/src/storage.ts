@@ -88,6 +88,7 @@ export async function loadLast(): Promise<string> {
   }
 }
 
+// shortcut: invites sit in plaintext AsyncStorage (no secure-storage module installed); the manifest excludes app data from backup, so they stay in the app sandbox. Upgrade to a keystore-backed store if rooted-device theft matters.
 export async function rememberInvite(invite: string) {
   const trimmed = invite.trim();
   if (!trimmed) return;

@@ -670,9 +670,15 @@ async fn resolve_endpoints(
     key: Option<String>,
     host: bool,
 ) -> Result<Resolved, Box<dyn std::error::Error>> {
+    // Keeps the invite out of `ps`: STRAIT_INVITE (e.g. from a systemd EnvironmentFile) when no
+    // --invite or --key was given. (clap's `env` feature is not enabled.)
+    let invite = invite.or_else(|| {
+        key.is_none().then(|| std::env::var("STRAIT_INVITE").ok().filter(|v| !v.trim().is_empty())).flatten()
+    });
     if let Some(raw) = invite {
         let parsed = Invite::parse(&raw)
             .ok_or("invalid invite: expected STRAIT2|<key>|<host>|<signal>|<room>")?;
+        Invite::check_key(&parsed.key)?;
         let signal = nat_tunnel::invite::resolve_signals(&parsed.signals).await?.first().copied();
         let hosts = nat_tunnel::invite::resolve(&parsed.hosts).await?;
         let bind_hint = hosts.first().copied();
@@ -692,7 +698,8 @@ async fn resolve_endpoints(
         });
     }
 
-    let key = key.ok_or("either --invite or --key is required")?;
+    let key = key.ok_or("either --invite (or STRAIT_INVITE) or --key is required")?;
+    Invite::check_key(&key)?;
     let room = room.unwrap_or_default();
     if relay.is_some() && room.is_empty() {
         return Err("--room is required when --relay is used".into());
@@ -918,6 +925,25 @@ mod tests {
         assert!(check_host_rv(&sig, false).is_err());
         assert!(check_host_rv(&sig, true).is_ok());
         assert!(check_host_rv(&["x".to_string()], false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invite_from_env_and_weak_key_rejected() {
+        // One test mutates STRAIT_INVITE so nothing else races on it.
+        let good = "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:7100";
+        std::env::set_var("STRAIT_INVITE", good);
+        let r = resolve_endpoints(None, None, None, None, true).await.unwrap();
+        assert_eq!(r.key, "0123456789abcdef0123456789abcdef");
+        // --invite wins over the environment.
+        let other = "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:7100".to_string();
+        let r = resolve_endpoints(Some(other), None, None, None, true).await.unwrap();
+        assert_eq!(r.key, "0123456789abcdef0123456789abcdef");
+        // A weak key is refused, from an invite and from --key.
+        let weak = "STRAIT2|00000000000000000000000000000000|127.0.0.1:7100".to_string();
+        assert!(resolve_endpoints(Some(weak), None, None, None, true).await.is_err());
+        assert!(resolve_endpoints(None, None, None, Some("k".into()), true).await.is_err());
+        std::env::remove_var("STRAIT_INVITE");
+        assert!(resolve_endpoints(None, None, None, None, true).await.is_err());
     }
 
     #[test]

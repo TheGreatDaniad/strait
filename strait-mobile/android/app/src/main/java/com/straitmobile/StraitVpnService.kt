@@ -73,13 +73,12 @@ class StraitVpnService : VpnService() {
     val cmd = listOf(
         binary().absolutePath,
         "host",
-        "--invite", invite,
         "--tun", "10.7.0.1/16", // ignored by the mux host (fixed 10.7.0.1/16); must only parse
         "--userspace",
         "--max-clients", maxClients.toString(),
         "--rate-kbps", rateKbps.toString(),
     )
-    launch(cmd, "host", intent.getIntExtra("port", 0))
+    launch(cmd, "host", invite, intent.getIntExtra("port", 0))
   }
 
   private fun startClient(invite: String, intent: Intent) {
@@ -104,7 +103,13 @@ class StraitVpnService : VpnService() {
     Thread {
       var pfd: ParcelFileDescriptor? = null
       try {
-        val client = server.accept()
+        // Only our own uid may receive the TUN fd; a foreign connection is dropped and we keep waiting for the core.
+        var client = server.accept()
+        while (client.peerCredentials.uid != android.os.Process.myUid()) {
+          Log.w(TAG, "rejected fd-socket peer uid ${client.peerCredentials.uid}")
+          client.close()
+          client = server.accept()
+        }
         client.soTimeout = ADDR_WAIT_MS
         // The host-assigned address is mandatory and strictly checked (10.7.0.0/16, prefix 16): never install anything else.
         val line = try { FdProtocol.readLine(client.inputStream) } catch (_: java.io.IOException) { null }
@@ -153,7 +158,6 @@ class StraitVpnService : VpnService() {
     val cmd = listOf(
         binary().absolutePath,
         "guest",
-        "--invite", invite,
         "--tun", "10.7.0.2/32", // fallback only; the host assigns the real address
         "--tun-fd-socket", "@$socketName",
     ) + (intent.getStringArrayListExtra("rvDisable").orEmpty()
@@ -162,7 +166,7 @@ class StraitVpnService : VpnService() {
         (intent.getStringArrayListExtra("carrierDisable").orEmpty()
             .filter { Regex("[a-z0-9]{1,12}").matches(it) }
             .takeIf { it.isNotEmpty() }?.let { listOf("--carrier-disable", it.joinToString(",")) } ?: emptyList())
-    launch(cmd, "client")
+    launch(cmd, "client", invite)
   }
 
   private fun buildInterface(
@@ -260,10 +264,11 @@ class StraitVpnService : VpnService() {
       "${(value ushr 24) and 0xff}.${(value ushr 16) and 0xff}." +
           "${(value ushr 8) and 0xff}.${value and 0xff}"
 
-  private fun launch(cmd: List<String>, mode: String, bindPort: Int = 0) {
+  private fun launch(cmd: List<String>, mode: String, invite: String, bindPort: Int = 0) {
     try {
       val pb = ProcessBuilder(cmd).redirectErrorStream(true)
       pb.environment()["RUST_LOG"] = "info"
+      pb.environment()["STRAIT_INVITE"] = invite // env, not argv: argv is world-readable via ps
       // Xray sidecar: exec is only allowed from the native library dir, so it ships as libxray.so (absent today).
       File(applicationInfo.nativeLibraryDir, "libxray.so").takeIf { it.exists() }?.let {
         it.setExecutable(true, false)
