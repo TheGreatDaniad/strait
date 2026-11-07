@@ -312,7 +312,17 @@ static LOG_TO_FILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 
 fn init_logger(log_file: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(path) = log_file else {
-        env_logger::init();
+        env_logger::Builder::from_default_env()
+            .format(|buf, record| {
+                use std::io::Write;
+                // eframe logs this and then may never return (no usable graphics): act on it here.
+                #[cfg(feature = "gui")]
+                if record.target() == "eframe::native::run" && record.args().to_string().starts_with("Exiting because of error") {
+                    gui_fatal(record.args().to_string());
+                }
+                writeln!(buf, "[{} {:<5} {}] {}", buf.timestamp_seconds(), record.level(), record.target(), record.args())
+            })
+            .init();
         return Ok(());
     };
     #[cfg(unix)]
@@ -325,6 +335,28 @@ fn init_logger(log_file: Option<&str>) -> Result<(), Box<dyn std::error::Error>>
         .init();
     LOG_TO_FILE.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// The window cannot start (no usable graphics): retry once with OpenGL in a fresh process, else tell the user.
+#[cfg(feature = "gui")]
+fn gui_fatal(msg: String) {
+    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        if std::env::var_os("STRAIT_RENDERER").is_none() {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Ok(st) = std::process::Command::new(exe).arg("gui").env("STRAIT_RENDERER", "glow").status() {
+                    std::process::exit(if st.success() { 0 } else { 1 });
+                }
+            }
+        }
+        eprintln!("error: {msg}");
+        #[cfg(windows)]
+        nat_tunnel::winlaunch::error_box(&msg);
+        std::process::exit(1);
+    });
 }
 
 /// The macOS window server refuses bare CLI processes running as root.
@@ -487,7 +519,44 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "gui")]
         Some(Command::Gui) => {
             guard_gui_root();
-            gui::run()?;
+            #[cfg(windows)]
+            {
+                // Double-click: UAC prompt, no console window, and a message box if the window cannot start.
+                if nat_tunnel::winlaunch::elevate_if_needed() {
+                    return Ok(());
+                }
+                nat_tunnel::winlaunch::detach_console_if_alone();
+            }
+            // A graphics failure can be an error or a panic (wgpu treats some as fatal): either way try
+            // OpenGL once in a fresh process before giving up with a message the user can read.
+            // eframe can hang instead of failing when the graphics system is unusable: if no window
+            // appears within 20 s, treat it as a failure.
+            std::thread::spawn(|| {
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    if gui::GUI_READY.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                gui_fatal("The window did not start within 20 seconds (the graphics system may be unavailable).".to_string());
+            });
+            let first = std::panic::catch_unwind(gui::run);
+            let failure = match first {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(p) => Some(
+                    p.downcast_ref::<String>().cloned()
+                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "the graphics system stopped the window".to_string()),
+                ),
+            };
+            if let Some(msg) = failure {
+                // One path for every failure: OpenGL retry in a fresh process, else the message box; it exits.
+                gui_fatal(msg);
+                loop {
+                    std::thread::park();
+                }
+            }
         }
         Some(Command::Ui {
             role,

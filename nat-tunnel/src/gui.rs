@@ -247,6 +247,9 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+/// Set once eframe has created the window and handed over the app (the renderer works).
+pub static GUI_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn run() -> io::Result<()> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([WINDOW_W, WINDOW_H])
@@ -258,8 +261,14 @@ pub fn run() -> io::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // DirectX/Vulkan/Metal first; main.rs restarts the app with STRAIT_RENDERER=glow when that cannot start.
+    let renderer = match std::env::var("STRAIT_RENDERER").as_deref() {
+        Ok("glow") => eframe::Renderer::Glow,
+        _ => eframe::Renderer::Wgpu,
+    };
     let options = eframe::NativeOptions {
         viewport,
+        renderer,
         ..Default::default()
     };
 
@@ -267,6 +276,7 @@ pub fn run() -> io::Result<()> {
         "Strait",
         options,
         Box::new(|cc| {
+            GUI_READY.store(true, std::sync::atomic::Ordering::Relaxed);
             install_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx);
             Ok(Box::new(GuiApp::new(cc)))
@@ -1239,11 +1249,12 @@ impl GuiApp {
         let mut listen = Vec::new();
         let mut invite = invite;
         if !picks.is_empty() {
-            let Some(host) = crui::effective_host(Some(&verdict), &self.settings.carrier_public) else {
+            let host = crui::effective_host(Some(&verdict), &self.settings.carrier_public);
+            if host.is_none() && picks.iter().any(|(id, _)| crui::is_tcp(*id)) {
                 self.start_error = Some("Public address unknown: forward the port and enter your address.".into());
                 return;
-            };
-            let plan = crui::plan(&picks, &host);
+            }
+            let plan = crui::plan(&picks, host.as_deref());
             invite = crui::with_carriers(&invite, &plan.invite);
             listen = plan.listen;
         }
@@ -1937,7 +1948,8 @@ fn host_opts(r: &Resolved, max_clients: u8, rate_bytes: u64) -> app::HostOpts {
             fd_socket: None,
             bypass: Vec::new(),
         }),
-        userspace: cfg!(windows),
+        // Kernel TUN mode sets up no forwarding or NAT, so a shared connection needs the userspace exit on every OS.
+        userspace: true,
         max_clients: max_clients.clamp(1, app::MAX_LANES),
         rate_bytes,
         ..Default::default()
@@ -2018,7 +2030,7 @@ fn is_admin() -> bool {
 }
 
 impl eframe::App for GuiApp {
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Leaving while connected must not strand a root tunnel.
         #[cfg(unix)]
         if self.privs.is_some() {

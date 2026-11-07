@@ -1,6 +1,6 @@
 [package]
 name = "nat-tunnel"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/TheGreatDaniad/strait"
@@ -28,7 +28,7 @@ cr-awg = []
 cr-xray = []
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -49,7 +49,7 @@ socket2 = "0.6.5"
 libc = "0.2.191"
 ratatui = "0.30.2"
 crossterm = "0.29.0"
-eframe = { version = "0.37.0", optional = true }
+eframe = { version = "0.37.0", optional = true, features = ["glow"] }
 futures = "0.3"
 netstack-smoltcp = "0.2.4"
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }

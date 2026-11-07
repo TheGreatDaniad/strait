@@ -138,6 +138,10 @@ fn public_address_comes_from_the_verdict_or_the_typed_field() {
     assert_eq!(crui::effective_host(None, " host.example "), Some("host.example".into()));
     assert_eq!(crui::effective_host(None, ""), None);
     assert_eq!(crui::effective_host(None, "bad host"), None);
+    // Behind NAT the STUN address is not dialable: the typed address (if any) is used instead.
+    assert_eq!(crui::effective_host(Some(&v), ""), None);
+    assert_eq!(crui::effective_host(Some(&v), "fwd.example").as_deref(), Some("fwd.example"));
+    v.method = "public".into();
     assert_eq!(crui::effective_host(Some(&v), "other.example").as_deref(), Some("203.0.113.5"));
     for bad in ["", "1.2.3.4:80", "a b", "-x.com"] {
         assert!(crui::validate_host(bad).is_err(), "{bad}");
@@ -150,7 +154,7 @@ fn public_address_comes_from_the_verdict_or_the_typed_field() {
 #[test]
 fn selection_becomes_listeners_and_invite_entries_and_round_trips() {
     let picks = [(CarrierId::Ss, 7201), (CarrierId::Ws, 8443)];
-    let plan = crui::plan(&picks, "203.0.113.5");
+    let plan = crui::plan(&picks, Some("203.0.113.5"));
     // The host listens on every interface; the invite carries the public endpoint.
     assert_eq!(plan.listen[0].to_string(), "ss@0.0.0.0:7201");
     assert_eq!(plan.listen[1].to_string(), "ws@0.0.0.0:8443");
@@ -167,7 +171,7 @@ fn selection_becomes_listeners_and_invite_entries_and_round_trips() {
     // No carriers: the invite is byte-identical to the old one.
     assert_eq!(crui::with_carriers(&base, &[]).encode(), base.encode());
     // IPv6 host: bracketed.
-    let p6 = crui::plan(&[(CarrierId::Xray, 8444)], "2001:db8::1");
+    let p6 = crui::plan(&[(CarrierId::Xray, 8444)], Some("2001:db8::1"));
     assert_eq!(p6.invite[0].to_string(), "xray@[2001:db8::1]:8444");
     assert_eq!(Invite::parse(&crui::with_carriers(&base, &p6.invite).encode()).unwrap().cr, p6.invite);
     // Listener entries are valid CLI entries too.
@@ -296,4 +300,16 @@ async fn local_check_reports_a_taken_port_and_a_missing_xray() {
         let s = crui::local_check(CarrierId::Xray, 0, &cfg).await;
         assert_eq!(crui::chip(CarrierId::Xray, Some(&s)).0, "Xray not found", "{s:?}");
     }
+}
+
+#[test]
+fn udp_carriers_need_no_public_address() {
+    let ready = st(&[(CarrierId::Ss, ok()), (CarrierId::Awg, ok()), (CarrierId::Ws, ok())]);
+    // Behind NAT (no public address): ss and awg punch like plain UDP, ws needs a reachable port.
+    assert!(crui::blockers(&[pick(CarrierId::Ss, "7201"), pick(CarrierId::Awg, "7202")], &ready, 7100, None).is_empty());
+    assert!(!crui::blockers(&[pick(CarrierId::Ws, "8443")], &ready, 7100, None).is_empty());
+    let p = crui::plan(&[(CarrierId::Ss, 7201)], None);
+    assert!(p.invite[0].endpoint.is_none() && p.listen[0].endpoint.is_none());
+    let p = crui::plan(&[(CarrierId::Ss, 7201)], Some("203.0.113.5"));
+    assert!(p.invite[0].endpoint.is_some());
 }

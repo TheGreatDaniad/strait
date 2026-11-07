@@ -31,7 +31,7 @@ The two peers can choose how they connect. Besides the built-in encrypted UDP tu
 for networks that block or inspect traffic:
 
 - Shadowsocks-2022
-- AmneziaWG (obfuscated WireGuard)
+- Obfuscated UDP in the style of AmneziaWG (our own envelope, not compatible with WireGuard or AmneziaWG clients)
 - WebSocket over TLS
 - Xray (VLESS + REALITY)
 
@@ -48,6 +48,21 @@ and A reaches the internet with B's IP address. If a direct connection is not po
 quietly routing through a third party.
 
 ---
+
+## Download
+
+Get the latest build from the [Releases page](https://github.com/TheGreatDaniad/strait/releases/latest).
+
+| System | File | Install |
+|---|---|---|
+| Ubuntu / Debian (Intel/AMD) | `strait_<version>_amd64.deb` | `sudo apt install ./strait_<version>_amd64.deb`, then open **Strait** from the menu |
+| Ubuntu / Debian (ARM) | `strait_<version>_arm64.deb` | same, with the arm64 file |
+| macOS (Apple silicon and Intel) | `strait-<version>-macos-universal.dmg` | open it, drag **Strait** to Applications, then right-click it and choose **Open** the first time (the app is not notarized) |
+| Windows 10/11 (64-bit) | `strait-<version>-windows-x64.zip` | unzip, keep `Strait.exe` and `wintun.dll` together, double-click `Strait.exe` and accept the administrator prompt (choose **More info > Run anyway** if SmartScreen warns; the app is not code-signed) |
+| Linux, other | `strait-<version>-linux-<arch>.tar.gz` | run `sudo ./nat-tunnel gui` |
+
+`SHA256SUMS` lists every file's checksum. Sharing or using the full tunnel needs administrator rights; the app asks for them.
+If the window cannot open (no usable graphics), Strait retries with OpenGL and then shows the reason instead of closing silently.
 
 ## Quick start
 

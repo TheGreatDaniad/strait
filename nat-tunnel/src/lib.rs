@@ -27,5 +27,7 @@ pub mod tunmode;
 pub mod tunmode;
 pub mod tunnel;
 pub mod ui;
+#[cfg(windows)]
+pub mod winlaunch;
 pub mod upnp;
 pub mod userspace;

@@ -1545,6 +1545,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -3062,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "nat-tunnel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chacha20poly1305 0.10.1",

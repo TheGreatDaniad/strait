@@ -1046,9 +1046,12 @@ pub mod crui {
         if host.parse::<std::net::Ipv6Addr>().is_ok() { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
     }
 
-    /// Public host to use: the verdict's, else the one the user typed (when valid).
+    /// Public host to use: the verdict's when clients can really dial it (public address or router
+    /// mapping; behind NAT the STUN address is no listener), else the one the user typed (when valid).
     pub fn effective_host(v: Option<&HostVerdict>, typed: &str) -> Option<String> {
-        v.and_then(public_host).or_else(|| validate_host(typed).ok().filter(|_| !typed.trim().is_empty()))
+        v.filter(|v| matches!(v.method.as_str(), "public" | "upnp" | "natpmp" | "pcp" | "ipv6"))
+            .and_then(public_host)
+            .or_else(|| validate_host(typed).ok().filter(|_| !typed.trim().is_empty()))
     }
 
     // ---- gating ----
@@ -1091,7 +1094,8 @@ pub mod crui {
                 _ => {}
             }
         }
-        if !picks.is_empty() && host.is_none() {
+        // UDP carriers (ss, awg) punch through NAT like plain UDP, so only TCP ones need a reachable address.
+        if picks.iter().any(|p| is_tcp(p.id)) && host.is_none() {
             out.push("Public address unknown: forward the port and enter your address.".into());
         }
         out
@@ -1108,11 +1112,20 @@ pub mod crui {
         pub invite: Vec<CarrierEntry>,
     }
 
-    pub fn plan(picks: &[(CarrierId, u16)], host: &str) -> Plan {
+    /// `host` is `None` behind NAT: UDP carriers then ride the punched UDP socket (no endpoint in the invite).
+    pub fn plan(picks: &[(CarrierId, u16)], host: Option<&str>) -> Plan {
         let mut p = Plan::default();
         for &(id, port) in picks {
-            p.listen.push(CarrierEntry::new(id).at(format!("0.0.0.0:{port}")));
-            p.invite.push(CarrierEntry::new(id).at(join_endpoint(host, port)));
+            match host {
+                Some(h) => {
+                    p.listen.push(CarrierEntry::new(id).at(format!("0.0.0.0:{port}")));
+                    p.invite.push(CarrierEntry::new(id).at(join_endpoint(h, port)));
+                }
+                None => {
+                    p.listen.push(CarrierEntry::new(id));
+                    p.invite.push(CarrierEntry::new(id));
+                }
+            }
         }
         p
     }
