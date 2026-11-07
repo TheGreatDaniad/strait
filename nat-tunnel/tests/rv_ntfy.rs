@@ -103,7 +103,7 @@ impl Fake {
                 ua = v.trim().to_string();
             }
         }
-        assert_eq!(ua, "strait-rendezvous");
+        assert_eq!(ua, "mozilla/5.0"); // generic on purpose: nothing names the product
         let mut body = vec![0u8; len];
         r.read_exact(&mut body).await.unwrap();
         let body = String::from_utf8(body).unwrap();
@@ -195,7 +195,7 @@ fn msg_line(seq: u64, t: u64, topic: &str, body: &str) -> String {
 }
 
 fn topic() -> String {
-    Derived::new(&KEY).room_topic()
+    Derived::new(&KEY).ntfy_topic()
 }
 fn ctx(role: Role) -> RvCtx {
     RvCtx::new(KEY, role, vec![if role == Role::Host { HOST } else { CLIENT }.parse().unwrap()])

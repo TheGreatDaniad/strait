@@ -245,13 +245,64 @@ fn spawn_child(cfg: &SidecarConfig) -> Result<Child, SidecarError> {
     if let Some(d) = &cfg.working_dir {
         c.current_dir(d);
     }
-    c.spawn().map_err(|e| {
+    // Linux: the kernel SIGKILLs the child when the thread that spawned it dies (the process being
+    // killed, or its runtime worker ending). Not set on other unixes (no prctl).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        c.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+            Ok(())
+        });
+    }
+    let child = c.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             SidecarError::Missing(cfg.program.clone())
         } else {
             SidecarError::Spawn(e.to_string())
         }
-    })
+    })?;
+    #[cfg(windows)]
+    win_job::adopt(&child);
+    Ok(child)
+}
+
+/// Windows: every sidecar joins one kill-on-close Job Object owned by this process, so the OS kills
+/// them when we die however we die (Stop-Process, crash). Best effort: on failure (e.g. we run in
+/// a job that forbids nesting) the child just is not tied. A tiny window between spawn and
+/// assignment remains. macOS/BSD: no equivalent, a killed parent leaves the sidecar running.
+#[cfg(windows)]
+mod win_job {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::*;
+
+    static JOB: OnceLock<usize> = OnceLock::new();
+
+    fn create() -> usize {
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return 0;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(h, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of_val(&info) as u32);
+            if ok == 0 {
+                log::warn!("sidecar job object: cannot set kill-on-close ({})", std::io::Error::last_os_error());
+                return 0;
+            }
+            h as usize
+        }
+    }
+
+    pub fn adopt(child: &tokio::process::Child) {
+        let job = *JOB.get_or_init(create);
+        if let (true, Some(p)) = (job != 0, child.raw_handle()) {
+            if unsafe { AssignProcessToJobObject(job as HANDLE, p as HANDLE) } == 0 {
+                log::warn!("sidecar job object: cannot add the child ({}); it may outlive us", std::io::Error::last_os_error());
+            }
+        }
+    }
 }
 
 fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(

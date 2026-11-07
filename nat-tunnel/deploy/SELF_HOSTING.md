@@ -12,10 +12,12 @@ a public or mapped endpoint needs no server at all.
 
 `deploy/deploy.sh` (run as root on the VPS) installs `strait-host.service`: the
 multiplexed host, one UDP port (7100), many clients, started from the invite in
-`/etc/strait/host.env` (0600). Default args:
+`/etc/strait/host.env` (0600). The binary reads `STRAIT_INVITE` from its environment
+(systemd `EnvironmentFile`), so the invite never appears in `ps`; `--invite` and `--invite-file`
+(guest) still work. Default args:
 
 ```
-nat-tunnel host --invite $STRAIT_INVITE --tun 10.7.0.1/16 --userspace --max-clients 8
+nat-tunnel host --tun 10.7.0.1/16 --userspace --max-clients 8
 ```
 
 `--userspace` terminates client TCP/UDP inside the process and re-dials it from

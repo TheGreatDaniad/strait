@@ -27,7 +27,11 @@ pub const MAX_CANDIDATES: usize = 8;
 #[derive(Clone, PartialEq, Eq)]
 pub struct Derived {
     pub seal_key: [u8; 32],
-    pub room: [u8; 32],
+    /// One identifier per backend, so observers of different services cannot join them.
+    pub room_trk: [u8; 32],
+    pub room_mqtt: [u8; 32],
+    pub room_ntfy: [u8; 32],
+    pub room_nostr: [u8; 32],
     pub dht_host_seed: [u8; 32],
     pub dht_client_seed: [u8; 32],
 }
@@ -84,7 +88,10 @@ impl Derived {
         };
         Self {
             seal_key: ex(b"seal"),
-            room: ex(b"room"),
+            room_trk: ex(b"room-trk"),
+            room_mqtt: ex(b"room-mqtt"),
+            room_ntfy: ex(b"room-ntfy"),
+            room_nostr: ex(b"room-nostr"),
             dht_host_seed: ex(b"dht-host"),
             dht_client_seed: ex(b"dht-client"),
         }
@@ -95,19 +102,24 @@ impl Derived {
         parse_key(key).map(|k| Self::new(&k))
     }
 
-    /// Tracker info_hash: first 20 bytes of the room tag.
+    /// Tracker info_hash: first 20 bytes of the tracker tag.
     pub fn room_info_hash(&self) -> [u8; 20] {
-        self.room[..20].try_into().unwrap()
+        self.room_trk[..20].try_into().unwrap()
     }
 
-    /// ntfy / MQTT topic: `strait-` + lowercase base32 of the first 16 bytes (26 chars).
-    pub fn room_topic(&self) -> String {
-        format!("strait-{}", base32_lower(&self.room[..16]))
+    /// MQTT topic: lowercase base32 of the first 16 bytes of the MQTT tag (26 chars).
+    pub fn mqtt_topic(&self) -> String {
+        base32_lower(&self.room_mqtt[..16])
     }
 
-    /// Nostr `r` tag: the full room tag as lowercase hex.
+    /// ntfy topic: same shape, own tag.
+    pub fn ntfy_topic(&self) -> String {
+        base32_lower(&self.room_ntfy[..16])
+    }
+
+    /// Nostr `r` tag: the full nostr tag as lowercase hex.
     pub fn room_hex(&self) -> String {
-        hex(&self.room)
+        hex(&self.room_nostr)
     }
 }
 
@@ -390,16 +402,16 @@ mod tests {
     #[test]
     fn domain_separation() {
         let x = d();
-        let v = [x.seal_key, x.room, x.dht_host_seed, x.dht_client_seed];
-        for i in 0..4 {
-            for j in i + 1..4 {
+        let v = [x.seal_key, x.room_trk, x.room_mqtt, x.room_ntfy, x.room_nostr, x.dht_host_seed, x.dht_client_seed];
+        for i in 0..v.len() {
+            for j in i + 1..v.len() {
                 assert_ne!(v[i], v[j], "{i} vs {j}");
             }
         }
         let y = Derived::new(&[K[0] ^ 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         assert_ne!(x.seal_key, y.seal_key);
-        assert_ne!(x.room, y.room);
-        assert_eq!(&x.room[..20], &x.room_info_hash());
+        assert_ne!(x.room_trk, y.room_trk);
+        assert_eq!(&x.room_trk[..20], &x.room_info_hash());
         // none of the derived values equals the key (or contains it as a prefix)
         assert!(v.iter().all(|s| s[..16] != K));
     }
@@ -407,9 +419,10 @@ mod tests {
     #[test]
     fn topic_and_hex_shapes() {
         let x = d();
-        let t = x.room_topic();
-        assert!(t.starts_with("strait-") && t.len() == 7 + 26, "{t}");
-        assert!(t[7..].bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)));
+        let t = x.mqtt_topic();
+        assert!(t.len() == 26 && !t.contains("strait"), "{t}");
+        assert_ne!(t, x.ntfy_topic());
+        assert!(t.bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)));
         assert_eq!(x.room_hex().len(), 64);
         // RFC 4648 vectors (lowercase, unpadded)
         assert_eq!(base32_lower(b"foobar"), "mzxw6ytboi");
@@ -432,10 +445,12 @@ mod tests {
     fn pinned_vectors() {
         let x = d();
         assert_eq!(hex(&x.seal_key), "ba4b1c0d17e9877100c95a204557ea405205ec9dc79c8ba98db84db33fd9d127");
-        assert_eq!(hex(&x.room), "e4082b688b7958e32ec2ecefb0223f8da54fe8ac3a263dc9589f210b8a8d165e");
+        assert_eq!(hex(&x.room_trk), "170f5f26257afc16d5cef6bbebd157f8d585a46f7a5de937a4901029b25ceb04");
         assert_eq!(hex(&x.dht_host_seed), "9a41f82e02a6707024f2577a5d640f4dafcecabbc2bd10f3518466c2c9615f94");
         assert_eq!(hex(&x.dht_client_seed), "10c85213c33234e60ada5bf7f4f05bfba3a2fb2c84f28ab36f818db41e1d0258");
-        assert_eq!(x.room_topic(), "strait-4qecw2elpfmoglwc5tx3air7ru");
+        assert_eq!(x.mqtt_topic(), "5vqmlkj5pglygtsear73zedboy");
+        assert_eq!(x.ntfy_topic(), "b6on5ohf46furi6ic4mnwkv4ua");
+        assert_eq!(x.room_hex(), "0c406de7634f07f9ee2b5c533d26547a55521772591be5bf162dd612531909f6");
         assert_eq!(hex(&sealed(Role::Host, &[a4(), a6()], NOW)), "07070707070707070707070717cdddc391b83f73b4606bb236ae79862794eddb4967b453d1c8634716c6d8921678719d8692286c7ee3835796f9d8cb79");
     }
 }

@@ -20,12 +20,16 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
 
 use super::{CarrierError, CarrierId, Caps, FrameIo, Health};
 
 pub const DEMUX_HEADER: usize = 4;
+/// A client mapping unused this long is dropped (its next datagram just gets a fresh mapping).
+const MAP_IDLE: Duration = Duration::from_secs(600);
+const MAP_SWEEP: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Demux {
@@ -64,6 +68,8 @@ pub struct LoopbackStats {
     pub foreign: u64,
     /// New client mappings refused because `max_clients` was reached.
     pub refused_clients: u64,
+    /// Datagrams over the frame limit, dropped alone (the carrier stays usable).
+    pub oversize: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +77,30 @@ struct HostMap {
     by_key: HashMap<(SocketAddr, u32), SocketAddr>,
     by_peer: HashMap<SocketAddr, (SocketAddr, u32)>,
     next: u32,
+    /// Last datagram per synthetic peer, for idle expiry.
+    seen: HashMap<SocketAddr, Instant>,
+    swept: Option<Instant>,
+}
+
+impl HostMap {
+    fn remove(&mut self, peer: SocketAddr) {
+        if let Some(k) = self.by_peer.remove(&peer) {
+            self.by_key.remove(&k);
+        }
+        self.seen.remove(&peer);
+    }
+
+    /// Drop mappings idle longer than `MAP_IDLE`; at most once per `MAP_SWEEP` unless `force`.
+    fn sweep(&mut self, now: Instant, force: bool) {
+        if !force && self.swept.is_some_and(|t| now.duration_since(t) < MAP_SWEEP) {
+            return;
+        }
+        self.swept = Some(now);
+        let idle: Vec<_> = self.seen.iter().filter(|(_, t)| now.duration_since(**t) >= MAP_IDLE).map(|(p, _)| *p).collect();
+        for p in idle {
+            self.remove(p);
+        }
+    }
 }
 
 enum Role {
@@ -86,6 +116,7 @@ pub struct LoopbackUdp {
     scratch: Mutex<Vec<u8>>,
     foreign: AtomicU64,
     refused: AtomicU64,
+    oversize: AtomicU64,
 }
 
 fn synthetic(n: u32) -> SocketAddr {
@@ -119,6 +150,7 @@ impl LoopbackUdp {
             scratch: Mutex::new(vec![0u8; 65536]),
             foreign: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            oversize: AtomicU64::new(0),
         }
     }
 
@@ -128,16 +160,16 @@ impl LoopbackUdp {
     }
 
     pub fn stats(&self) -> LoopbackStats {
-        LoopbackStats { foreign: self.foreign.load(Ordering::Relaxed), refused_clients: self.refused.load(Ordering::Relaxed) }
+        LoopbackStats {
+            foreign: self.foreign.load(Ordering::Relaxed), refused_clients: self.refused.load(Ordering::Relaxed),
+            oversize: self.oversize.load(Ordering::Relaxed),
+        }
     }
 
     /// Host side: drop the mapping of an evicted peer.
     pub fn forget(&self, peer: SocketAddr) {
         if let Role::Host { map } = &self.role {
-            let mut m = map.lock().unwrap();
-            if let Some(k) = m.by_peer.remove(&peer) {
-                m.by_key.remove(&k);
-            }
+            map.lock().unwrap().remove(peer);
         }
     }
 
@@ -227,9 +259,14 @@ impl FrameIo for LoopbackUdp {
                         }
                         let cid = u32::from_be_bytes(sc[..4].try_into().unwrap());
                         let mut m = map.lock().unwrap();
+                        let now = Instant::now();
+                        m.sweep(now, false);
                         let peer = match m.by_key.get(&(src, cid)) {
                             Some(p) => *p,
                             None => {
+                                if m.by_peer.len() >= self.cfg.max_clients {
+                                    m.sweep(now, true);
+                                }
                                 if m.by_peer.len() >= self.cfg.max_clients {
                                     self.refused.fetch_add(1, Ordering::Relaxed);
                                     continue;
@@ -241,12 +278,14 @@ impl FrameIo for LoopbackUdp {
                                 p
                             }
                         };
+                        m.seen.insert(peer, now);
                         (&sc[DEMUX_HEADER..n], peer)
                     }
                 },
             };
             if payload.len() > buf.len() || payload.len() > self.cfg.max_frame {
-                return Err(CarrierError::FrameTooLarge { max: buf.len().min(self.cfg.max_frame) }.into());
+                self.oversize.fetch_add(1, Ordering::Relaxed); // drop this datagram only; an Err would mute the carrier
+                continue;
             }
             buf[..payload.len()].copy_from_slice(payload);
             return Ok((payload.len(), peer));
@@ -259,5 +298,43 @@ impl FrameIo for LoopbackUdp {
 
     fn health(&self) -> Health {
         self.guard.as_ref().map(|g| g.health()).unwrap_or(Health::Ok)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_mappings_expire_and_forget_frees() {
+        let mut m = HostMap::default();
+        let t = Instant::now();
+        for i in 1..=3u32 {
+            let (p, k) = (synthetic(i), (SocketAddr::from(([127, 0, 0, 1], 1000 + i as u16)), i));
+            m.by_key.insert(k, p);
+            m.by_peer.insert(p, k);
+            m.seen.insert(p, if i == 3 { t + MAP_IDLE } else { t });
+        }
+        m.sweep(t + MAP_IDLE, true);
+        assert_eq!((m.by_peer.len(), m.by_key.len(), m.seen.len()), (1, 1, 1));
+        m.remove(synthetic(3));
+        assert!(m.by_peer.is_empty() && m.by_key.is_empty() && m.seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversize_datagram_is_dropped_alone() {
+        let mut cfg = LoopbackCfg::new(CarrierId::Xray);
+        cfg.max_frame = 100;
+        let host = LoopbackUdp::host(cfg, "127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let to = host.local_addr().unwrap();
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.send_to(&[1u8; 101], to).await.unwrap();
+        s.send_to(&[2u8; 10], to).await.unwrap();
+        host.readable().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut b = [0u8; 200];
+        let (n, _) = host.try_recv_from(&mut b).expect("the good datagram, not an error");
+        assert_eq!((n, b[0]), (10, 2));
+        assert_eq!(host.stats().oversize, 1);
     }
 }

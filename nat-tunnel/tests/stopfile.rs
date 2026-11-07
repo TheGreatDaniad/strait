@@ -15,7 +15,7 @@ fn scratch(mode: u32) -> PathBuf {
 
 fn spawn_guest(dir: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_nat-tunnel"))
-        .args(["guest", "--invite", "STRAIT2|k|127.0.0.1:9", "--listen", "127.0.0.1:0"])
+        .args(["guest", "--invite", "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:9", "--listen", "127.0.0.1:0"])
         .arg("--stop-file")
         .arg(dir.join("stop"))
         .arg("--log-file")
@@ -80,7 +80,7 @@ fn stop_file_owned_by_another_uid_is_refused() {
     let dir = scratch(0o700);
     let me = unsafe { libc::geteuid() };
     let mut child = Command::new(env!("CARGO_BIN_EXE_nat-tunnel"))
-        .args(["guest", "--invite", "STRAIT2|k|127.0.0.1:9", "--listen", "127.0.0.1:0"])
+        .args(["guest", "--invite", "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:9", "--listen", "127.0.0.1:0"])
         .arg("--stop-file")
         .arg(dir.join("stop"))
         .arg("--stop-uid")

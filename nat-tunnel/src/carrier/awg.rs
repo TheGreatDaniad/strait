@@ -103,10 +103,12 @@ pub enum Role {
 pub struct AwgCarrier {
     inner: Arc<dyn FrameIo>,
     keys: Keys,
+    key: Vec<u8>,
     role: Role,
     rng: Mutex<Rng>,
     junked: Mutex<HashSet<SocketAddr>>,
     scratch: Mutex<Vec<u8>>,
+    rejected: super::Rejects,
 }
 
 impl AwgCarrier {
@@ -121,10 +123,12 @@ impl AwgCarrier {
         Self {
             inner,
             keys: derive(key),
+            key: key.to_vec(),
             role,
             rng: Mutex::new(rng),
             junked: Mutex::new(HashSet::new()),
             scratch: Mutex::new(vec![0u8; 65536]),
+            rejected: Default::default(),
         }
     }
 
@@ -248,10 +252,28 @@ impl FrameIo for AwgCarrier {
                 buf[..f.len()].copy_from_slice(&f);
                 return Ok((f.len(), from));
             }
+            if self.role == Role::Client {
+                self.rejected.note(from);
+            }
         }
+    }
+    fn take_rejected(&self) -> Vec<SocketAddr> {
+        self.rejected.take()
     }
     async fn readable(&self) -> io::Result<()> {
         self.inner.readable().await
+    }
+    /// No junk burst: a port scan would send one to each of 64k destinations.
+    async fn send_probe(&self, frame: &[u8], to: SocketAddr) -> io::Result<usize> {
+        if frame.len() > self.caps().max_frame {
+            return Err(CarrierError::FrameTooLarge { max: self.caps().max_frame }.into());
+        }
+        self.inner.send_to(&self.seal(frame), to).await?;
+        Ok(frame.len())
+    }
+    async fn sibling(&self) -> Option<Arc<dyn FrameIo>> {
+        let inner = self.inner.sibling().await?;
+        Some(Arc::new(AwgCarrier::wrap(inner, &self.key, self.role)))
     }
     /// Punch / STUN packets go through the raw socket; the envelope check drops them on receive.
     fn udp(&self) -> Option<&tokio::net::UdpSocket> {

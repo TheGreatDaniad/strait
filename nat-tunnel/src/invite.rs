@@ -305,6 +305,22 @@ impl Invite {
         out.join(",")
     }
 
+    /// Refuse a key that is not 16 random-looking bytes (32 hex chars). `parse` stays permissive;
+    /// callers that start a tunnel run this on the key they are about to use.
+    pub fn check_key(key: &str) -> Result<(), String> {
+        let b = crate::rendezvous::derive::parse_key(key).ok_or(
+            "invalid key: expected 32 hex characters (16 bytes); omit --key to have one generated",
+        )?;
+        let mut distinct = b.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        // Period 1, 2, 4 or 8 (all-same byte, short repeat) or very few distinct bytes.
+        if b[..8] == b[8..] || distinct.len() < 6 {
+            return Err("weak key: it repeats a short pattern; use a random 32-hex-character key".into());
+        }
+        Ok(())
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         let value = value.trim();
         if value.is_empty() {
@@ -415,6 +431,27 @@ fn parse_addrs(value: &str) -> Option<Vec<Endpoint>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weak_keys_are_rejected() {
+        for bad in [
+            "k",
+            "",
+            "00000000000000000000000000000000",
+            "abababababababababababababababab",
+            "01234567012345670123456701234567",
+            "0123456789abcdef0123456789abcdef",
+            "00112233445566778899aabbccddee", // 15 bytes
+            "000000000000000100000000000000010",
+            "0000000000000001000000000000000g",
+            "00010200010200010200010200010201", // few distinct bytes
+        ] {
+            assert!(Invite::check_key(bad).is_err(), "{bad:?}");
+        }
+        for good in ["0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff", "0123456789abcdef0123456789abcdef"] {
+            assert!(Invite::check_key(good).is_ok(), "{good:?}");
+        }
+    }
 
     #[test]
     fn public_host_invite_round_trips() {

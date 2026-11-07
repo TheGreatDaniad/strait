@@ -24,21 +24,21 @@
         "address": "203.0.113.7",
         "encryption": "none",
         "flow": "",
-        "id": "22847d9d-4c7a-4676-bc2d-0b8f3c9ab2e0",
+        "id": "f5407a91-dc3e-4c49-ad62-5a750dea84d4",
         "port": 443
       },
       "streamSettings": {
         "network": "xhttp",
         "realitySettings": {
           "fingerprint": "firefox",
-          "publicKey": "tlannVY4XPvuZ3yLdVXXlCMll1_uYWyOrOwvi1smEVc",
+          "publicKey": "WtSooJMsuBDgMF8BOngY-HOzRjqEJuBOuVv_tOEqc3g",
           "serverName": "www.example.org",
-          "shortId": "75406c0596d6c37f"
+          "shortId": "12d4cc55f2f831e2"
         },
         "security": "reality",
         "xhttpSettings": {
           "mode": "packet-up",
-          "path": "/c48f92869a665906"
+          "path": "/8fb29121779d81a2"
         }
       },
       "tag": "out"

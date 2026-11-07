@@ -93,11 +93,55 @@ The Shadowsocks, AmneziaWG, WebSocket and Xray transports are opt-in build featu
 Mobile: `cd strait-mobile && npm install && npx jest`. Device builds are in `strait-mobile/ios/README_DEVICE_TESTING.md`.
 A packet-tunnel VPN on iOS needs a paid Apple Developer team.
 
-## Status
+## Test results (AWS NAT lab)
 
-Alpha. Verified on macOS, Windows 11 ARM and Android (emulator) against a real internet host, over every rendezvous method.
-iOS runs in the simulator; the system VPN is untested on a device. Some network combinations (for example both peers behind
-symmetric NAT) cannot connect directly, and the app says so instead of falling back to a relay.
+Measured on AWS, not an emulator: 16 "houses" in 3 regions (Linux arm64 and Windows Server 2022), each behind its own NAT and
+controlled over SSM. Peers used public rendezvous only (trackers, Nostr, DHT, ntfy, MQTT), with no server of ours and no relay.
+Tested build: the code released as v0.4.0.
+
+NAT types in the lab:
+
+| House | NAT | House | NAT |
+|---|---|---|---|
+| a | port-restricted (Linux masquerade) | e | address-restricted |
+| b | AWS NAT Gateway (symmetric) | f | carrier-grade (two NATs, outer random) |
+| c | symmetric (`random` masquerade) | g | UDP blocked (only 53/123) |
+| d | full cone | h | public, no NAT |
+
+Linux to Linux, UDP over trackers, ✅ = connects and moves data, ❌ = cannot connect (row = host, column = client):
+
+| host \ client | a | b | c | d | e | f | g | h |
+|---|---|---|---|---|---|---|---|---|
+| a port-restricted | - | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| b symmetric | ✅ | - | ❌ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| c symmetric | ✅ | ❌ | - | ✅ | ✅ | ❌ | ❌ | ✅ |
+| d full cone | ✅ | ✅ | ✅ | - | ✅ | ✅ | ❌ | ✅ |
+| e address-restricted | ✅ | ✅ | ✅ | ✅ | - | ✅ | ❌ | ✅ |
+| f carrier-grade | ✅ | ❌ | ❌ | ✅ | ✅ | - | ❌ | ✅ |
+| h public | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ ws only | - |
+
+- Every pair that is possible without a relay passes, and nothing passes that should not. The only failures are both sides
+  symmetric (b, c, f among themselves) and the UDP-blocked house g, which can only use `ws`, and only to a host with inbound TCP.
+- Windows to Windows and Windows to Linux behave the same way (91 cross-OS pairs, 60 of 60 repeats for non-symmetric pairs).
+- A port-restricted client reaching a symmetric host has to scan ports, which takes 5-59 s. The scan is rate-limited in stages
+  (400, then 1500, then up to 4000 packets/s) so it cannot exhaust a small home router's NAT table.
+- Throughput, same region: 360-447 Mbit/s; cross-region: 29-130 Mbit/s; 0 % UDP loss in every passing run.
+- Transports `udp`, `ss`, `ws`, `awg` and `xray` work on Linux and Windows wherever the network allows them.
+- Rendezvous join time: trackers, Nostr, ntfy 0.5-3 s; MQTT 1-5 s; DHT 8-14 s.
+- Host on a real home connection (a Mac behind a consumer router, userspace exit): all 7 NAT types connected and moved data.
+
+| Client NAT | First ping | Up / down (Mbit/s) |
+|---|---|---|
+| port-restricted | 1.0 s | 129 / 137 |
+| full cone | 10.1 s | 97 / 128 |
+| address-restricted | 4.1 s | 41 / 53 |
+| public | 21.3 s | 48 / 52 |
+| symmetric (gateway) | 3.2 s | 43 / 58 |
+| symmetric (random) | 5.3 s | 32 / 37 |
+| carrier-grade | 11.3 s | 24 / 37 |
+
+Not covered yet: Mac and Android as clients, IPv6, real mobile networks, real consumer routers under the port scan, and the
+Windows userspace-exit crash seen in 5 of about 380 early jobs (it is contained, its trigger was never reproduced).
 
 ## Notes
 

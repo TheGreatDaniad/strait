@@ -118,7 +118,7 @@ fn overrides_are_validated() {
     let ok = RvOverrides {
         ntfy_base: "https://ntfy.example.com".into(),
         mqtt_broker: "broker.example.com:8883".into(),
-        trackers: "udp://t.example.org:6969, https://t2.example.org/announce".into(),
+        trackers: "udp://t.example.org:6969, udp://t2.example.org:6969".into(),
         relays: "wss://r1.example.org,wss://r2.example.org".into(),
     };
     let cfg = ok.config(Vec::new()).unwrap();
@@ -136,6 +136,7 @@ fn overrides_are_validated() {
     assert!(bad(|o| o.ntfy_base = "https://".into()));
     assert!(bad(|o| o.mqtt_broker = "nohostport".into()));
     assert!(bad(|o| o.trackers = "ftp://x".into()));
+    assert!(bad(|o| o.trackers = "https://t.example.org/announce".into())); // the tracker backend is UDP only
     assert!(bad(|o| o.relays = "https://relay".into()));
     assert!(bad(|o| o.relays = "wss://a b".into()));
     assert!(bad(|o| o.trackers = (0..9).map(|i| format!("udp://t{i}.x:1")).collect::<Vec<_>>().join(",")));
@@ -218,11 +219,11 @@ fn start_enabling_rules() {
 #[test]
 fn meeting_copy_per_nat_type() {
     let cone = rvui::meeting_copy(&verdict("blocked", "RestrictedCone", false, 7100));
-    assert!(cone.contains("does not open a port for clients") && cone.contains("meeting point"), "{cone}");
+    assert!(cone.contains("meeting point") && cone.contains("public services below"), "{cone}");
     assert!(!cone.contains("symmetric"));
     let sym = rvui::meeting_copy(&verdict("symmetric", "Symmetric", false, 7100));
     assert!(sym.contains("meeting point") && sym.contains("symmetric NAT"), "{sym}");
-    assert!(sym.contains("full-cone / address-restricted"));
+    assert!(sym.contains("full-cone or address-restricted") && sym.contains("public services below"));
     let blocked_v = verdict("blocked", "Block", false, 7100);
     let blocked = rvui::meeting_copy(&blocked_v);
     assert!(blocked.contains("these services cannot help") && blocked.contains("1. Enable UPnP") && blocked.contains("forward UDP 7100"), "{blocked}");

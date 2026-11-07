@@ -7,7 +7,7 @@
 //!   route its default traffic through the host.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -284,13 +284,10 @@ fn with_health(r: Reason, h: carrier::Health) -> Reason {
 
 fn reason_from_connect(e: &ConnectError, udp: bool) -> Reason {
     match e {
-        ConnectError::HostUnreachable | ConnectError::Symmetric => {
-            if udp {
-                Reason::NoPunch
-            } else {
-                Reason::Timeout
-            }
-        }
+        // Silent direct endpoints are a timeout (UDP may be blocked), not a failed punch.
+        ConnectError::HostUnreachable if udp => Reason::TimedOutWith("no reply from the host's UDP address".into()),
+        ConnectError::Symmetric if udp => Reason::NoPunch,
+        ConnectError::HostUnreachable | ConnectError::Symmetric => Reason::Timeout,
         ConnectError::Io(io) => match CarrierError::from_io(io) {
             Some(c) => reason_from_carrier(c),
             None if io.kind() == io::ErrorKind::InvalidInput && io.to_string().contains("forward mode needs") => {
@@ -525,11 +522,28 @@ pub async fn run_relay(port: u16) -> io::Result<()> {
     relay::run_server_with(port, cfg).await
 }
 
+/// The mux host's network is fixed (10.7.0.0/16, host 10.7.0.1; the prefix of `--tun` is
+/// ignored): refuse another address instead of silently serving a different one.
+fn check_mux_addr(addr: Ipv4Addr) -> io::Result<()> {
+    if addr == MUX_HOST_IP {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("--tun {addr}: the multi-client host always uses {MUX_HOST_IP}/{MUX_PREFIX}; pass --tun {MUX_HOST_IP}/{MUX_PREFIX} (a different tunnel network is not supported)"),
+    ))
+}
+
 /// Serve one tunnel session at a time: connect, bridge to the local service,
 /// and start over when the peer closes.
 pub async fn run_host(opts: HostOpts) -> io::Result<()> {
     if let Some(cfg) = opts.tun.clone() {
-        let kernel = (!opts.userspace).then_some(cfg);
+        check_mux_addr(cfg.addr)?;
+        if cfg!(windows) {
+            // main.rs forces userspace=true on Windows, so this must not depend on it
+            log::warn!("Windows hosts run userspace only (no TUN adapter is created): clients reach the internet and the LAN through the host's userspace exit");
+        }
+        let kernel = (!opts.userspace && !cfg!(windows)).then_some(cfg);
         return run_host_mux(&opts, kernel).await;
     }
     let mut limiter = RateLimiter::new(opts.rate_bytes);
@@ -665,6 +679,8 @@ async fn run_tun_guest(
     let mut dev: Option<(tunmode::TunDevice, Ipv4Addr, usize)> = None;
     let mut limiter: Option<RateLimiter> = None;
     let mut ever_connected = false;
+    let mut had_dev = false;
+    let mut pins: Vec<String> = Vec::new();
 
     // No outer stop arm: it would also fire mid-session and drop the BYE in
     // `tunnel.close()`. The stop is raced around connect and around the pump instead.
@@ -706,14 +722,33 @@ async fn run_tun_guest(
                 // The carrier that won decides the MTU; a device made for a bigger one is rebuilt.
                 let mtu = effective_mtu(&[tunnel.caps()]);
                 set_tun_mtu(mtu);
-                if dev.as_ref().map(|(_, a, m)| (*a, *m)) != Some((ip, mtu)) {
-                    drop(dev.take());
+                // Default-route mode: the transport's own destinations stay on the physical path.
+                let want_pins = if cfg.default_via.is_some() {
+                    transport_pins(tunnel.peer(), signal, &cfg.bypass)
+                } else {
+                    Vec::new()
+                };
+                if dev.as_ref().map(|(_, a, m)| (*a, *m)) != Some((ip, mtu)) || want_pins != pins {
+                    let rebuilt = dev.take().is_some() || had_dev;
                     let mut c = cfg.clone();
                     c.addr = ip;
                     c.prefix = prefix;
+                    c.bypass.extend(want_pins.iter().cloned());
                     log::info!("client address {ip}/{prefix}, MTU {mtu}, carrier {}", tunnel.caps().id);
-                    let mut d = tunmode::open(&c)?;
+                    let mut d = match tunmode::open(&c) {
+                        Ok(d) => d,
+                        // A rebuild can race with the kernel still removing the old interface: retry.
+                        Err(e) if rebuilt => {
+                            log::warn!("cannot reopen the TUN device: {e}; retrying");
+                            tunnel.close().await.ok();
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     d.start_reader();
+                    had_dev = true;
+                    pins = want_pins;
                     dev = Some((d, ip, mtu));
                 }
                 let (dev_ref, _, _) = dev.as_mut().expect("device opened above");
@@ -757,6 +792,12 @@ async fn run_tun_guest(
                         ));
                     }
                     log::warn!("guest tun session ended: {}", e);
+                    // An fd handed in by a VPN provider cannot be re-created here.
+                    if is_dev_err(&e) && cfg.fd.is_none() {
+                        // The interface is gone or detached; reusing it would leave the tunnel dead.
+                        log::warn!("TUN device failed; it is rebuilt for the next session");
+                        dev = None;
+                    }
                 }
                 ui::session_ended(&label);
                 tunnel.close().await.ok();
@@ -851,13 +892,22 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
         }
         None => None,
     };
+    // A fresh userspace stack (also used when the TCP engine died, see `userspace::contain_panic`).
+    // The userspace stack serves every client: its MTU is the largest carrier MTU, not the smallest
+    // (a ws/xray carrier at 1300 used to cap ss/awg clients that were told 1315-1342). TCP follows
+    // each client's own MSS and send_to_peer drops anything above that client's carrier MTU, so
+    // smaller-MTU clients stay safe. The kernel TUN is one device and keeps the minimum.
+    let stack_mtu = stack_mtu(&mux.caps(), mtu, dev.is_some());
+    let mk_stack = |mtu: usize| -> io::Result<_> {
+        let UserspaceHost { stack, tcp, udp } = userspace::build(mtu)?;
+        tokio::spawn(userspace::serve_tcp(tcp));
+        tokio::spawn(userspace::serve_udp(udp));
+        Ok(stack.split())
+    };
     let (mut stack_sink, mut stack_stream) = match dev {
         Some(_) => (None, None),
         None => {
-            let UserspaceHost { stack, tcp, udp } = userspace::build(mtu)?;
-            tokio::spawn(userspace::serve_tcp(tcp));
-            tokio::spawn(userspace::serve_udp(udp));
-            let (sink, stream) = stack.split();
+            let (sink, stream) = mk_stack(stack_mtu)?;
             (Some(sink), Some(stream))
         }
     };
@@ -866,6 +916,8 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_stats = tokio::time::Instant::now();
+    // Packets per direction, logged every 5 s while a client is connected (data-path diagnosis).
+    let (mut last_count, mut from_clients, mut to_clients, mut undelivered) = (tokio::time::Instant::now(), 0u64, 0u64, 0u64);
     let stop = stop_signal();
     tokio::pin!(stop);
 
@@ -875,10 +927,15 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
             while let Some(event) = mux.try_recv().await? {
                 match event {
                     MuxEvent::Packet { data, .. } => {
+                        from_clients += 1;
                         if let Some(d) = dev.as_mut() {
                             d.send(&data).await?;
                         } else if let Some(s) = stack_sink.as_mut() {
-                            s.send(data).await?;
+                            if s.send(data).await.is_err() {
+                                log::error!("userspace stack stopped; building a new one (open TCP flows are lost, clients stay connected)");
+                                let (sink, stream) = mk_stack(stack_mtu)?;
+                                (stack_sink, stack_stream) = (Some(sink), Some(stream));
+                            }
                         }
                     }
                     MuxEvent::Joined { ip, from, .. } => {
@@ -900,7 +957,10 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                         None => std::future::pending().await,
                     }
                 } => {
-                    route_to_client(&mut mux, &read?).await;
+                    to_clients += 1;
+                    if !route_to_client(&mut mux, &read?).await {
+                        undelivered += 1;
+                    }
                 }
                 packet = async {
                     match stack_stream.as_mut() {
@@ -909,9 +969,18 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                     }
                 } => {
                     match packet {
-                        Some(Ok(p)) => route_to_client(&mut mux, &p).await,
-                        Some(Err(e)) => return Err(e),
-                        None => return Ok(()),
+                        Some(Ok(p)) => {
+                            to_clients += 1;
+                            if !route_to_client(&mut mux, &p).await {
+                                undelivered += 1;
+                            }
+                        }
+                        Some(Err(_)) | None => {
+                            tokio::time::sleep(Duration::from_millis(100)).await; // never a hot loop
+                            log::error!("userspace stack stopped; building a new one (open TCP flows are lost, clients stay connected)");
+                            let (sink, stream) = mk_stack(stack_mtu)?;
+                            (stack_sink, stack_stream) = (Some(sink), Some(stream));
+                        }
                     }
                 }
                 _ = mux.readable() => {}
@@ -920,6 +989,16 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                     if last_stats.elapsed() >= Duration::from_secs(1) {
                         ui::stats(label, mux.bytes_sent(), mux.bytes_received());
                         last_stats = tokio::time::Instant::now();
+                    }
+                    if last_count.elapsed() >= Duration::from_secs(5) {
+                        if mux.peer_count() > 0 || from_clients + to_clients > 0 {
+                            log::info!(
+                                "host tun 5s: {from_clients} packets from clients into the {}, {to_clients} packets from it to clients ({undelivered} had no client to go to)",
+                                if dev.is_some() { "kernel TUN" } else { "userspace stack" }
+                            );
+                        }
+                        (from_clients, to_clients, undelivered) = (0, 0, 0);
+                        last_count = tokio::time::Instant::now();
                     }
                 }
                 _ = &mut stop => {
@@ -940,12 +1019,12 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
 
 /// Deliver a packet from the host's TUN/stack to the client that owns its
 /// destination address.
-async fn route_to_client(mux: &mut MuxHost, packet: &[u8]) {
+async fn route_to_client(mux: &mut MuxHost, packet: &[u8]) -> bool {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
-        return;
+        return false;
     }
     let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-    mux.send_to_ip(dst, packet).await;
+    mux.send_to_ip(dst, packet).await
 }
 
 /// One real TCP handshake through the tunnel (routed by the new default).
@@ -1016,6 +1095,43 @@ async fn stop_signal() {
     }
 }
 
+/// Host routes (`a.b.c.d/32`) that keep the tunnel's own traffic (the peer, the signal server) out
+/// of the tunnel once the default route points into it. IPv4 only; one the user already bypasses
+/// is not repeated.
+fn transport_pins(peer: Option<SocketAddr>, signal: Option<SocketAddr>, bypass: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for a in [peer, signal].into_iter().flatten() {
+        if let IpAddr::V4(ip) = a.ip() {
+            let pin = format!("{ip}/32");
+            if !bypass.contains(&pin) && !v.contains(&pin) {
+                v.push(pin);
+            }
+        }
+    }
+    v
+}
+
+/// An I/O error of the TUN device itself (interface deleted or detached under us), as opposed to
+/// the tunnel. After one the device cannot be reused: the session loop must open a new one.
+#[derive(Debug)]
+struct TunIoError(io::Error);
+
+impl std::fmt::Display for TunIoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for TunIoError {}
+
+fn dev_err(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), TunIoError(e))
+}
+
+fn is_dev_err(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.is::<TunIoError>())
+}
+
 async fn pipe_tun(
     tunnel: &mut Tunnel,
     dev: &mut tunmode::TunDevice,
@@ -1041,7 +1157,7 @@ async fn pipe_tun(
                     if let Some(limiter) = limiter {
                         limiter.wait(ip.len()).await;
                     }
-                    dev.send(&ip).await?;
+                    dev.send(&ip).await.map_err(dev_err)?;
                     tun_written += 1;
                 }
                 Some(Event::Closed) => {
@@ -1072,7 +1188,7 @@ async fn pipe_tun(
         let can_read = tunnel.can_send();
         tokio::select! {
             read = dev.recv(&mut buf), if can_read => {
-                let n = read?;
+                let n = read.map_err(dev_err)?;
                 if n == 0 {
                     continue;
                 }
@@ -1286,6 +1402,41 @@ mod tests {
     }
 
     #[test]
+    fn silent_direct_udp_is_a_timeout_not_no_punch() {
+        assert_eq!(reason_from_connect(&ConnectError::HostUnreachable, true).to_string(), "timed out (no reply from the host's UDP address)");
+        assert_eq!(reason_from_connect(&ConnectError::Symmetric, true).to_string(), "no punch");
+        assert_eq!(reason_from_connect(&ConnectError::HostUnreachable, false).to_string(), "timed out");
+    }
+
+    #[test]
+    fn tun_device_errors_are_told_apart_from_tunnel_errors() {
+        let e = dev_err(io::Error::from_raw_os_error(77));
+        assert!(is_dev_err(&e));
+        assert_eq!(e.raw_os_error(), None, "wrapped");
+        assert!(e.to_string().contains("os error 77"), "{e}");
+        assert!(!is_dev_err(&io::Error::from_raw_os_error(77)));
+        assert!(!is_dev_err(&io::Error::other("tunnel")));
+    }
+
+    #[test]
+    fn transport_destinations_are_pinned_off_the_tunnel() {
+        let p: SocketAddr = "203.0.113.7:7100".parse().unwrap();
+        let sig: SocketAddr = "198.51.100.2:7000".parse().unwrap();
+        assert_eq!(transport_pins(Some(p), Some(sig), &[]), vec!["203.0.113.7/32", "198.51.100.2/32"]);
+        assert_eq!(transport_pins(Some(p), Some(p), &[]), vec!["203.0.113.7/32"]);
+        assert!(transport_pins(Some(p), None, &["203.0.113.7/32".into()]).is_empty());
+        assert!(transport_pins(Some("[2001:db8::1]:1".parse().unwrap()), None, &[]).is_empty());
+        assert!(transport_pins(None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn mux_host_rejects_other_tunnel_address() {
+        assert!(check_mux_addr(Ipv4Addr::new(10, 7, 0, 1)).is_ok());
+        let e = check_mux_addr(Ipv4Addr::new(10, 42, 0, 1)).unwrap_err();
+        assert!(e.to_string().contains("10.42.0.1") && e.to_string().contains("10.7.0.1/16"), "{e}");
+    }
+
+    #[test]
     fn lane_gateway_is_stable() {
         assert_eq!(lane_gateway(0), std::net::Ipv4Addr::new(10, 7, 0, 1));
         assert_eq!(lane_gateway(3), std::net::Ipv4Addr::new(10, 7, 3, 1));
@@ -1354,5 +1505,30 @@ impl RateLimiter {
             let deficit = need - self.tokens;
             tokio::time::sleep(Duration::from_secs_f64(deficit / self.rate)).await;
         }
+    }
+}
+
+/// MTU of the host's userspace stack: the largest carrier MTU (see `run_host`); `min` for a kernel TUN.
+fn stack_mtu(caps: &[crate::carrier::Caps], min: usize, kernel_tun: bool) -> usize {
+    if kernel_tun {
+        return min;
+    }
+    caps.iter().map(|c| c.tun_mtu()).max().unwrap_or(min).clamp(min, 1400)
+}
+
+#[cfg(test)]
+mod stack_mtu_tests {
+    use super::*;
+    use crate::carrier::{Caps, CarrierId};
+
+    #[test]
+    fn userspace_stack_follows_the_largest_carrier_kernel_tun_the_smallest() {
+        let ws = Caps { id: CarrierId::Ws, max_frame: 1435, punchable: false, reliable_stream: true, overhead: 0 };
+        let ss = Caps { id: CarrierId::Ss, max_frame: 1435, punchable: false, reliable_stream: false, overhead: 0 };
+        assert_eq!(ws.tun_mtu(), 1300);
+        assert!(ss.tun_mtu() > 1300);
+        let caps = [ws, ss];
+        assert_eq!(stack_mtu(&caps, 1300, true), 1300);
+        assert_eq!(stack_mtu(&caps, 1300, false), ss.tun_mtu());
     }
 }

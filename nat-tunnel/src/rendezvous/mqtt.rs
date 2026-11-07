@@ -5,7 +5,7 @@
 //!
 //! Brokers: `RvConfig.mqtt_broker` (comma list of `host:port`, `mqtts://`/`ssl://`/`tls://` or
 //! `mqtt://`/`tcp://` URLs; bare `host:port` is TLS only for port 8883) or the built-in
-//! HiveMQ + EMQX list, all used in parallel. Topic `strait/<room_topic>`, never retained.
+//! HiveMQ + EMQX list, all used in parallel. Topic `<mqtt_topic>`, never retained.
 //!
 //! Politeness (per broker): one publish at start, then every 5 s for the first 30 s, then every
 //! 20 s; at least 2 s between publishes; at most 25 publishes per 10 minutes; payload < 256 B;
@@ -67,6 +67,8 @@ impl Default for Tuning {
 
 pub struct Mqtt {
     brokers: Vec<Spec>,
+    /// Set when the user's own broker list has an unusable entry: never fall back to the public list.
+    bad: Option<String>,
     tun: Tuning,
 }
 
@@ -76,14 +78,19 @@ impl Mqtt {
     }
     #[doc(hidden)]
     pub fn with_tuning(cfg: &RvConfig, tun: Tuning) -> Self {
-        let mut brokers: Vec<Spec> = match &cfg.mqtt_broker {
-            Some(s) => s.split(',').filter_map(|p| parse_spec(p.trim())).collect(),
-            None => Vec::new(),
-        };
-        if brokers.is_empty() {
-            brokers = DEFAULT_BROKERS.iter().filter_map(|s| parse_spec(s)).collect();
+        let (mut brokers, mut bad) = (Vec::new(), None);
+        match &cfg.mqtt_broker {
+            Some(s) => {
+                for p in s.split(',').map(str::trim) {
+                    match parse_spec(p) {
+                        Some(b) => brokers.push(b),
+                        None => bad = Some(format!("MQTT broker '{p}' is not usable")),
+                    }
+                }
+            }
+            None => brokers = DEFAULT_BROKERS.iter().filter_map(|s| parse_spec(s)).collect(),
         }
-        Self { brokers, tun }
+        Self { brokers, bad, tun }
     }
 }
 
@@ -354,11 +361,20 @@ async fn session(spec: &Spec, sh: &Shared, pace: &mut Pace, connected: &mut bool
                         3 => if let Some((t, payload)) = parse_publish(h, &body) {
                             if t != sh.topic.as_bytes() { continue }
                             let Ok(addrs) = open(&d, sh.ctx.role, payload) else { continue };
+                            let mut fresh = false;
                             for addr in addrs {
                                 let new = sh.seen.lock().unwrap().insert(addr);
+                                fresh |= new;
                                 if new && sh.tx.send(Candidate { addr, via: "mqtt" }).await.is_err() {
                                     return Ok(());
                                 }
+                            }
+                            // A new peer is waiting for our blob: answer now (still min_gap and
+                            // cap paced) instead of at the next scheduled publish.
+                            if fresh && pace.sent.len() < sh.tun.cap {
+                                let now = Instant::now();
+                                let at = pace.last.map_or(now, |l| (l + sh.tun.min_gap).max(now));
+                                next_pub = next_pub.min(at);
                             }
                         },
                         _ => {}
@@ -434,6 +450,9 @@ impl Rendezvous for Mqtt {
     }
 
     async fn probe(&self, timeout: Duration) -> ProbeStatus {
+        if let Some(e) = &self.bad {
+            return ProbeStatus::Error(e.clone());
+        }
         let client_id = client_id();
         let tun = Tuning { connect_timeout: timeout, ..self.tun.clone() };
         let one = |spec: Spec| {
@@ -458,10 +477,13 @@ impl Rendezvous for Mqtt {
     }
 
     async fn run(&self, ctx: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
+        if let Some(e) = &self.bad {
+            return Err(RvError::Failed(e.clone()));
+        }
         let d = ctx.derived();
         seal(&d, ctx.role, &ctx.local).map_err(|e| RvError::Failed(format!("cannot seal candidates: {e}")))?;
         let sh = Arc::new(Shared {
-            topic: format!("strait/{}", d.room_topic()),
+            topic: d.mqtt_topic(),
             client_id: client_id(),
             tun: self.tun.clone(),
             seen: Mutex::new(HashSet::new()),
@@ -487,6 +509,15 @@ fn client_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_broker_list_never_falls_back() {
+        let m = |b: &str| Mqtt::new(&RvConfig { mqtt_broker: Some(b.into()), ..Default::default() });
+        assert!(m("http://h").bad.is_some() && m("http://h").brokers.is_empty());
+        assert!(m("127.0.0.1:1883,http://h").bad.is_some());
+        assert!(m("127.0.0.1:1883").bad.is_none());
+        assert!(Mqtt::new(&RvConfig::default()).brokers.len() > 1);
+    }
 
     #[test]
     fn specs() {

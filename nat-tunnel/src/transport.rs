@@ -71,7 +71,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,7 +79,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use crate::birthday::{Birthday, Sprayer};
+use crate::birthday::{Birthday, FlowBudget, ProbeTally, Scanner, Sprayer};
 use crate::carrier::shared::Port;
 use crate::carrier::udp::{norm as norm_addr, to_wire, UdpCarrier};
 use crate::carrier::{Caps, CarrierError, CarrierId, FrameIo, Health};
@@ -123,8 +123,27 @@ const FAN_BATCH: usize = 16;
 /// Most punch frames the fan sends per tick in total (candidates are not trusted input).
 const FAN_TICK_PACKETS: usize = 256;
 /// A host stops firing at a client candidate that never joined after this long.
-const RV_HOST_PUNCH_TOTAL: Duration = Duration::from_secs(60);
+/// Long enough to outlast a guest's full-range port scan (`Birthday::scan_window`, 3 min): the
+/// punch keeps the host's fresh NAT mapping toward the client alive for the scan to hit.
+const RV_HOST_PUNCH_TOTAL: Duration = Duration::from_secs(200);
+/// Candidates the birthday fan fires at (256 sockets x this = its live NAT entries).
+const FAN_MAX_TARGETS: usize = 4;
 const RV_MAX_TARGETS: usize = 64;
+/// Host IPs port-scanned at once (candidates are not trusted input).
+const SCAN_MAX_IPS: usize = 2;
+/// Source addresses of undecodable datagrams probed per attempt (see `FrameIo::take_rejected`).
+const HINT_MAX: usize = 8;
+
+/// A candidate on this side's own public IP is our own (stale) announce coming back, not the host.
+/// LAN-private addresses are never "own": a host on the same LAN is reached through them.
+fn is_own_announce(addr: SocketAddr, own: &[IpAddr]) -> bool {
+    let ip = norm_addr(addr).ip();
+    let private = match ip {
+        IpAddr::V4(v) => v.is_private() || v.is_loopback() || v.is_link_local(),
+        IpAddr::V6(v) => v.is_loopback() || (v.segments()[0] & 0xfe00) == 0xfc00,
+    };
+    !private && own.contains(&ip)
+}
 
 /// Why a connection could not be set up. Distinct variants so UIs can show
 /// the right advice without matching on strings.
@@ -389,9 +408,9 @@ fn rv_summary(st: &[(&'static str, Status)], w: &WaitStats) -> String {
 }
 
 /// Next datagram on any fan-out socket: (index, result). Pending while none is readable.
-async fn fan_recv(fan: &[UdpSocket], buf: &mut [u8]) -> (usize, io::Result<(usize, SocketAddr)>) {
+async fn fan_recv(fan: &[Arc<dyn FrameIo>], buf: &mut [u8]) -> (usize, io::Result<(usize, SocketAddr)>) {
     loop {
-        let (r, i, _) = futures::future::select_all(fan.iter().map(|s| Box::pin(s.readable()))).await;
+        let (r, i, _) = futures::future::select_all(fan.iter().map(|s| s.readable())).await;
         if r.is_err() {
             return (i, Err(io::ErrorKind::Other.into()));
         }
@@ -753,26 +772,31 @@ impl Tunnel {
 
     /// My reachable endpoints as the punch socket looks from outside: the STUN-mapped IPv4 plus a
     /// global IPv6 on the same port. Empty when STUN stays silent.
-    async fn rv_local(&self, no_v6: bool) -> Vec<SocketAddr> {
+    /// The flag says the STUN servers saw this socket under different ports (symmetric NAT).
+    async fn rv_local(&self, no_v6: bool) -> (Vec<SocketAddr>, bool) {
         let mut out = Vec::new();
+        let mut symmetric = false;
         let servers: Vec<SocketAddr> = stun_servers().await.into_iter().map(|s| self.wire(s)).collect();
         let Some(sock) = self.io.udp() else {
             // A carrier with a socket of its own that it keeps reading (ss): it taps the answers.
-            out.extend(self.io.stun_mapped(&servers, Duration::from_millis(1500)).await);
-            return out;
+            let seen = self.io.stun_mapped(&servers, Duration::from_millis(1500)).await;
+            if let Some(first) = seen.first() {
+                out.push(*first);
+                symmetric = seen.iter().any(|m| m != first);
+            }
+            return (out, symmetric);
         };
-        if let Some(m) = crate::tunnel::stun::survey(sock, &servers, Duration::from_millis(1500))
-            .await
-            .first()
-        {
+        let samples = crate::tunnel::stun::survey(sock, &servers, Duration::from_millis(1500)).await;
+        if let Some(m) = samples.first() {
             out.push(m.mapped);
+            symmetric = samples.iter().any(|x| x.mapped != m.mapped);
         }
         if !no_v6 && self.dual {
             if let (Some(v6), Ok(a)) = (global_v6(), sock.local_addr()) {
                 out.push(SocketAddr::new(v6.into(), a.port()));
             }
         }
-        out
+        (out, symmetric)
     }
 
     /// Guest side of rendezvous: announce my mapped endpoint through `backends` and fire at every
@@ -787,14 +811,20 @@ impl Tunnel {
         symmetric_hint: bool,
         v6_route: bool,
     ) -> Result<(), ConnectError> {
-        let local = self.rv_local(rv.no_v6).await;
+        let (local, local_symmetric) = self.rv_local(rv.no_v6).await;
         if local.is_empty() {
-            return Err(ConnectError::RendezvousFailed("stun: no answer".into()));
+            return Err(ConnectError::RendezvousFailed("stun: no answer (UDP or STUN appears blocked on this network; try a TCP carrier such as ws if the invite lists one)".into()));
         }
+        let own_ips: Vec<IpAddr> = local.iter().map(|a| norm_addr(*a).ip()).collect();
         let mut handle = Runner::new(backends).start(RvCtx::new(key, Role::Client, local));
         let publisher = spawn_publisher("guest", &handle);
         let mut stats = WaitStats::default();
-        let r = self.rv_wait(&mut handle, rv.budget.unwrap_or(RV_BUDGET), v6_route, &rv.birthday, &mut stats).await;
+        // An explicit budget is a hard limit; only the default one stretches to let a scan finish.
+        let mut bd = rv.birthday.clone();
+        if rv.budget.is_some() {
+            bd.scan_window = Duration::ZERO;
+        }
+        let r = self.rv_wait(&mut handle, rv.budget.unwrap_or(RV_BUDGET), v6_route, &bd, local_symmetric, &own_ips, &mut stats).await;
         let status = handle.status();
         publisher.abort();
         rendezvous::live::publish("guest", status.clone());
@@ -819,10 +849,12 @@ impl Tunnel {
         budget: Duration,
         v6_route: bool,
         bd: &Birthday,
+        local_symmetric: bool,
+        own_ips: &[IpAddr],
         stats: &mut WaitStats,
     ) -> Result<(), ConnectError> {
         let t0 = Instant::now();
-        let deadline = t0 + budget;
+        let mut deadline = t0 + budget;
         let mut targets: Vec<Target> = Vec::new();
         let mut done = false;
         let mut last_register = Instant::now();
@@ -831,10 +863,28 @@ impl Tunnel {
         let mut buf = [0u8; 2048];
         let mut fan_buf = [0u8; 2048];
         // Birthday fan-out: extra sockets when the single-socket punch stays silent.
-        let mut fan: Vec<UdpSocket> = Vec::new();
+        let mut fan: Vec<Arc<dyn FrameIo>> = Vec::new();
         let mut fan_cursor = 0usize;
-        let mut fan_done = !(bd.enabled && bd.fan > 0 && self.io.caps().id == CarrierId::Udp);
+        let mut fan_done = !(bd.enabled && bd.fan > 0 && self.io.caps().punchable);
         let mut first_target: Option<Instant> = None;
+        // Port scan of a symmetric host's destination ports (see `birthday::Scanner`).
+        // Not from behind a symmetric NAT: every probed port would cost a NAT mapping of its own
+        // (a CGNAT's per-subscriber port quota, a small router's flow table).
+        let scan_on = bd.enabled && bd.scan_pps > 0 && bd.scan_passes > 0 && self.io.caps().punchable && !local_symmetric;
+        if local_symmetric {
+            log::info!("this side's NAT is symmetric: no port scan of the host (a sweep would open one NAT mapping per port)");
+        }
+        let mut scans: Vec<Scanner> = Vec::new();
+        let mut scan_last = Instant::now();
+        let mut scan_budget = FlowBudget::new(bd.scan_cap());
+        let mut tally = ProbeTally::default();
+        let mut scan_sweep = 0usize;
+        let mut scan_tick = tokio::time::interval(Duration::from_millis(10));
+        scan_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut scan_started: Option<Instant> = None;
+        let mut scan_stage = 0usize;
+        // Sources of datagrams the carrier codec rejected (the host's plain punch, for ss / awg).
+        let mut hints: Vec<SocketAddr> = Vec::new();
         if self.signal.is_some() {
             let _ = self.register().await;
         }
@@ -844,6 +894,9 @@ impl Tunnel {
             }
             stats.tried = targets.len();
             stats.punched = t0.elapsed();
+            if Instant::now() >= deadline && tally.sent + tally.failed > 0 {
+                log::info!("birthday scan: gave up after {} probes sent ({} sends failed) in {:.0}s", tally.sent, tally.failed, t0.elapsed().as_secs_f32());
+            }
             if Instant::now() >= deadline || (done && targets.is_empty() && self.signal.is_none()) {
                 return Err(ConnectError::RendezvousFailed(String::new()));
             }
@@ -853,6 +906,9 @@ impl Tunnel {
                         // stays on the status board, but never costs a punch window
                         log::debug!("rendezvous: host candidate {} via {} skipped (no IPv6 route)", c.addr, c.via);
                         stats.skipped_v6 += 1;
+                    }
+                    Some(c) if is_own_announce(c.addr, own_ips) => {
+                        log::info!("rendezvous: ignoring own announce {} via {} (a stale record of a previous run with this key)", c.addr, c.via);
                     }
                     Some(c) => {
                         log::debug!("rendezvous: host candidate {} via {}", c.addr, c.via);
@@ -871,7 +927,7 @@ impl Tunnel {
                             self.pending.push_back(plain);
                             self.learn_direct(from);
                             // This socket's external port is the one the host's filter let through.
-                            self.io = Arc::new(UdpCarrier::from_socket(fan.swap_remove(i), self.dual));
+                            self.io = fan.swap_remove(i);
                             log::info!("direct path open to {from} (rendezvous, birthday socket {i} of {})", fan.len() + 1);
                             return Ok(());
                         }
@@ -883,6 +939,12 @@ impl Tunnel {
                             add_target(&mut targets, addr);
                         }
                     }
+                    // A host behind a symmetric NAT fires its 1-byte punch from a port nobody announced.
+                    // That source is only a place to send our (authenticated) JOIN to; the path is
+                    // adopted when a sealed ACCEPT comes back from there, never on this hint.
+                    Ok((1, from)) if self.mux.is_some() && buf[0] == T_PUNCH => {
+                        add_target(&mut targets, norm_addr(from));
+                    }
                     Ok((len, from)) => {
                         // The AEAD tag authenticates the sender, wherever the NAT says it is.
                         match self.open_dgram(&buf[..len]) {
@@ -892,7 +954,8 @@ impl Tunnel {
                                 }
                                 self.pending.push_back(plain);
                                 self.learn_direct(from);
-                                log::info!("direct path open to {from} (rendezvous)");
+                                let scanned = scans.iter().any(|s| IpAddr::V4(s.ip) == from.ip()) && !targets.iter().any(|t| t.addr == from);
+                                log::info!("direct path open to {from} (rendezvous{})", if scanned { ", found by port scan" } else { "" });
                                 return Ok(());
                             }
                             Err(CryptoError::Replay) if Some(from) == self.peer => {
@@ -905,8 +968,50 @@ impl Tunnel {
                     Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
                     Err(e) => return Err(e.into()),
                 },
+                // Probes go out in 10 ms slices, not one burst per 50 ms tick.
+                _ = scan_tick.tick(), if !scans.is_empty() => {
+                    let dt = scan_last.elapsed().min(Duration::from_millis(250));
+                    scan_last = Instant::now();
+                    let live = scans.iter().filter(|s| !s.done()).count();
+                    if let (Some(frame), true) = (self.punch_frame(), live > 0) {
+                        let sweep = scans.iter().map(|s| s.sweeps()).min().unwrap_or(0);
+                        let (stage, pps, cap) = bd.scan_stage(scan_started.map_or(Duration::ZERO, |t| t.elapsed()), sweep);
+                        if stage != scan_stage {
+                            scan_stage = stage;
+                            scan_budget.set_cap(cap);
+                            log::info!("birthday scan: no answer yet, raising to {pps} packets/s (at most ~{} NAT entries alive)", cap.min(scans[0].pass_len()));
+                        }
+                        if sweep != scan_sweep {
+                            scan_sweep = sweep;
+                            log::info!("birthday scan: sweep {sweep} done after {} probes ({} sends failed), starting sweep {} at {pps} packets/s in a fresh port order", tally.sent, tally.failed, sweep + 1);
+                        }
+                        let want = (pps as f64 * dt.as_secs_f64()).ceil() as usize;
+                        let n = scan_budget.take(Instant::now(), want).div_ceil(live);
+                        for k in 0..scans.len() {
+                            let was_live = !scans[k].done();
+                            for port in scans[k].next(n) {
+                                let to = SocketAddr::new(scans[k].ip.into(), port);
+                                let r = self.io.send_probe(&frame, self.wire(to)).await;
+                                tally.note(to, r);
+                            }
+                            if was_live && scans[k].done() {
+                                log::info!("birthday scan: host {} gave up after {} sweeps ({} probes sent, {} sends failed)", scans[k].ip, bd.scan_passes, tally.sent, tally.failed);
+                            }
+                        }
+                    }
+                }
                 _ = tick.tick() => {
                     let now = Instant::now();
+                    for a in self.io.take_rejected() {
+                        let a = norm_addr(a);
+                        let from_candidate = targets.iter().any(|t| norm_addr(t.addr).ip() == a.ip());
+                        if from_candidate && hints.len() < HINT_MAX && !hints.contains(&a) && !is_own_announce(a, own_ips) && !targets.iter().any(|t| t.addr == a) {
+                            log::info!("direct path hint: host punch seen from {a} (undecodable by the {} codec), probing it", self.io.caps().id);
+                            hints.push(a);
+                            // only a JOIN goes there; the path opens when a valid ACCEPT comes back
+                            add_target(&mut targets, a);
+                        }
+                    }
                     for i in 0..targets.len() {
                         if targets[i].due(now) {
                             targets[i].last = Some(now);
@@ -923,18 +1028,36 @@ impl Tunnel {
                         fan = self.open_fan(bd.fan).await;
                         log::info!("no answer on the main socket; fanning out over {} sockets", fan.len());
                     }
+                    if scan_on && first_target.is_some_and(|t| t.elapsed() >= bd.scan_delay) {
+                        for t in &targets {
+                            if let IpAddr::V4(ip) = norm_addr(t.addr).ip() {
+                                if scans.len() < SCAN_MAX_IPS && !scans.iter().any(|s| s.ip == ip) {
+                                    let sc = Scanner::new(ip, t.addr.port(), bd.scan_passes);
+                                    log::info!(
+                                        "birthday scan: host {ip} (announced port {}): probing its ports from the main socket at {} packets/s (at most ~{} NAT entries alive), repeated sweeps of {} ports, for up to {} s",
+                                        t.addr.port(), bd.scan_pps, bd.scan_cap(), sc.pass_len(), bd.scan_window.as_secs()
+                                    );
+                                    scans.push(sc);
+                                    scan_started.get_or_insert_with(Instant::now);
+                                    // the scan outlives the usual rendezvous budget (a sweep takes minutes at a safe rate)
+                                    deadline = deadline.max(Instant::now() + bd.scan_window);
+                                }
+                            }
+                        }
+                    }
                     if !fan.is_empty() && !targets.is_empty() {
                         if let Some(frame) = self.punch_frame() {
                             // A fixed packet budget per tick, however many candidates there are.
                             let mut budget = FAN_TICK_PACKETS;
+                            let nt = targets.len().min(FAN_MAX_TARGETS);
                             for _ in 0..FAN_BATCH.min(fan.len()) {
-                                for k in 0..targets.len() {
+                                for k in 0..nt {
                                     if budget == 0 {
                                         break;
                                     }
                                     budget -= 1;
-                                    let t = &targets[(fan_cursor + k) % targets.len()];
-                                    let _ = fan[fan_cursor].send_to(&frame, self.wire(t.addr)).await;
+                                    let t = &targets[(fan_cursor + k) % nt];
+                                    let _ = fan[fan_cursor].send_probe(&frame, self.wire(t.addr)).await;
                                 }
                                 fan_cursor = (fan_cursor + 1) % fan.len();
                             }
@@ -1159,16 +1282,25 @@ impl Tunnel {
 
     /// Open up to `n` extra sockets of the main socket's family (each gets its own external port
     /// from a symmetric NAT). Stops quietly at the first failure (fd limit).
-    async fn open_fan(&self, n: usize) -> Vec<UdpSocket> {
-        let mut v = Vec::with_capacity(n);
+    async fn open_fan(&self, n: usize) -> Vec<Arc<dyn FrameIo>> {
+        let mut v: Vec<Arc<dyn FrameIo>> = Vec::with_capacity(n);
         for _ in 0..n {
-            match bind_marked(None).await {
-                Ok((s, d)) if d == self.dual => v.push(s),
-                Ok(_) => break,
-                Err(e) => {
-                    log::warn!("birthday fan-out: stopped at {} sockets ({e})", v.len());
-                    break;
+            // The plain UDP carrier keeps its marked/pinned sockets; ss and awg dial siblings.
+            let next: Option<Arc<dyn FrameIo>> = if self.io.caps().id == CarrierId::Udp {
+                match bind_marked(None).await {
+                    Ok((s, d)) if d == self.dual => Some(Arc::new(UdpCarrier::from_socket(s, d))),
+                    Ok(_) => None,
+                    Err(e) => {
+                        log::warn!("birthday fan-out: stopped at {} sockets ({e})", v.len());
+                        None
+                    }
                 }
+            } else {
+                self.io.sibling().await
+            };
+            match next {
+                Some(io) => v.push(io),
+                None => break,
             }
         }
         v
@@ -1194,6 +1326,18 @@ impl Tunnel {
                     self.control(&plain);
                 }
             }
+        }
+        // The host holds this slot "unconfirmed" until a packet opens under the new session key:
+        // send two at once (one may be lost) and a third at the next tick, 1 s on.
+        if let Some(peer) = self.peer {
+            for _ in 0..2 {
+                let d = self.seal_dgram(&[C_KEEPALIVE]);
+                let _ = self.send_to(&d, peer).await;
+            }
+        }
+        if let Some(m) = self.mux.as_mut() {
+            let now = Instant::now();
+            m.last_tx = now.checked_sub(m.keepalive).map_or(now, |t| t + Duration::from_secs(1));
         }
         Ok(())
     }
@@ -1709,12 +1853,23 @@ pub const MUX_KEEPALIVE: Duration = Duration::from_secs(15);
 pub const MUX_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard ceiling on clients per host.
 pub const MUX_MAX_CLIENTS: usize = 1024;
+/// Health text a stream carrier reports when its last connection ended normally for a host.
+fn routine_leave(why: &str) -> bool {
+    why.starts_with("connection closed by peer") || why.starts_with("connection reset:")
+}
+
 /// The host's address inside the tunnel network.
 pub const MUX_HOST_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
 /// Prefix length of the tunnel network (10.7.0.0/16).
 pub const MUX_PREFIX: u8 = 16;
 /// How many past `cn`s the host remembers to refuse replayed JOINs.
 const SEEN_CN_CAP: usize = 8192;
+/// Fewest slots one source address may hold (three quarters of the pool, at least this many):
+/// a household behind one NAT fits, yet one address never takes every slot.
+const MUX_MIN_PER_SOURCE: usize = 4;
+/// How long a join may stay unconfirmed (no packet under the new session key yet). Longer than
+/// `MUX_KEEPALIVE`, so on a lossy path the client's regular keepalive still confirms it.
+const MUX_UNCONFIRMED_TTL: Duration = Duration::from_secs(20);
 
 fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     let (mut ik, mut ok) = ([0x36u8; 64], [0x5cu8; 64]);
@@ -2005,6 +2160,10 @@ struct Peer {
     last_tx: Instant,
     rx: Bucket,
     tx: Bucket,
+    /// Joined at; a peer that sends nothing under its session key is dropped after
+    /// `MUX_UNCONFIRMED_TTL` (a replayed JOIN cannot produce such a packet).
+    since: Instant,
+    confirmed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2497,7 +2656,9 @@ impl MuxHost {
     fn evict(&mut self, slot: usize, reason: &'static str) {
         if let Some(p) = self.peers.get_mut(slot).and_then(|p| p.take()) {
             self.pool.free(slot);
-            self.events.push_back(MuxEvent::Left { id: slot, ip: p.ip, reason });
+            if p.confirmed {
+                self.events.push_back(MuxEvent::Left { id: slot, ip: p.ip, reason });
+            }
         }
     }
 
@@ -2558,13 +2719,24 @@ impl MuxHost {
         if self.seen.contains(&cn) {
             return;
         }
-        // A restarted client on the same address replaces its old slot.
-        if let Some(old) = (0..self.peers.len())
-            .find(|&i| self.peers[i].as_ref().is_some_and(|p| p.addr == from && p.via == via))
-        {
-            self.evict(old, "replaced by a new join");
+        // One source may hold a bounded share of the slots (loopback, i.e. tests and labs, exempt).
+        let src = from.ip().to_canonical();
+        let cap = (self.pool.capacity() * 3 / 4).max(MUX_MIN_PER_SOURCE);
+        let held = |s: &Self| s.peers.iter().flatten().filter(|p| p.addr.ip().to_canonical() == src).count();
+        while !src.is_loopback() && held(self) >= cap {
+            if !self.drop_unconfirmed(Some(src)) {
+                log::info!("rejected {from}: too many slots for one address");
+                return;
+            }
         }
-        let Some((slot, ip)) = self.pool.alloc() else {
+        // Unconfirmed joins never keep a real client out: a full host frees the oldest first.
+        // A restarted client on the same address replaces its old slot once its first packet
+        // confirms (see `confirm`), so a replayed JOIN cannot evict a bystander.
+        let mut alloc = self.pool.alloc();
+        if alloc.is_none() && self.drop_unconfirmed(None) {
+            alloc = self.pool.alloc();
+        }
+        let Some((slot, ip)) = alloc else {
             let mut r = Vec::with_capacity(33);
             r.push(T_REJECT);
             r.extend_from_slice(&cn);
@@ -2581,6 +2753,10 @@ impl MuxHost {
             return;
         }
         self.remember_cn(cn);
+        log::info!(
+            "join request from {from}{}",
+            if self.punch.iter().any(|t| t.addr == from) { "" } else { " (not an announced candidate: the client's NAT maps this destination to another port)" }
+        );
         let hn = rand16();
         self.peers[slot] = Some(Peer {
             addr: from,
@@ -2595,11 +2771,39 @@ impl MuxHost {
             last_tx: Instant::now(),
             rx: Bucket::new(self.cfg.rate_bytes),
             tx: Bucket::new(self.cfg.rate_bytes),
+            since: Instant::now(),
+            confirmed: false,
         });
         self.send_accept(slot, (&cn, &hn), (&cpub, &hpub), from, via).await;
         self.send_assign(slot).await;
+    }
+
+    /// First packet under the new session key: the join is real. Announce it, and let it replace
+    /// an older peer of the same address (a restarted client).
+    fn confirm(&mut self, slot: usize) {
+        let Some(p) = self.peers[slot].as_mut() else { return };
+        p.confirmed = true;
+        let (ip, from, via) = (p.ip, p.addr, p.via);
+        if let Some(old) = (0..self.peers.len()).find(|&i| {
+            i != slot && self.peers[i].as_ref().is_some_and(|q| q.confirmed && q.addr == from && q.via == via)
+        }) {
+            self.evict(old, "replaced by a new join");
+        }
         log::info!("client {from} joined as {ip} via {}", self.ios[via].caps().id);
         self.events.push_back(MuxEvent::Joined { id: slot, ip, from });
+    }
+
+    /// Free the oldest unconfirmed slot (of source `ip` when given). True when one was freed.
+    fn drop_unconfirmed(&mut self, ip: Option<std::net::IpAddr>) -> bool {
+        let oldest = (0..self.peers.len())
+            .filter(|&i| {
+                self.peers[i].as_ref().is_some_and(|p| !p.confirmed && ip.is_none_or(|a| p.addr.ip().to_canonical() == a))
+            })
+            .min_by_key(|&i| self.peers[i].as_ref().map(|p| p.since));
+        oldest.is_some_and(|i| {
+            self.evict(i, "unconfirmed");
+            true
+        })
     }
 
     /// True when `d` opened under a peer's session.
@@ -2611,10 +2815,15 @@ impl MuxHost {
         let Some(p) = self.peers.get_mut(slot).and_then(|p| p.as_mut()) else { return false };
         let Ok((plain, _)) = p.crypto.open(&d[3..]) else { return false };
         p.last_rx = Instant::now();
+        let first = !p.confirmed;
         // The tag authenticates the peer, so a new source address is a NAT
         // rebinding, not a spoof.
         p.addr = from;
         p.via = via;
+        if first {
+            self.confirm(slot);
+        }
+        let Some(p) = self.peers.get_mut(slot).and_then(|p| p.as_mut()) else { return true };
         match plain.first() {
             Some(b) if b >> 4 == 4 => {
                 if plain.len() < 20 || plain[12..16] != p.ip.octets() || !p.rx.allow(plain.len()) {
@@ -2659,6 +2868,11 @@ impl MuxHost {
                     Err(e) if matches!(CarrierError::from_io(&e), Some(CarrierError::Closed)) => {
                         log::warn!("{} carrier stopped: {e}", self.ios[i].caps().id);
                         self.dead[i].store(true, Ordering::Relaxed);
+                    }
+                    // One oversize datagram is dropped on its own; the carrier keeps serving.
+                    Err(e) if matches!(CarrierError::from_io(&e), Some(CarrierError::FrameTooLarge { .. })) => {
+                        log::debug!("{} carrier: dropped an oversize datagram", self.ios[i].caps().id);
+                        continue 'next;
                     }
                     Err(e) => {
                         log::debug!("{} carrier: {e}", self.ios[i].caps().id);
@@ -2756,14 +2970,24 @@ impl MuxHost {
         for i in 0..self.ios.len() {
             let down = matches!(self.ios[i].health(), Health::Down(_));
             if down && !self.was_down[i] {
-                log::warn!("{} carrier is down: {:?}", self.ios[i].caps().id, self.ios[i].health());
+                let h = self.ios[i].health();
+                // The last client of a stream carrier leaving (EOF / reset / no TLS close_notify) is routine.
+                if matches!(&h, Health::Down(w) if routine_leave(w)) {
+                    log::debug!("{} carrier has no client left: {h:?}", self.ios[i].caps().id);
+                } else {
+                    log::warn!("{} carrier is down: {h:?}", self.ios[i].caps().id);
+                }
             }
             self.was_down[i] = down;
         }
         let (keepalive, timeout) = (self.cfg.keepalive, self.cfg.timeout);
         for slot in 0..self.peers.len() {
             let Some(p) = self.peers[slot].as_ref() else { continue };
-            if p.last_rx.elapsed() >= timeout {
+            if !p.confirmed {
+                if p.since.elapsed() >= MUX_UNCONFIRMED_TTL {
+                    self.evict(slot, "unconfirmed");
+                }
+            } else if p.last_rx.elapsed() >= timeout {
                 self.send_sealed(slot, &[C_BYE]).await;
                 self.evict(slot, "timed out");
             } else if p.last_tx.elapsed() >= keepalive {
@@ -2932,6 +3156,56 @@ fn dual_socket(port: u16) -> io::Result<(socket2::Socket, bool)> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
+    #[test]
+    fn own_public_announce_is_ignored_but_lan_and_others_are_not() {
+        let own: Vec<IpAddr> = vec!["203.0.113.7".parse().unwrap()];
+        let yes = |a: &str| is_own_announce(a.parse().unwrap(), &own);
+        assert!(yes("203.0.113.7:4000"), "own mapped IP, any port");
+        assert!(yes("[::ffff:203.0.113.7]:4000"), "v4-mapped form");
+        assert!(!yes("203.0.113.8:4000"), "another host");
+        assert!(!yes("192.168.1.5:4000"), "LAN address stays a candidate");
+        assert!(!is_own_announce("10.0.0.2:1".parse().unwrap(), &["10.0.0.2".parse().unwrap()]), "private is never own");
+    }
+
+    /// Slots per source address: confirmed joins from one non-loopback address stop at the cap
+    /// (three quarters of the pool, at least 4); another address and loopback are unaffected.
+    #[tokio::test]
+    async fn slots_per_source_address_are_capped() {
+        let key = "per-source-cap-test-key";
+        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), max_clients: 8, ..Default::default() })
+            .await
+            .unwrap();
+        async fn join(h: &mut MuxHost, from: &str) -> Option<usize> {
+            let (cn, (_, cpub)) = (rand16(), hs_keypair());
+            h.join_authenticated(cn, cpub, from.parse().unwrap(), 0).await;
+            h.peers.iter().position(|p| p.as_ref().is_some_and(|p| p.cn == cn))
+        }
+        let mut slots = vec![];
+        for i in 0..6 {
+            let s = join(&mut h, &format!("203.0.113.7:{}", 1000 + i)).await.expect("under the cap");
+            h.confirm(s);
+            slots.push(s);
+        }
+        assert!(join(&mut h, "203.0.113.7:2000").await.is_none(), "over the cap");
+        assert!(join(&mut h, "203.0.113.8:1000").await.is_some(), "another address is fine");
+        // An unconfirmed join of the same source gives way to a newcomer instead of blocking it.
+        h.evict(slots[0], "test");
+        let a = join(&mut h, "203.0.113.7:3000").await.expect("freed slot");
+        let b = join(&mut h, "203.0.113.7:3001").await.expect("replaces the unconfirmed one");
+        assert!(h.peers[a].is_none() || a == b, "oldest unconfirmed was dropped");
+        // Loopback (tests, labs) is exempt.
+        for i in 0..3 {
+            assert!(join(&mut h, &format!("127.0.0.1:{}", 4000 + i)).await.is_some());
+        }
+    }
+
+    #[test]
+    fn client_leave_is_routine_but_sidecar_death_is_not() {
+        assert!(super::routine_leave("connection reset: peer closed connection without sending TLS close_notify"));
+        assert!(super::routine_leave("connection closed by peer"));
+        assert!(!super::routine_leave("sidecar exited (1)"));
+    }
+
     #[test]
     fn rendezvous_candidates_must_be_public() {
         let ok = |a: &str, local| super::candidate_allowed(a.parse().unwrap(), local);

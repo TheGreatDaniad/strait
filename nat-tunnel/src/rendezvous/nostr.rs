@@ -240,7 +240,7 @@ impl From<std::io::Error> for SessionEnd {
 }
 
 async fn session(sh: &Shared, w: &mut ws::Ws, url: &str, pace: &mut Pace, cancel: &CancellationToken) -> Result<(), SessionEnd> {
-    let req = json!(["REQ", "strait", {"kinds": [KIND_EPH, KIND_REP], "#r": [&sh.room], "since": now_secs().saturating_sub(SINCE_SECS)}]);
+    let req = json!(["REQ", "r", {"kinds": [KIND_EPH, KIND_REP], "#r": [&sh.room], "since": now_secs().saturating_sub(SINCE_SECS)}]);
     w.send(1, req.to_string().as_bytes()).await?;
     pace.next_eph = Instant::now();
     pace.next_rep = Instant::now();
@@ -402,7 +402,7 @@ mod ws {
     use super::b64_encode;
 
     const MAX_MSG: usize = 1 << 20;
-    const UA: &str = "strait-rendezvous"; // relays 403 default library user agents
+    const UA: &str = "Mozilla/5.0"; // relays 403 default library user agents
 
     #[derive(Debug)]
     pub enum ConnErr {

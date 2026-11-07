@@ -185,7 +185,7 @@ fn ctx(role: Role, key: [u8; 16], addr: &str) -> RvCtx {
 }
 
 fn topic_of(key: [u8; 16]) -> String {
-    format!("strait/{}", Derived::new(&key).room_topic())
+    Derived::new(&key).mqtt_topic()
 }
 
 struct Peer {
@@ -323,7 +323,7 @@ async fn different_room_never_delivers_and_topic_has_no_wildcards() {
     let topics = f.st.topics.lock().unwrap().clone();
     assert!(topics.contains(&topic_of(KEY)) && topics.contains(&topic_of(key2)));
     for t in topics {
-        assert!(t.starts_with("strait/strait-") && !t.contains(['#', '+', '$']), "{t}");
+        assert!(t.len() == 26 && !t.contains("strait") && !t.contains(['#', '+', '$']), "{t}");
     }
     h.stop().await.unwrap();
     c.stop().await.unwrap();

@@ -21,10 +21,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// smoltcp socket buffer per direction and flow. The TCP window is capped by this: 64 KiB gave
-/// about 7.5 Mbit/s at 66 ms RTT (window / RTT), 256 KiB allows about 31 Mbit/s at 66 ms (and
-/// 100+ Mbit/s under 20 ms). Memory is at most 2 x this per open flow (512 KiB; `ExitConfig::max_tcp`
-/// = 1024 flows bounds the worst case to 512 MiB, typical use is a handful of flows).
-pub const TCP_BUF: u32 = 256 * 1024;
+/// about 7.5 Mbit/s at 66 ms RTT (window / RTT), 256 KiB about 21 Mbit/s at 92 ms, 1 MiB allows
+/// about 90 Mbit/s at 92 ms. Memory is at most 2 x this per open flow (2 MiB, and only the part a
+/// flow really fills is touched); `ExitConfig::max_tcp` = 256 flows keeps the worst case at 512 MiB.
+pub const TCP_BUF: u32 = 1024 * 1024;
 
 // ---- exit destination policy -------------------------------------------------------------
 //
@@ -144,6 +144,20 @@ fn check_dest(remote: SocketAddr, what: &str) -> io::Result<()> {
     }
 }
 
+/// Run the smoltcp engine so that a panic inside it (smoltcp 0.12 can panic on a TCP segment whose
+/// sequence arithmetic underflows) ends only this stack: the future is dropped, its channels close
+/// and the host builds a new stack. Without this the panic took the whole host down.
+pub async fn contain_panic<F: std::future::Future>(f: F) -> Option<F::Output> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(f).catch_unwind().await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            log::error!("userspace stack: the TCP engine panicked; its flows are dropped and the stack is rebuilt");
+            None
+        }
+    }
+}
+
 pub struct UserspaceHost {
     pub stack: Stack,
     pub tcp: TcpListener,
@@ -179,7 +193,7 @@ pub fn build(mtu: usize) -> io::Result<UserspaceHost> {
 
     // The runner drives TCP timers (retransmits, FIN handling).
     if let Some(runner) = runner {
-        tokio::spawn(runner);
+        tokio::spawn(contain_panic(runner));
     }
 
     Ok(UserspaceHost {
@@ -302,6 +316,10 @@ pub static UDP_REPLIES_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub struct ExitConfig {
     pub max_tcp: usize,
     pub max_udp: usize,
+    /// Per guest address (the flow's source in the tunnel network), within the global caps, so one
+    /// guest cannot take every permit.
+    pub per_guest_tcp: usize,
+    pub per_guest_udp: usize,
     pub tcp_idle: Duration,
     pub udp_idle: Duration,
     pub dial_timeout: Duration,
@@ -310,11 +328,44 @@ pub struct ExitConfig {
 impl Default for ExitConfig {
     fn default() -> Self {
         Self {
-            max_tcp: 1024,
+            max_tcp: 256,
             max_udp: 1024,
+            per_guest_tcp: 128,
+            per_guest_udp: 256,
             tcp_idle: Duration::from_secs(60),
             udp_idle: Duration::from_secs(30),
             dial_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+/// Live flows per guest address. A [`GuestSlot`] holds one and gives it back on drop, so every
+/// close path (error, idle, panic) releases it.
+#[derive(Clone, Default)]
+struct GuestCounts(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<IpAddr, usize>>>);
+
+struct GuestSlot(GuestCounts, IpAddr);
+
+impl GuestCounts {
+    fn take(&self, ip: IpAddr, cap: usize) -> Option<GuestSlot> {
+        let mut m = self.0.lock().unwrap();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(GuestSlot(self.clone(), ip))
+    }
+}
+
+impl Drop for GuestSlot {
+    fn drop(&mut self) {
+        let mut m = (self.0).0.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
         }
     }
 }
@@ -338,7 +389,8 @@ pub async fn serve_tcp_with<St, S>(
 {
     let limit = sem.unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.max_tcp)));
     let refusals = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
-    while let Some((mut inner, _local, remote)) = flows.next().await {
+    let guests = GuestCounts::default();
+    while let Some((mut inner, local, remote)) = flows.next().await {
         // Backstop for the stack filter, and the only check on the STRAIT_EXIT_PROXY path
         // (where the dial address is the proxy, not the guest's destination).
         if let Err(e) = check_dest(remote, "tcp") {
@@ -348,10 +400,10 @@ pub async fn serve_tcp_with<St, S>(
             });
             continue;
         }
-        let permit = match limit.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                log::warn!("exit connection limit reached; refusing {remote}");
+        let permit = match guests.take(local.ip(), cfg.per_guest_tcp).zip(limit.clone().try_acquire_owned().ok()) {
+            Some(permit) => permit,
+            None => {
+                log::warn!("exit connection limit reached; refusing {remote} from {}", local.ip());
                 // The netstack yields a flow at SYN time. Dropping it before the
                 // handshake finished removes the socket silently (no FIN/RST), so the
                 // client would hang. Hold it briefly (bounded by `refusals`) until the
@@ -480,6 +532,7 @@ pub async fn serve_udp_with<St>(
     type Key = (SocketAddr, SocketAddr);
     let limit = sem.unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(cfg.max_udp)));
     let flows: Arc<Mutex<HashMap<Key, mpsc::Sender<Vec<u8>>>>> = Default::default();
+    let guests = GuestCounts::default();
 
     while let Some((data, local, remote)) = read.next().await {
         if !exit_dest_allowed(remote.ip()) {
@@ -493,8 +546,8 @@ pub async fn serve_udp_with<St>(
                 continue; // delivered, or queue full (drop datagram)
             }
         }
-        let Ok(permit) = limit.clone().try_acquire_owned() else {
-            log::warn!("exit udp flow limit reached; dropping {remote}");
+        let Some(permit) = guests.take(local.ip(), cfg.per_guest_udp).zip(limit.clone().try_acquire_owned().ok()) else {
+            log::warn!("exit udp flow limit reached; dropping {remote} from {}", local.ip());
             continue;
         };
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
@@ -589,5 +642,15 @@ mod policy_tests {
             // Loopback opt-in alone opens only loopback.
             assert_eq!(exit_dest_allowed_with(ip, false, true), def || (lo && !lan), "{a} allow-loopback");
         }
+    }
+}
+
+#[cfg(test)]
+mod panic_tests {
+    #[tokio::test]
+    async fn a_panicking_engine_is_contained() {
+        let r = super::contain_panic(async { panic!("attempt to subtract sequence numbers with underflow") }).await;
+        assert!(r.is_none());
+        assert_eq!(super::contain_panic(async { 7 }).await, Some(7));
     }
 }

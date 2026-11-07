@@ -7,7 +7,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::invite::{Endpoint, Invite};
 use crate::rendezvous::{self, ProbeStatus, RvConfig};
@@ -203,17 +202,12 @@ pub async fn check_host_with(
     let egress = tunnel::NatTraversalModule::local_egress_ip();
     let ipv6 = global_ipv6().filter(|_| crate::transport::dual_stack_available());
 
+    // 32 hex chars: rendezvous methods derive from a 16-byte key and reject 64-hex ones.
     let key = key.filter(|k| !k.trim().is_empty()).unwrap_or_else(|| {
-        let seed = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        // 32 hex chars: rendezvous methods derive from a 16-byte key and reject 64-hex ones.
-        format!("{:x}", Sha256::digest(seed.as_bytes()))[..32].to_string()
+        use chacha20poly1305::aead::{rand_core::RngCore, OsRng};
+        let mut k = [0u8; 16];
+        OsRng.fill_bytes(&mut k);
+        crate::rendezvous::derive::hex(&k)
     });
 
     // UPnP first: a real mapping accepts inbound from anyone, which is
@@ -672,15 +666,15 @@ pub mod rvui {
 
     /// Plain-words reason a meeting point is needed, adapted to the NAT type.
     pub fn meeting_copy(v: &HostVerdict) -> String {
-        const CONE: &str = "Your router allows direct connections, but it does not open a port for clients, so the two devices need a meeting point (a signaling service) to find each other.";
+        const CONE: &str = "Clients can't connect to you directly, so both sides need a meeting point to find each other.";
         match nat_kind(v) {
             NatKind::Blocked => format!(
                 "Your network seems to block incoming UDP, so these services cannot help.\n{}",
                 blocked_copy(v.port)
             ),
-            NatKind::Cone => format!("{CONE} You can also enable UPnP on your router, or forward UDP {} to this device, and check again.", v.port),
+            NatKind::Cone => format!("{CONE} Use the public services below, or enable UPnP / forward UDP {} and check again.", v.port),
             NatKind::Symmetric => format!(
-                "{CONE} Your network uses symmetric NAT: only clients that are public or behind full-cone / address-restricted routers can connect. You can also enable UPnP on your router, or forward UDP {} to this device, and check again.",
+                "{CONE} Your network uses symmetric NAT: only public, full-cone or address-restricted clients can connect. Use the public services below, or enable UPnP / forward UDP {} and check again.",
                 v.port
             ),
         }
@@ -817,7 +811,7 @@ pub mod rvui {
             };
             Ok(RvConfig {
                 signals,
-                trackers: list(&self.trackers, &["udp://", "http://", "https://"], "tracker")?,
+                trackers: list(&self.trackers, &["udp://"], "tracker")?,
                 relays: list(&self.relays, &["wss://", "ws://"], "relay")?,
                 ntfy_base,
                 mqtt_broker,
@@ -1276,5 +1270,13 @@ mod tests {
             let d = decide(&facts);
             assert_eq!((d.method, d.hostable, d.requirements), (method, hostable, req), "{name}");
         }
+    }
+
+    #[test]
+    fn tracker_overrides_match_the_backend() {
+        let o = |t: &str| rvui::RvOverrides { trackers: t.into(), ..Default::default() }.validate();
+        assert!(o("udp://t.example:6969").is_ok());
+        assert!(o("https://t.example/announce").is_err());
+        assert!(o("http://t.example/announce").is_err());
     }
 }

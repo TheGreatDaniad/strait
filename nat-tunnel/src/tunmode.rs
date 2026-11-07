@@ -576,7 +576,50 @@ struct StaleState {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_state(text: &str) -> Option<StaleState> {
-    serde_json::from_str(text).ok()
+    serde_json::from_str(text).ok().and_then(sanitize_state)
+}
+
+/// The state file lives where a standard user may have planted it, and its values end up in
+/// elevated PowerShell / netsh. Accept only an interface index (digits) and parsed IP addresses
+/// / prefixes, re-formatted from the parsed value; anything else refuses the whole file.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn sanitize_state(s: StaleState) -> Option<StaleState> {
+    use std::net::IpAddr;
+    let index = |v: &str| (!v.is_empty() && v.len() <= 10 && v.bytes().all(|b| b.is_ascii_digit())).then(|| v.parse::<u32>().ok()).flatten().map(|n| n.to_string());
+    let ip = |v: &str| v.parse::<IpAddr>().ok().map(|a| a.to_string());
+    let opt = |v: &str, f: &dyn Fn(&str) -> Option<String>| if v.is_empty() { Some(String::new()) } else { f(v) };
+    let net = |v: &str| {
+        let (addr, len) = match v.split_once('/') {
+            Some((a, l)) => (a, Some(l)),
+            None => (v, None),
+        };
+        let addr: IpAddr = addr.parse().ok()?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        match len {
+            None => Some(addr.to_string()),
+            Some(l) if !l.is_empty() && l.len() <= 3 && l.bytes().all(|b| b.is_ascii_digit()) => {
+                let n: u8 = l.parse().ok()?;
+                (n <= max).then(|| format!("{addr}/{n}"))
+            }
+            _ => None,
+        }
+    };
+    Some(StaleState {
+        dns: match s.dns {
+            Some(d) => Some(WindowsDns {
+                interface: index(&d.interface)?,
+                servers: d.servers.iter().map(|v| ip(v)).collect::<Option<_>>()?,
+            }),
+            None => None,
+        },
+        v6: match s.v6 {
+            Some(v) => Some(WindowsV6 { interface: index(&v.interface)? }),
+            None => None,
+        },
+        bypass: s.bypass.iter().map(|v| net(v)).collect::<Option<_>>()?,
+        gateway: opt(&s.gateway, &ip)?,
+        device: opt(&s.device, &index)?,
+    })
 }
 
 #[cfg(windows)]
@@ -600,7 +643,11 @@ pub fn recover_stale_state() -> bool {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false;
     };
-    if let Some(state) = parse_state(&text) {
+    let state = parse_state(&text);
+    if state.is_none() {
+        log::warn!("{} is not a valid recovery file; refusing it", path.display());
+    }
+    if let Some(state) = state {
         log::warn!("restoring DNS/IPv6/routes left by a previous session that did not exit cleanly");
         if let Some(dns) = state.dns {
             dns.restore();
@@ -631,11 +678,72 @@ pub fn recover_cli() -> i32 {
         }
         0
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        println!("nothing to recover (only Windows keeps state outside the process)");
+        if run_capture("id", &["-u"]).is_none_or(|u| u.trim() != "0") {
+            eprintln!("recover needs root");
+            return 1;
+        }
+        println!("{}", if recover_mac_state() { "restored DNS and IPv6 from the previous session" } else { "nothing to recover" });
         0
     }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        println!("nothing to recover (this platform keeps no state outside the process)");
+        0
+    }
+}
+
+/// Crash recovery (macOS). `networksetup` DNS and IPv6 settings are persistent, so a killed full
+/// tunnel would leave 1.1.1.1/8.8.8.8 and IPv6 off for good. The original values are kept in a
+/// root-only file while the tunnel runs; the next full tunnel (or `recover`) puts them back.
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MacState {
+    /// (service, original resolvers; empty = DHCP)
+    dns: Option<(String, Vec<String>)>,
+    v6: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+const MAC_STATE: &str = "/Library/Application Support/Strait/restore.json";
+
+#[cfg(target_os = "macos")]
+fn save_mac_state(dns: &Option<DnsRestore>, v6: &Option<V6Restore>) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let state = MacState {
+        dns: dns.as_ref().map(|d| (d.service.clone(), d.servers.clone())),
+        v6: v6.as_ref().map(|v| v.service.clone()),
+    };
+    let path = std::path::Path::new(MAC_STATE);
+    let write = || -> io::Result<()> {
+        let dir = path.parent().expect("has a parent");
+        std::fs::create_dir_all(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        io::Write::write_all(&mut f, serde_json::to_string(&state)?.as_bytes())
+    };
+    if let Err(e) = write() {
+        log::warn!("could not write the crash-recovery state: {e}");
+    }
+}
+
+/// Put back DNS / IPv6 settings left by a full tunnel that did not exit cleanly.
+#[cfg(target_os = "macos")]
+fn recover_mac_state() -> bool {
+    let path = std::path::Path::new(MAC_STATE);
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    if let Ok(state) = serde_json::from_str::<MacState>(&text) {
+        log::warn!("restoring DNS/IPv6 left by a previous session that did not exit cleanly");
+        if let Some((service, servers)) = state.dns {
+            DnsRestore { service, servers }.restore();
+        }
+        if let Some(service) = state.v6 {
+            V6Restore { service }.restore();
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    true
 }
 
 /// Previous default routes, restored when the tunnel goes away.
@@ -664,11 +772,15 @@ impl RouteRestore {
         let _ = tun;
         let ipv6 = capture_ipv6_default();
         #[cfg(target_os = "macos")]
-        let dns = DnsRestore::capture_and_apply(device);
+        let _ = recover_mac_state();
         #[cfg(target_os = "macos")]
-        let v6 = V6Restore::capture_and_disable(device);
+        let dns = DnsRestore::capture_and_apply(device);
         #[cfg(windows)]
         let dns = WindowsDns::capture_and_apply(device, tun);
+        #[cfg(target_os = "macos")]
+        let v6 = V6Restore::capture_and_disable(device);
+        #[cfg(target_os = "macos")]
+        save_mac_state(&dns, &v6);
         #[cfg(windows)]
         let v6 = WindowsV6::capture_and_disable(device);
         #[cfg(windows)]
@@ -734,6 +846,8 @@ impl RouteRestore {
         }
         #[cfg(windows)]
         let _ = std::fs::remove_file(state_path());
+        #[cfg(target_os = "macos")]
+        let _ = std::fs::remove_file(MAC_STATE);
     }
 }
 
@@ -816,6 +930,23 @@ fn add_firewall_rule() -> bool {
     }
 }
 
+/// Interfaces other than `own` that carry a connected route for the same network, from the text
+/// of `/proc/net/route` (destination and mask are hex of the network-order bytes as stored).
+#[cfg(any(target_os = "linux", test))]
+fn route_conflicts(table: &str, addr: Ipv4Addr, prefix: u8, own: &str) -> Vec<String> {
+    let mask = prefix_mask(prefix).octets();
+    let net: Vec<u8> = addr.octets().iter().zip(mask).map(|(a, m)| a & m).collect();
+    let bytes = |h: &str| u32::from_str_radix(h, 16).ok().map(|v| v.to_ne_bytes());
+    let mut out: Vec<String> = Vec::new();
+    for l in table.lines().skip(1) {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() > 7 && f[0] != own && bytes(f[1]).is_some_and(|d| d[..] == net[..]) && bytes(f[7]) == Some(mask) && !out.iter().any(|o| o == f[0]) {
+            out.push(f[0].to_string());
+        }
+    }
+    out
+}
+
 /// Create and configure the interface, then install routes.
 pub fn open(cfg: &TunConfig) -> io::Result<TunDevice> {
     if cfg!(not(any(
@@ -889,6 +1020,17 @@ pub fn open(cfg: &TunConfig) -> io::Result<TunDevice> {
     let name = device
         .tun_name()
         .map_err(|e| io::Error::other(e.to_string()))?;
+    #[cfg(target_os = "linux")]
+    if let Ok(table) = std::fs::read_to_string("/proc/net/route") {
+        for other in route_conflicts(&table, cfg.addr, cfg.prefix, &name) {
+            log::warn!(
+                "interface {other} also routes {}/{}: replies for the tunnel network may leave through it \
+                 and never reach the peer (a stale or second tunnel?). Remove it: ip link del {other}",
+                std::net::Ipv4Addr::from(u32::from(cfg.addr) & u32::from(prefix_mask(cfg.prefix))),
+                cfg.prefix
+            );
+        }
+    }
 
     #[cfg(windows)]
     let tun_index = device
@@ -1515,6 +1657,22 @@ mod state_tests {
     use super::*;
 
     #[test]
+    fn a_second_interface_with_the_same_tunnel_network_is_reported() {
+        let hex = |a: [u8; 4]| format!("{:08X}", u32::from_ne_bytes(a));
+        let (net, m16) = (hex([10, 7, 0, 0]), hex([255, 255, 0, 0]));
+        let table = format!(
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             ens5\t00000000\t0100000A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+             carr0\t{net}\t00000000\t0001\t0\t0\t0\t{m16}\t0\t0\t0\n\
+             strait-mx\t{net}\t00000000\t0001\t0\t0\t0\t{m16}\t0\t0\t0\n"
+        );
+        assert_eq!(route_conflicts(&table, Ipv4Addr::new(10, 7, 0, 1), 16, "strait-mx"), vec!["carr0".to_string()]);
+        // a /24 client address in the same /16 is a different network: not a conflict
+        assert!(route_conflicts(&table, Ipv4Addr::new(10, 7, 0, 2), 24, "strait-mx").is_empty());
+        assert!(route_conflicts(&table, Ipv4Addr::new(10, 7, 0, 1), 16, "carr0").len() == 1);
+    }
+
+    #[test]
     fn recovery_state_roundtrip_and_defaults() {
         let st = StaleState {
             dns: Some(WindowsDns { interface: "14".into(), servers: vec!["192.0.2.2".into()] }),
@@ -1532,5 +1690,26 @@ mod state_tests {
         let old = parse_state(r#"{"dns":null,"v6":{"interface":"14"}}"#).unwrap();
         assert!(old.bypass.is_empty() && old.gateway.is_empty());
         assert!(parse_state("not json").is_none());
+    }
+
+    #[test]
+    fn recovery_state_refuses_injected_values() {
+        let ok = r#"{"dns":{"interface":"14","servers":["1.1.1.1","2606:4700::1111"]},"v6":{"interface":"14"},"bypass":["10.0.0.0/8","203.0.113.10"],"gateway":"192.168.1.1","device":"14"}"#;
+        let st = parse_state(ok).expect("valid file");
+        assert_eq!(st.bypass, ["10.0.0.0/8", "203.0.113.10"]);
+        let patch = |from: &str, to: &str| ok.replace(from, to);
+        for bad in [
+            patch(r#""device":"14""#, r#""device":"14; calc""#),
+            patch(r#""interface":"14","servers""#, r#""interface":"14 -x $(calc)","servers""#),
+            patch(r#""v6":{"interface":"14"}"#, r#""v6":{"interface":"-1"}"#),
+            patch(r#""1.1.1.1""#, r#""1.1.1.1,evil""#),
+            patch(r#""1.1.1.1""#, r#""1.1.1.1'; calc; '""#),
+            patch(r#""10.0.0.0/8""#, r#""10.0.0.0/8 add""#),
+            patch(r#""10.0.0.0/8""#, r#""10.0.0.0/33""#),
+            patch(r#""192.168.1.1""#, r#""192.168.1.1 && calc""#),
+            patch(r#""device":"14""#, r#""device":"99999999999""#),
+        ] {
+            assert!(parse_state(&bad).is_none(), "accepted: {bad}");
+        }
     }
 }
