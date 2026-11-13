@@ -368,6 +368,33 @@ guest Strait --UDP--> 127.0.0.1:Lp [xray tunnel inbound] ==VLESS/XHTTP/REALITY(t
 
 ---
 
+### 4.5 ws without a reachable port: TCP hole punch (implemented)
+
+A `ws` entry without `@host:port` (host and invite alike) runs in punch mode, so a host behind a
+home router needs neither a port forward nor a router that maps ports on request.
+
+- Every TCP socket of one side shares one local port (`SO_REUSEADDR` / `SO_REUSEPORT`,
+  `src/carrier/tcp_punch.rs`): the listener, the outbound attempts and the STUN query. The NAT
+  mapping of that port is therefore the same for all of them.
+- Each side learns how the port looks from outside with a STUN Binding request over TCP
+  (`STUN_TCP_SERVERS` overrides the list). Without an answer it assumes the router keeps the port
+  number and takes the public IP from the UDP STUN answer.
+- The host publishes that TCP address through rendezvous next to its UDP mapping
+  (`FrameIo::extra_candidates`). The client publishes its own (`FrameIo::stun_mapped`) the way the
+  UDP carriers do.
+- The client's JOIN frames aimed at a host candidate become dial attempts from its port; the host
+  dials every client candidate from its port while it is a punch target (`FrameIo::punch`). An
+  attempt lasts 3 s and is restarted while the target stays listed. The two SYNs open both
+  routers' filters and meet in a TCP simultaneous open, or one of them reaches the other side's
+  listener.
+- Roles do not depend on who dialed: the host always runs the TLS / WebSocket server on the
+  connection, the client always the TLS client with the pinned certificate.
+- Limits: IPv4 only; needs endpoint-independent mapping on both routers (a router that picks a new
+  port per destination defeats it, as it does for UDP); port scans and socket fan-outs are not
+  used over TCP.
+- Tests: `tests/carrier_ws.rs` (`punch_*`), `tests/carrier_rv.rs`
+  (`ws_without_an_address_connects_through_rendezvous`), `src/carrier/tcp_punch.rs` unit tests.
+
 ## 7. Invite, ladder, UX (apply to all four)
 
 ### 7.1 Invite

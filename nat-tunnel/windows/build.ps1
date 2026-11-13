@@ -1,5 +1,5 @@
 <#
- Builds nat-tunnel natively with all five rendezvous features and the GUI (= the default feature set),
+ Builds nat-tunnel natively with all five rendezvous features, the ss/ws/awg carriers and the GUI (= the default feature set),
  then copies the exe and wintun.dll to C:\strait\bin. Source must already be in -Src (run-remote.sh stages it).
  Log: C:\strait\logs\build.log
 #>
@@ -18,8 +18,8 @@ $env:CARGO_TARGET_DIR = 'C:\strait\target'
 $env:CARGO_TERM_COLOR = 'never'
 Push-Location $Src
 try {
-    Write-Log 'cargo build --release --features gui,rv-sig,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt' $log
-    & cargo build --release --features 'gui,rv-sig,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt' 2>&1 | Tee-Object -FilePath $log -Append
+    Write-Log 'cargo build --release --features gui,rv-sig,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt,cr-ss,cr-ws,cr-awg' $log
+    & cargo build --release --features 'gui,rv-sig,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt,cr-ss,cr-ws,cr-awg' 2>&1 | Tee-Object -FilePath $log -Append
     $rc = $LASTEXITCODE
 } finally { Pop-Location }
 if ($rc -ne 0) { Write-Log "ERROR: cargo build failed ($rc)" $log; exit 10 }

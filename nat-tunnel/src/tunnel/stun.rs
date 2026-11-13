@@ -190,6 +190,11 @@ pub fn mapped_from_response(packet: &[u8]) -> Option<SocketAddr> {
     parse_binding_response(packet, &id).ok().flatten()
 }
 
+/// The mapped address in the Binding success response to `transaction_id`, if `packet` is one.
+pub fn mapped_for(packet: &[u8], transaction_id: &[u8; 12]) -> Option<SocketAddr> {
+    parse_binding_response(packet, transaction_id).ok().flatten()
+}
+
 /// Parse a message, returning `Ok(None)` when it is not the answer to
 /// `transaction_id` (stray or late traffic) and an error only when the message
 /// is ours but malformed.

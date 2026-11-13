@@ -22,6 +22,7 @@ pub mod mem;
 pub mod shared;
 pub mod stream;
 pub mod supervisor;
+pub mod tcp_punch;
 pub mod udp;
 #[cfg(feature = "cr-ss")]
 pub mod ss;
@@ -302,7 +303,8 @@ pub fn effective_mtu(carriers: &[Caps]) -> usize {
 pub struct Caps {
     pub id: CarrierId,
     pub max_frame: usize,
-    /// Only raw / obfuscated UDP on the shared socket.
+    /// Finds the host through rendezvous and a hole punch: raw / obfuscated UDP on the shared
+    /// socket, or a stream carrier dialing without an address (TCP punch).
     pub punchable: bool,
     /// Stream-backed: bounded queues, head-of-line blocking is possible.
     pub reliable_stream: bool,
@@ -425,6 +427,14 @@ pub trait FrameIo: Send + Sync + 'static {
     /// only; at most [`Rejects::MAX`]). The host's plain punch is such a datagram for ss / awg: the
     /// transport probes the source with a valid JOIN (the source alone authenticates nothing).
     fn take_rejected(&self) -> Vec<SocketAddr> {
+        Vec::new()
+    }
+    /// Host side: a client endpoint learned through rendezvous. A carrier that can hole-punch
+    /// on its own (TCP) dials it; called again while the endpoint stays a punch target.
+    fn punch(&self, _to: SocketAddr) {}
+    /// Host side: addresses of this carrier to announce next to the UDP mapping. `public_ip` is
+    /// the address STUN reports for the UDP socket.
+    fn extra_candidates(&self, _public_ip: std::net::IpAddr) -> Vec<SocketAddr> {
         Vec::new()
     }
     fn health(&self) -> Health {

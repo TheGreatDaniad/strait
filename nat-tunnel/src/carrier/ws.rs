@@ -32,6 +32,12 @@
 //! free one from a private counter (still unique). Client side: the host's resolved address, fixed
 //! for the life of the carrier. The transport's per-peer maps therefore see distinct stable keys.
 //!
+//! Without an address (`endpoint` unset) both ends run in punch mode, for a host that has no
+//! reachable TCP port: the host announces its TCP mapping next to the UDP one, the client finds
+//! it through rendezvous, and both dial each other from their listening port until a connection
+//! forms (see [`super::tcp_punch`]). The host is always the TLS / WebSocket server, whichever
+//! side's SYN got through.
+//!
 //! TCP-over-TCP: see [`tcp_over_tcp_warning`]. Caps are honest: `punchable=false`,
 //! `reliable_stream=true`. Dial errors: connect / TLS / any non-101 HTTP answer = `Blocked`,
 //! everything else `Failed`; reconnect-with-backoff is the transport's job.
@@ -508,13 +514,107 @@ fn spawn_pump(ws: WebSocketStream<Conn>, idle: Duration, ping: Duration, pipe: u
 pub struct WsCarrier {
     inner: Arc<StreamCarrier>,
     overhead: usize,
-    accept: Option<AbortHandle>,
+    tasks: Vec<AbortHandle>,
+    punch: Option<Arc<Punch>>,
 }
 
 impl Drop for WsCarrier {
     fn drop(&mut self) {
-        if let Some(a) = &self.accept {
-            a.abort();
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Outbound attempts one carrier runs at a time (a host fires at every announced client).
+const MAX_PUNCH_INFLIGHT: usize = 32;
+
+/// Punch mode state: every socket of this carrier uses local TCP `port`.
+struct Punch {
+    port: u16,
+    cfg: Cfg,
+    sc: std::sync::Weak<StreamCarrier>,
+    /// Host: how a connection is answered. `None` on the client.
+    serve: Option<Arc<Serve>>,
+    inflight: Mutex<std::collections::HashSet<SocketAddr>>,
+    /// Host: how `port` looks from outside, refreshed in the background.
+    mapped: Mutex<Option<SocketAddr>>,
+    /// Client: key of its one connection.
+    peer: Mutex<Option<SocketAddr>>,
+}
+
+impl Punch {
+    /// Dial `to` from the shared port unless that is already running or connected.
+    fn kick(self: &Arc<Self>, to: SocketAddr) {
+        let to = norm(to);
+        let Some(sc) = self.sc.upgrade() else { return };
+        if !to.is_ipv4() || sc.peers().contains(&to) {
+            return;
+        }
+        {
+            let mut f = self.inflight.lock().unwrap();
+            if f.len() >= MAX_PUNCH_INFLIGHT || !f.insert(to) {
+                return;
+            }
+        }
+        let p = self.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(tcp)) = tokio::time::timeout(super::tcp_punch::ATTEMPT, super::tcp_punch::connect_from(p.port, to)).await {
+                log::debug!("ws carrier: tcp punch connected to {to}");
+                p.adopt(tcp, to).await;
+            }
+            p.inflight.lock().unwrap().remove(&to);
+        });
+    }
+
+    /// A TCP connection exists (dialed or accepted): run this side's part of the upgrade on it.
+    async fn adopt(self: &Arc<Self>, tcp: TcpStream, remote: SocketAddr) {
+        if let Some(sv) = &self.serve {
+            return sv.conn(tcp, remote).await;
+        }
+        let remote = norm(remote);
+        let (ip, ep) = (remote.ip().to_string(), remote.to_string());
+        let Ok(Ok(ws)) = tokio::time::timeout(self.cfg.connect, client_upgrade(tcp, &ip, &ep, &self.cfg)).await else { return };
+        let Some(sc) = self.sc.upgrade() else { return };
+        let mut peer = self.peer.lock().unwrap();
+        if peer.is_none() && sc.add_conn(spawn_pump(ws, self.cfg.idle, self.cfg.ping, self.cfg.pipe), remote).is_ok() {
+            *peer = Some(remote);
+        }
+    }
+}
+
+/// Host side: everything needed to answer one TCP connection.
+struct Serve {
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    path: String,
+    token: String,
+    cfg: Cfg,
+    sc: std::sync::Weak<StreamCarrier>,
+    ctr: AtomicU16,
+}
+
+impl Serve {
+    async fn conn(&self, tcp: TcpStream, remote: SocketAddr) {
+        let _ = tcp.set_nodelay(true);
+        limit_unsent(&tcp, self.cfg.lowat);
+        let ws = tokio::time::timeout(HEAD_TIMEOUT, async {
+            let conn: Conn = match &self.tls {
+                Some(a) => Box::new(a.accept(tcp).await.ok()?),
+                None => Box::new(tcp),
+            };
+            server_upgrade(conn, &self.path, &self.token, self.cfg.ws_config()).await
+        })
+        .await
+        .ok()
+        .flatten();
+        let (Some(ws), Some(sc)) = (ws, self.sc.upgrade()) else { return };
+        let side = spawn_pump(ws, self.cfg.idle, self.cfg.ping, self.cfg.pipe);
+        let mut peer = norm(remote);
+        while sc.peers().contains(&peer) {
+            peer.set_port(1024 + self.ctr.fetch_add(1, Ordering::Relaxed) % 60000);
+        }
+        if let Err(e) = sc.add_conn(side, peer) {
+            log::debug!("ws carrier: reject {remote}: {e}");
         }
     }
 }
@@ -537,13 +637,55 @@ impl FrameIo for WsCarrier {
     fn caps(&self) -> Caps {
         let mut c = self.inner.caps();
         c.overhead += self.overhead;
+        c.punchable = self.punch.as_ref().is_some_and(|p| p.serve.is_none());
         c
     }
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.local_addr()
     }
     async fn send_to(&self, frame: &[u8], to: SocketAddr) -> io::Result<usize> {
-        self.inner.send_to(frame, to).await
+        let Some(p) = self.punch.as_ref().filter(|p| p.serve.is_none()) else {
+            return self.inner.send_to(frame, to).await;
+        };
+        // A punch client has one connection, whatever address the transport aims at; until it
+        // exists a frame is lost like a datagram and the send becomes a dial attempt.
+        let peer = *p.peer.lock().unwrap();
+        match self.inner.send_to(frame, peer.unwrap_or(to)).await {
+            Err(e) if matches!(CarrierError::from_io(&e), Some(CarrierError::UnknownPeer)) => {
+                p.kick(to);
+                Ok(frame.len())
+            }
+            r => r,
+        }
+    }
+    async fn send_probe(&self, frame: &[u8], to: SocketAddr) -> io::Result<usize> {
+        match &self.punch {
+            // Port scans and socket fan-outs are UDP tricks; a TCP dial per probe would be a flood.
+            Some(p) if p.serve.is_none() => Ok(frame.len()),
+            _ => self.send_to(frame, to).await,
+        }
+    }
+    async fn stun_mapped(&self, servers: &[SocketAddr], wait: Duration) -> Vec<SocketAddr> {
+        let Some(p) = self.punch.as_ref().filter(|p| p.serve.is_none()) else { return Vec::new() };
+        let seen = super::tcp_punch::mapped(p.port, 2).await;
+        if !seen.is_empty() {
+            return seen;
+        }
+        // No TCP answer: the public address by UDP, assuming the router keeps the port number.
+        let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else { return Vec::new() };
+        let s = crate::tunnel::stun::survey(&sock, servers, wait).await;
+        s.first().map(|m| SocketAddr::new(m.mapped.ip(), p.port)).into_iter().collect()
+    }
+    fn punch(&self, to: SocketAddr) {
+        if let Some(p) = self.punch.as_ref().filter(|p| p.serve.is_some()) {
+            p.kick(to);
+        }
+    }
+    fn extra_candidates(&self, public_ip: std::net::IpAddr) -> Vec<SocketAddr> {
+        let Some(p) = self.punch.as_ref().filter(|p| p.serve.is_some()) else { return Vec::new() };
+        // Until a TCP STUN answer says otherwise: the router keeps the port number.
+        let m = (*p.mapped.lock().unwrap()).unwrap_or(SocketAddr::new(public_ip, p.port));
+        if m.is_ipv4() { vec![m] } else { Vec::new() }
     }
     fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.inner.try_recv_from(buf)
@@ -555,8 +697,8 @@ impl FrameIo for WsCarrier {
         self.inner.health()
     }
     async fn close(&self) {
-        if let Some(a) = &self.accept {
-            a.abort();
+        for t in &self.tasks {
+            t.abort();
         }
         self.inner.close().await
     }
@@ -573,22 +715,26 @@ fn warn_tcp(c: &WsCarrier) {
     }
 }
 
-/// Host: bind and serve. `endpoint` = listen address (default `0.0.0.0:bind_port`).
+/// Host: bind and serve. `endpoint` = listen address; without one the carrier runs in punch mode
+/// on `bind_port` (0 = any).
 pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
     let cfg = Cfg::from_spec(spec)?;
     let id = Identity::derive(&cfg.key);
     let tls = if cfg.tls == TlsMode::Off { None } else { Some(server_tls(&id)?) };
-    let bind = spec.endpoint.clone().unwrap_or_else(|| format!("0.0.0.0:{}", spec.bind_port.unwrap_or(0)));
-    let l = TcpListener::bind(&bind).await.map_err(|e| CarrierError::Failed(format!("ws: bind {bind}: {e}")))?;
+    let punch_mode = spec.endpoint.is_none();
+    let (l, bind) = match &spec.endpoint {
+        Some(bind) => (TcpListener::bind(bind).await, bind.clone()),
+        None => (super::tcp_punch::listen(spec.bind_port.unwrap_or(0)), format!("0.0.0.0:{}", spec.bind_port.unwrap_or(0))),
+    };
+    let l = l.map_err(|e| CarrierError::Failed(format!("ws: bind {bind}: {e}")))?;
     let local = l.local_addr().map_err(|e| CarrierError::Failed(e.to_string()))?;
     let inner = Arc::new(StreamCarrier::new(cfg.stream_cfg(local))?);
-    // The accept task holds only a Weak: dropping the carrier must not be kept alive by it.
-    let weak = Arc::downgrade(&inner);
+    // The tasks hold only a Weak: dropping the carrier must not be kept alive by them.
     let (path, token) = cfg.path_token();
-    let (idle, ping, wsc, lowat, pipe) = (cfg.idle, cfg.ping, cfg.ws_config(), cfg.lowat, cfg.pipe);
+    let serve = Arc::new(Serve { tls, path, token, cfg: cfg.clone(), sc: Arc::downgrade(&inner), ctr: AtomicU16::new(0) });
+    let sv = serve.clone();
     let h = tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
-        let ctr = Arc::new(AtomicU16::new(0));
         let by_ip = PendingByIp::default();
         loop {
             let (tcp, remote) = match l.accept().await {
@@ -609,34 +755,43 @@ pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
                     None => continue,
                 }
             };
-            let (tls, path, token, weak, ctr) = (tls.clone(), path.clone(), token.clone(), weak.clone(), ctr.clone());
+            let sv = sv.clone();
             tokio::spawn(async move {
                 let (_permit, _slot) = (permit, slot);
-                let _ = tcp.set_nodelay(true);
-                limit_unsent(&tcp, lowat);
-                let ws = tokio::time::timeout(HEAD_TIMEOUT, async {
-                    let conn: Conn = match tls {
-                        Some(a) => Box::new(a.accept(tcp).await.ok()?),
-                        None => Box::new(tcp),
-                    };
-                    server_upgrade(conn, &path, &token, wsc).await
-                })
-                .await
-                .ok()
-                .flatten();
-                let (Some(ws), Some(sc)) = (ws, weak.upgrade()) else { return };
-                let side = spawn_pump(ws, idle, ping, pipe);
-                let mut peer = norm(remote);
-                while sc.peers().contains(&peer) {
-                    peer.set_port(1024 + ctr.fetch_add(1, Ordering::Relaxed) % 60000);
-                }
-                if let Err(e) = sc.add_conn(side, peer) {
-                    log::debug!("ws carrier: reject {remote}: {e}");
-                }
+                sv.conn(tcp, remote).await;
             });
         }
     });
-    let c = WsCarrier { inner, overhead: overhead(&cfg), accept: Some(h.abort_handle()) };
+    let mut tasks = vec![h.abort_handle()];
+    let punch = punch_mode.then(|| {
+        Arc::new(Punch {
+            port: local.port(),
+            cfg: cfg.clone(),
+            sc: Arc::downgrade(&inner),
+            serve: Some(serve),
+            inflight: Mutex::default(),
+            mapped: Mutex::new(None),
+            peer: Mutex::new(None),
+        })
+    });
+    if let Some(p) = &punch {
+        let p = Arc::downgrade(p);
+        // Keep the announced mapping current (a router may hand out another port later).
+        tasks.push(
+            tokio::spawn(async move {
+                loop {
+                    let Some(pu) = p.upgrade() else { return };
+                    if let Some(m) = super::tcp_punch::mapped(pu.port, 1).await.into_iter().next() {
+                        *pu.mapped.lock().unwrap() = Some(m);
+                    }
+                    drop(pu);
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                }
+            })
+            .abort_handle(),
+        );
+    }
+    let c = WsCarrier { inner, overhead: overhead(&cfg), tasks, punch };
     warn_tcp(&c);
     Ok(c)
 }
@@ -704,12 +859,45 @@ fn split_host(endpoint: &str) -> Result<(String, u16), CarrierError> {
     Ok((h.trim_start_matches('[').trim_end_matches(']').to_string(), p.parse().map_err(|_| bad())?))
 }
 
+/// TLS + upgrade on a connected socket, as the client. `host` is the name (or IP) for SNI,
+/// `endpoint` the default Host header.
+async fn client_upgrade(tcp: TcpStream, host: &str, endpoint: &str, cfg: &Cfg) -> Result<WebSocketStream<Conn>, CarrierError> {
+    let blocked = |s: &str, e: &dyn std::fmt::Display| CarrierError::Blocked(format!("{s}: {e}"));
+    let id = Identity::derive(&cfg.key);
+    let (path, token) = cfg.path_token();
+    let _ = tcp.set_nodelay(true);
+    limit_unsent(&tcp, cfg.lowat);
+    let conn: Conn = if cfg.tls == TlsMode::Off {
+        Box::new(tcp)
+    } else {
+        let name = cfg.sni.clone().unwrap_or_else(|| host.to_string());
+        let name = pki_types::ServerName::try_from(name.clone()).map_err(|e| CarrierError::Failed(format!("ws: sni {name}: {e}")))?;
+        Box::new(client_tls(cfg, &id)?.connect(name, tcp).await.map_err(|e| blocked("tls", &e))?)
+    };
+    // Host header is configurable independently of the TCP target (domain fronting style / proxy vhost).
+    let hosthdr = cfg.host.clone().or_else(|| cfg.sni.clone()).unwrap_or_else(|| endpoint.to_string());
+    let req = tungstenite::http::Request::builder()
+        .method("GET")
+        .uri(format!("ws://{hosthdr}{path}"))
+        .header("Host", &hosthdr)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
+        .header("Authorization", format!("Bearer {token}"))
+        .body(())
+        .map_err(|e| CarrierError::Failed(format!("ws: request: {e}")))?;
+    let (ws, _resp) = tokio_tungstenite::client_async_with_config(req, conn, Some(cfg.ws_config())).await.map_err(|e| match e {
+        tungstenite::Error::Http(r) => CarrierError::Blocked(format!("upgrade refused: http {}", r.status().as_u16())),
+        e => CarrierError::Failed(format!("ws: upgrade: {e}")),
+    })?;
+    Ok(ws)
+}
+
 /// TCP + TLS + upgrade. Sends no WebSocket frames. Returns (ws, host address, local address).
 async fn connect_ws(spec: &CarrierSpec, cfg: &Cfg) -> Result<(WebSocketStream<Conn>, SocketAddr, SocketAddr), CarrierError> {
     let endpoint = spec.endpoint.as_deref().ok_or_else(|| CarrierError::Failed("ws: missing endpoint".into()))?;
     let (host, port) = split_host(endpoint)?;
-    let id = Identity::derive(&cfg.key);
-    let (path, token) = cfg.path_token();
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
         .await
         .map_err(|e| CarrierError::Failed(format!("ws: resolve {host}: {e}")))?
@@ -728,36 +916,9 @@ async fn connect_ws(spec: &CarrierSpec, cfg: &Cfg) -> Result<(WebSocketStream<Co
             }
         }
         let tcp = tcp.ok_or(last)?;
-        let _ = tcp.set_nodelay(true);
-        limit_unsent(&tcp, cfg.lowat);
         let remote = tcp.peer_addr().map_err(|e| blocked("connect", &e))?;
         let local = tcp.local_addr().map_err(|e| blocked("connect", &e))?;
-        let conn: Conn = if cfg.tls == TlsMode::Off {
-            Box::new(tcp)
-        } else {
-            let name = cfg.sni.clone().unwrap_or_else(|| host.clone());
-            let name = pki_types::ServerName::try_from(name.clone()).map_err(|e| CarrierError::Failed(format!("ws: sni {name}: {e}")))?;
-            Box::new(client_tls(cfg, &id)?.connect(name, tcp).await.map_err(|e| blocked("tls", &e))?)
-        };
-        // Host header is configurable independently of the TCP target (domain fronting style / proxy vhost).
-        let hosthdr = cfg.host.clone().or_else(|| cfg.sni.clone()).unwrap_or_else(|| endpoint.to_string());
-        let req = tungstenite::http::Request::builder()
-            .method("GET")
-            .uri(format!("ws://{hosthdr}{path}"))
-            .header("Host", &hosthdr)
-            .header("Connection", "Upgrade")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", tungstenite::handshake::client::generate_key())
-            .header("Authorization", format!("Bearer {token}"))
-            .body(())
-            .map_err(|e| CarrierError::Failed(format!("ws: request: {e}")))?;
-        let (ws, _resp) = tokio_tungstenite::client_async_with_config(req, conn, Some(cfg.ws_config()))
-            .await
-            .map_err(|e| match e {
-                tungstenite::Error::Http(r) => CarrierError::Blocked(format!("upgrade refused: http {}", r.status().as_u16())),
-                e => CarrierError::Failed(format!("ws: upgrade: {e}")),
-            })?;
+        let ws = client_upgrade(tcp, &host, endpoint, cfg).await?;
         Ok::<_, CarrierError>((ws, remote, local))
     };
     match tokio::time::timeout(cfg.connect, work).await {
@@ -769,10 +930,45 @@ async fn connect_ws(spec: &CarrierSpec, cfg: &Cfg) -> Result<(WebSocketStream<Co
 /// Client: one connection, shown to the transport as the host's resolved address.
 pub async fn dial_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
     let cfg = Cfg::from_spec(spec)?;
+    if spec.endpoint.is_none() {
+        return punch_client(spec, cfg);
+    }
     let (ws, remote, local) = connect_ws(spec, &cfg).await?;
     let inner = Arc::new(StreamCarrier::new(cfg.stream_cfg(local))?);
     inner.add_conn(spawn_pump(ws, cfg.idle, cfg.ping, cfg.pipe), norm(remote))?;
-    let c = WsCarrier { inner, overhead: overhead(&cfg), accept: None };
+    let c = WsCarrier { inner, overhead: overhead(&cfg), tasks: Vec::new(), punch: None };
+    warn_tcp(&c);
+    Ok(c)
+}
+
+/// Client without a host address: nothing is dialed yet. The transport learns the host's
+/// endpoints through rendezvous and every frame it aims at one becomes a dial from our port,
+/// while the listener takes the host's own dial when that one gets through first.
+fn punch_client(spec: &CarrierSpec, cfg: Cfg) -> Result<WsCarrier, CarrierError> {
+    let l = super::tcp_punch::listen(spec.bind_port.unwrap_or(0)).map_err(|e| CarrierError::Failed(format!("ws: bind: {e}")))?;
+    let local = l.local_addr().map_err(|e| CarrierError::Failed(e.to_string()))?;
+    let inner = Arc::new(StreamCarrier::new(cfg.stream_cfg(local))?);
+    let punch = Arc::new(Punch {
+        port: local.port(),
+        cfg: cfg.clone(),
+        sc: Arc::downgrade(&inner),
+        serve: None,
+        inflight: Mutex::default(),
+        mapped: Mutex::new(None),
+        peer: Mutex::new(None),
+    });
+    let p = Arc::downgrade(&punch);
+    let h = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, remote)) = l.accept().await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let Some(p) = p.upgrade() else { return };
+            tokio::spawn(async move { p.adopt(tcp, remote).await });
+        }
+    });
+    let c = WsCarrier { inner, overhead: overhead(&cfg), tasks: vec![h.abort_handle()], punch: Some(punch) };
     warn_tcp(&c);
     Ok(c)
 }
@@ -788,10 +984,11 @@ impl CarrierFactory for WsFactory {
             shared: &[
                 "a network observer sees a TLS connection to your host that looks like a website using WebSocket",
                 "traffic volume and timing patterns may still be recognisable",
+                "without a reachable port on the host: a public STUN server sees each side's address once, to learn its TCP port mapping",
             ],
             not_shared: &["the tunnel payload", "keys"],
             why: "carry the tunnel over the web port when UDP is blocked",
-            operator: "none: connects only to the host itself",
+            operator: "none: connects only to the host itself (plus one STUN query when the host has no reachable port)",
         }
     }
     async fn probe(&self, spec: &CarrierSpec, timeout: Duration) -> ProbeStatus {
@@ -799,6 +996,10 @@ impl CarrierFactory for WsFactory {
             Ok(c) => c,
             Err(e) => return ProbeStatus::Error(e.to_string()),
         };
+        if spec.endpoint.is_none() {
+            // Punch mode has nothing to dial before rendezvous; like the UDP carriers, say so.
+            return ProbeStatus::Reachable { rtt_ms: 0 };
+        }
         let t0 = Instant::now();
         match tokio::time::timeout(timeout, connect_ws(spec, &cfg)).await {
             // The socket is dropped right away: no WebSocket frame is ever sent.

@@ -787,17 +787,22 @@ fn ladder_explicit_failure_summary() {
 
 #[test]
 fn ladder_needs_reachable_host_and_no_punch() {
-    let invite = v(&["udp", "ws", "awg"]);
-    let built = [CarrierId::Udp, CarrierId::Ws, CarrierId::Awg];
+    let invite = v(&["udp", "xray", "awg", "ws"]);
+    let built = [CarrierId::Udp, CarrierId::Xray, CarrierId::Awg, CarrierId::Ws];
     let mut inp = LadderInput::new(&invite, &built);
-    // host behind NAT, punching works: stream carriers cannot be used
+    // host behind NAT, punching works: xray cannot be used, ws without an address punches over TCP
     let p = plan(&inp);
-    assert_eq!(p.attempts.iter().map(|a| a.id).collect::<Vec<_>>(), vec![CarrierId::Udp, CarrierId::Awg]);
-    assert_eq!(p.skipped, vec![("ws".to_string(), Reason::NeedsReachableHost)]);
+    assert_eq!(p.attempts.iter().map(|a| a.id).collect::<Vec<_>>(), vec![CarrierId::Udp, CarrierId::Awg, CarrierId::Ws]);
+    assert_eq!(p.skipped, vec![("xray".to_string(), Reason::NeedsReachableHost)]);
+    // a ws entry with an address that nothing else makes reachable is still a plain dial target
+    let with_addr = v(&["ws@198.51.100.7:8443"]);
+    let mut dial = LadderInput::new(&with_addr, &built);
+    dial.host_reachable = true;
+    assert_eq!(plan(&dial).attempts.len(), 1);
     // ...and punching is known impossible: nothing is left, and the message says why
     inp.punch_ok = false;
     let l = Ladder::new(plan(&inp));
-    assert_eq!(l.summary(), "udp: no punch; ws: needs a reachable host; awg: no punch");
+    assert_eq!(l.summary(), "udp: no punch; xray: needs a reachable host; awg: no punch; ws: no punch");
 }
 
 #[test]

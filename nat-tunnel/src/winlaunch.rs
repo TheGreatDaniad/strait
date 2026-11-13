@@ -1,10 +1,9 @@
-//! Windows double-click launch of the GUI: ask for administrator rights (UAC), drop the console window,
+//! Windows double-click launch of the GUI: ask for administrator rights (UAC), run without a console window,
 //! and show a message box instead of vanishing when the window cannot start.
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, SW_SHOWNORMAL};
 
@@ -25,12 +24,33 @@ pub fn elevate_if_needed() -> bool {
     r as isize > 32
 }
 
-/// Started by double-click (this process is the console's only user): close the console window.
-/// Started from a terminal: keep it, the log lines belong there.
-pub fn detach_console_if_alone() {
-    let mut pids = [0u32; 2];
-    if unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) } == 1 {
-        unsafe { FreeConsole() };
+/// The exe is a Windows-subsystem program (no console window on double-click). Started from a terminal,
+/// join its console so log lines and `--help` still print there; redirected handles are left alone.
+pub fn attach_parent_console() {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let unset = |h| {
+            let x = GetStdHandle(h);
+            x.is_null() || x as isize == -1
+        };
+        if !(unset(STD_OUTPUT_HANDLE) || unset(STD_ERROR_HANDLE) || unset(STD_INPUT_HANDLE)) || AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let open = |name: &str, write: bool| {
+            std::fs::OpenOptions::new().read(!write).write(write).open(name).ok().map(|f| f.into_raw_handle())
+        };
+        if unset(STD_OUTPUT_HANDLE) {
+            if let Some(h) = open("CONOUT$", true) { SetStdHandle(STD_OUTPUT_HANDLE, h as _); }
+        }
+        if unset(STD_ERROR_HANDLE) {
+            if let Some(h) = open("CONOUT$", true) { SetStdHandle(STD_ERROR_HANDLE, h as _); }
+        }
+        if unset(STD_INPUT_HANDLE) {
+            if let Some(h) = open("CONIN$", false) { SetStdHandle(STD_INPUT_HANDLE, h as _); }
+        }
     }
 }
 

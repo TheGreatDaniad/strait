@@ -498,10 +498,10 @@ async fn probe_sends_no_frames_and_reports_typed_status() {
 
 #[tokio::test]
 async fn dial_errors_are_typed() {
-    // Missing key / endpoint are Failed, not Blocked.
+    // A missing key is Failed, not Blocked (a missing endpoint is punch mode, see the punch tests).
     let e = dial_ws(&CarrierSpec { endpoint: Some("127.0.0.1:1".into()), ..Default::default() }).await.err().unwrap();
     assert!(matches!(e, CarrierError::Failed(_)), "{e}");
-    let e = dial_ws(&spec(None, false, &[])).await.err().unwrap();
+    let e = dial_ws(&CarrierSpec::default()).await.err().unwrap();
     assert!(matches!(e, CarrierError::Failed(_)), "{e}");
     // A peer that accepts and never answers the upgrade: Blocked("connect timeout").
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -531,4 +531,58 @@ async fn a_healthy_host_probed_without_its_key_is_unverifiable_not_blocked() {
     let keyless = CarrierSpec { endpoint: Some(addr.to_string()), bind_port: None, params: vec![("key".into(), "00112233445566778899aabbccddeeff".into())] };
     let st = f.probe(&keyless, Duration::from_secs(5)).await;
     assert!(matches!(keyless_verdict(CarrierId::Ws, &st), Verdict::Unverifiable(_)), "{st:?}");
+}
+
+// ---- punch mode (no address on either side)
+
+async fn punch_pair() -> (WsCarrier, WsCarrier, SocketAddr, SocketAddr) {
+    let h = listen_ws(&spec(None, true, &[])).await.expect("listen");
+    let c = dial_ws(&spec(None, true, &[])).await.expect("dial");
+    assert!(c.caps().punchable && !h.caps().punchable);
+    let lo = |io: &WsCarrier| SocketAddr::new([127, 0, 0, 1].into(), io.local_addr().unwrap().port());
+    let (ha, ca) = (lo(&h), lo(&c));
+    (h, c, ha, ca)
+}
+
+/// The client's frames aimed at the host's address become a dial; once it stands, frames flow.
+#[tokio::test]
+async fn punch_client_dial_reaches_the_host() {
+    let (h, c, ha, _) = punch_pair().await;
+    assert_eq!(c.send_to(b"lost like a datagram", ha).await.unwrap(), 20);
+    wait_for(|| h.peers().len() == 1).await;
+    wait_for(|| c.peers().len() == 1).await;
+    c.send_to(b"join", ha).await.unwrap();
+    let (f, from) = recv(&h).await.unwrap();
+    assert_eq!(f, b"join");
+    h.send_to(b"accept", from).await.unwrap();
+    assert_eq!(recv(&c).await.unwrap(), (b"accept".to_vec(), ha));
+    // Probes (port scan / fan-out) never open connections.
+    c.send_probe(b"x", "127.0.0.1:9".parse().unwrap()).await.unwrap();
+}
+
+/// The host's own dial lands on the client's listener; the client still is the TLS client and
+/// uses that one connection whatever address the transport aims at.
+#[tokio::test]
+async fn punch_host_dial_reaches_the_client() {
+    let (h, c, ha, ca) = punch_pair().await;
+    h.punch(ca);
+    h.punch(ca); // a repeat while one attempt runs is ignored
+    wait_for(|| c.peers().len() == 1 && h.peers().len() == 1).await;
+    c.send_to(b"join", ha).await.unwrap();
+    let (f, from) = recv(&h).await.unwrap();
+    assert_eq!((f.as_slice(), from), (&b"join"[..], ca));
+    h.send_to(b"accept", from).await.unwrap();
+    assert_eq!(recv(&c).await.unwrap().0, b"accept");
+    assert_eq!(h.peers().len(), 1, "one connection, not one per attempt");
+}
+
+/// The host announces its punch port next to the UDP mapping; a host with an address does not.
+#[tokio::test]
+async fn punch_host_announces_its_port() {
+    std::env::set_var("STUN_TCP_SERVERS", "127.0.0.1:9");
+    let h = listen_ws(&spec(None, true, &[])).await.unwrap();
+    let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    assert_eq!(h.extra_candidates(ip), vec![SocketAddr::new(ip, h.local_addr().unwrap().port())]);
+    let (fixed, _) = host(true, &[]).await;
+    assert!(fixed.extra_candidates(ip).is_empty());
 }

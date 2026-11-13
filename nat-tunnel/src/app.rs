@@ -830,6 +830,30 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     for (id, why) in &failed {
         ui::status(&format!("carrier {id} not started: {why}"));
     }
+    // Ask the router to open the TCP ports of the stream carriers (ws, xray), so a home host
+    // needs no manual port forward. Held (and renewed) for the whole session.
+    let mut tcp_guards = Vec::new();
+    if crate::upnp::behind_router().await {
+        for e in own.iter().filter(|e| matches!(e.id, CarrierId::Ws | CarrierId::Xray) && !failed.iter().any(|(id, _)| *id == e.id)) {
+            let Some(p) = e.endpoint.as_deref().and_then(|a| a.rsplit_once(':')).and_then(|(_, p)| p.parse::<u16>().ok()) else { continue };
+            // Reuse the mapping the host check kept, so the port in the invite holds.
+            let mapped = match crate::preflight::take_kept_tcp(p) {
+                Some(g) => Some(g),
+                None => crate::upnp::add_tcp_mapping(p, 3600).await,
+            };
+            match mapped {
+                Some(g) if g.external_port == p => {
+                    log::info!("router mapping {} active on TCP port {p} for carrier {}", g.method, e.id);
+                    tcp_guards.push(g);
+                }
+                Some(g) => {
+                    ui::status(&format!("carrier {}: the router opened TCP port {} instead of {p}; the invite must use that port", e.id, g.external_port));
+                    tcp_guards.push(g);
+                }
+                None => ui::status(&format!("carrier {}: the router did not open TCP port {p} automatically; forward it by hand in the router settings", e.id)),
+            }
+        }
+    }
     if opts.rv_host().is_some() && ios.iter().any(|io| matches!(io.caps().id, CarrierId::Ss | CarrierId::Awg)) {
         // A listener of its own is not what rendezvous publishes.
         let msg = "rendezvous publishes the plain UDP socket only: an ss/awg carrier with its own address:port is not found through it; list it without an address (--carrier ss) to serve it on that socket";
@@ -1010,6 +1034,9 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     }
     .await;
     mux.close().await;
+    for g in tcp_guards.drain(..) {
+        let _ = g.release().await;
+    }
     if let Some(g) = guard.take() {
         let _ = g.release().await;
     }

@@ -2466,6 +2466,12 @@ impl MuxHost {
             if let Some(v6) = rv.v6 {
                 want.push(SocketAddr::new(v6.into(), port));
             }
+            // A stream carrier that punches on its own port (TCP) is found at that port.
+            for a in self.ios.iter().flat_map(|io| io.extra_candidates(m.ip())) {
+                if !want.contains(&a) && want.len() < rendezvous::derive::MAX_CANDIDATES {
+                    want.push(a);
+                }
+            }
             if rv.handle.is_none() || want != rv.local {
                 rv.restart(want);
             }
@@ -2949,6 +2955,9 @@ impl MuxHost {
                 let addr = self.punch[i].addr;
                 if let Some(v) = self.punch_io {
                     self.raw_send(&[T_PUNCH], addr, v).await;
+                }
+                for io in &self.ios {
+                    io.punch(addr);
                 }
             }
         }

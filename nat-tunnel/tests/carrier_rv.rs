@@ -294,3 +294,57 @@ async fn shared_needs_the_plain_socket() {
     let e = MuxHost::bind(KEY, MuxConfig { shared: vec![CarrierId::Ws], ..MuxConfig::default() }).await.err().expect("must fail");
     assert!(e.to_string().contains("cannot ride"), "{e}");
 }
+
+/// ws without an address on either side: the host announces its TCP port next to the UDP
+/// mapping, the guest finds it through rendezvous and the join runs over the punched TCP
+/// connection.
+#[cfg(feature = "cr-ws")]
+#[tokio::test]
+async fn ws_without_an_address_connects_through_rendezvous() {
+    use nat_tunnel::carrier::ws::WsFactory;
+    use nat_tunnel::transport::IoList;
+    bound(async {
+        stun_init();
+        std::env::set_var("STUN_TCP_SERVERS", "127.0.0.1:9"); // no TCP STUN: the port number is announced as is
+        let hub = MockHub::new();
+        let ws = WsFactory.listen(&spec(None, None)).await.unwrap();
+        let ws_port = ws.local_addr().unwrap().port();
+        let mut mux = MuxHost::bind(
+            KEY,
+            MuxConfig { stun: true, rv: Some(rv_host(hub.backend("trk").arc())), carriers: IoList(vec![ws]), ..MuxConfig::default() },
+        )
+        .await
+        .unwrap();
+        let joined: Arc<Mutex<Vec<SocketAddr>>> = Arc::default();
+        let j = joined.clone();
+        let host = tokio::spawn(async move {
+            loop {
+                while let Some(ev) = mux.try_recv().await.unwrap() {
+                    match ev {
+                        MuxEvent::Packet { data, .. } => {
+                            let src = Ipv4Addr::new(data[12], data[13], data[14], data[15]);
+                            mux.send_to_ip(src, &pkt(MUX_HOST_IP, src, &data[20..])).await;
+                        }
+                        MuxEvent::Joined { from, .. } => j.lock().unwrap().push(from),
+                        _ => {}
+                    }
+                }
+                tokio::select! {
+                    _ = mux.readable() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => { mux.tick().await.unwrap(); }
+                }
+            }
+        });
+        let io = WsFactory.dial(&spec(None, None)).await.unwrap();
+        assert!(io.caps().punchable);
+        let guest_port = io.local_addr().unwrap().port();
+        let rv = rv_join(hub.backend("trk").arc(), Duration::from_secs(10));
+        let mut t = Tunnel::connect_with_io(opts(vec![]), &[], false, false, Some(rv), io).await.expect("ws connects");
+        t.enable_packet_mode();
+        assert!(echo(&mut t, b"over punched tcp").await);
+        assert_eq!(t.peer().map(|p| p.port()), Some(ws_port), "the tunnel runs to the host's TCP port");
+        assert_eq!(joined.lock().unwrap().iter().map(|a| a.port()).collect::<Vec<_>>(), vec![guest_port]);
+        host.abort();
+    })
+    .await;
+}

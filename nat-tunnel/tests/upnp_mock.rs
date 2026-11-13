@@ -78,6 +78,7 @@ fn spawn_igd(quirk: Quirk, igd: Arc<Igd>) -> String {
                 }
                 let port: u16 = t.split("<NewExternalPort>").nth(1)
                     .and_then(|x| x.split('<').next()).and_then(|x| x.parse().ok()).unwrap_or(0);
+                let proto = t.split("<NewProtocol>").nth(1).and_then(|x| x.split('<').next()).unwrap_or("").to_string();
                 if t.contains("#AddPortMapping") {
                     igd.adds.fetch_add(1, SeqCst);
                     if matches!(quirk, Quirk::Refuse606) {
@@ -88,11 +89,13 @@ fn spawn_igd(quirk: Quirk, igd: Arc<Igd>) -> String {
                         return http_reply(&mut s, "500 Internal Server Error",
                             "<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>718</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>");
                     }
-                    igd.maps.lock().unwrap().insert(port, "x".into());
+                    igd.maps.lock().unwrap().insert(port, proto);
                     http_reply(&mut s, "200 OK", "<u:AddPortMappingResponse/>")
                 } else if t.contains("#DeletePortMapping") {
                     igd.deletes.fetch_add(1, SeqCst);
-                    igd.maps.lock().unwrap().remove(&port);
+                    let mut maps = igd.maps.lock().unwrap();
+                    if maps.get(&port) == Some(&proto) { maps.remove(&port); }
+                    drop(maps);
                     http_reply(&mut s, "200 OK", "<u:DeletePortMappingResponse/>")
                 } else if t.contains("#GetExternalIPAddress") {
                     http_reply(&mut s, "200 OK", "<u:GetExternalIPAddressResponse><NewExternalIPAddress>203.0.113.7</NewExternalIPAddress></u:GetExternalIPAddressResponse>")
@@ -109,6 +112,7 @@ fn spawn_igd(quirk: Quirk, igd: Arc<Igd>) -> String {
 struct Pmp {
     maps: Mutex<HashMap<u16, u16>>,
     maps_req: AtomicUsize,
+    last_op: AtomicUsize,
     deletes: AtomicUsize,
 }
 
@@ -135,13 +139,14 @@ fn spawn_pmp(mode: PmpMode, st: Arc<Pmp>) -> SocketAddr {
             let mut ext = u16::from_be_bytes([b[6], b[7]]);
             let life = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
             let result: u16 = if matches!(mode, PmpMode::Refuse) { 2 } else { 0 };
+            st.last_op.store(b[1] as usize, SeqCst);
             if life == 0 { st.deletes.fetch_add(1, SeqCst); st.maps.lock().unwrap().remove(&internal); }
             else {
                 st.maps_req.fetch_add(1, SeqCst);
                 if ext == 0 { ext = internal }
                 st.maps.lock().unwrap().insert(internal, ext);
             }
-            let mut r = vec![0, 0x81];
+            let mut r = vec![0, 0x80 | b[1]];
             r.extend_from_slice(&result.to_be_bytes());
             r.extend_from_slice(&[0, 0, 0, 1]);
             r.extend_from_slice(&internal.to_be_bytes());
@@ -278,4 +283,60 @@ async fn upnp_fault_606_is_reported_as_refused() {
         explain(&r),
         "The router answered UPnP but refused the mapping (error 606): enable UPnP in the router settings."
     );
+}
+
+#[tokio::test]
+async fn tcp_mapping_names_tcp_on_add_and_delete() {
+    let igd = Arc::new(Igd::default());
+    let loc = spawn_igd(Quirk::None, igd.clone());
+    let t = Targets { local: Some(LOCAL), upnp_locations: vec![loc], tcp: true, ..Targets::default() };
+    let g = probe_targets(t, 7700, 0).await.guard.expect("upnp tcp");
+    assert!(g.tcp);
+    assert_eq!(igd.maps.lock().unwrap().get(&7700).map(String::as_str), Some("TCP"));
+    g.release().await.unwrap();
+    assert!(igd.maps.lock().unwrap().is_empty(), "the delete must name TCP too");
+
+    // NAT-PMP: opcode 2, and the reply must echo it.
+    let st = Arc::new(Pmp::default());
+    let srv = spawn_pmp(PmpMode::Normal, st.clone());
+    let t = Targets { local: Some(LOCAL), natpmp: Some(srv), tcp: true, ..Targets::default() };
+    let g = probe_targets(t, 7701, 0).await.guard.expect("natpmp tcp");
+    assert_eq!((g.tcp, st.last_op.load(SeqCst)), (true, 2));
+    g.release().await.unwrap();
+    assert_eq!(st.last_op.load(SeqCst), 2, "the delete uses the TCP opcode");
+}
+
+#[tokio::test]
+async fn carrier_port_follows_the_router_and_is_kept_for_the_host() {
+    use nat_tunnel::preflight::{map_carrier_port_with, take_kept_tcp};
+    // 7800 is taken on the router (718), so it grants 7801: the carrier must listen on and
+    // publish 7801, with the mapping redone as 7801 -> 7801.
+    let igd = Arc::new(Igd::default());
+    igd.taken.lock().unwrap().insert(7800);
+    let loc = spawn_igd(Quirk::None, igd.clone());
+    let add = |p: u16| {
+        let t = Targets { local: Some(LOCAL), upnp_locations: vec![loc.clone()], tcp: true, ..Targets::default() };
+        async move { probe_targets(t, p, 0).await.guard }
+    };
+    assert_eq!(map_carrier_port_with(7800, &add).await, Ok(7801));
+    assert_eq!(igd.maps.lock().unwrap().keys().copied().collect::<Vec<_>>(), vec![7801]);
+    // Asking again reuses the kept mapping instead of adding another.
+    let adds = igd.adds.load(SeqCst);
+    assert_eq!(map_carrier_port_with(7801, &add).await, Ok(7801));
+    assert_eq!(igd.adds.load(SeqCst), adds);
+    // The host adopts it by its listen port; nothing is kept twice.
+    let g = take_kept_tcp(7801).expect("kept for the host");
+    assert_eq!((g.internal.port(), g.external_port, g.tcp), (7801, 7801, true));
+    assert!(take_kept_tcp(7801).is_none());
+    g.release().await.unwrap();
+    assert!(igd.maps.lock().unwrap().is_empty());
+
+    // A router that says no is an error with the port in it, and nothing is kept.
+    let refuse = spawn_igd(Quirk::Refuse606, Arc::new(Igd::default()));
+    let add = |p: u16| {
+        let t = Targets { local: Some(LOCAL), upnp_locations: vec![refuse.clone()], tcp: true, ..Targets::default() };
+        async move { probe_targets(t, p, 0).await.guard }
+    };
+    assert!(map_carrier_port_with(7810, &add).await.unwrap_err().contains("7810"));
+    assert!(take_kept_tcp(7810).is_none());
 }

@@ -117,8 +117,9 @@ fn start_gating() {
     let used = ProbeStatus::Error("TCP port 8443 is already in use on this device".into());
     let b = crui::blockers(&[pick(CarrierId::Ws, "8443")], &st(&[(CarrierId::Ws, used)]), 7100, host);
     assert!(b[0].contains("already in use"));
-    // No public address and none typed: blocked with the reason.
-    let b = crui::blockers(&[pick(CarrierId::Ws, "8443")], &ready, 7100, None);
+    // No public address and none typed: ws punches like UDP, xray is blocked with the reason.
+    assert!(crui::blockers(&[pick(CarrierId::Ws, "8443")], &ready, 7100, None).is_empty());
+    let b = crui::blockers(&[pick(CarrierId::Xray, "8444")], &st(&[(CarrierId::Xray, ProbeStatus::Reachable { rtt_ms: 1 })]), 7100, None);
     assert_eq!(b, ["Public address unknown: forward the port and enter your address."]);
 }
 
@@ -305,9 +306,11 @@ async fn local_check_reports_a_taken_port_and_a_missing_xray() {
 #[test]
 fn udp_carriers_need_no_public_address() {
     let ready = st(&[(CarrierId::Ss, ok()), (CarrierId::Awg, ok()), (CarrierId::Ws, ok())]);
-    // Behind NAT (no public address): ss and awg punch like plain UDP, ws needs a reachable port.
-    assert!(crui::blockers(&[pick(CarrierId::Ss, "7201"), pick(CarrierId::Awg, "7202")], &ready, 7100, None).is_empty());
-    assert!(!crui::blockers(&[pick(CarrierId::Ws, "8443")], &ready, 7100, None).is_empty());
+    // Behind NAT (no public address): ss and awg punch like plain UDP, ws punches over TCP.
+    assert!(crui::blockers(&[pick(CarrierId::Ss, "7201"), pick(CarrierId::Awg, "7202"), pick(CarrierId::Ws, "8443")], &ready, 7100, None).is_empty());
+    assert!(crui::needs_host(CarrierId::Xray) && !crui::needs_host(CarrierId::Ws));
+    let p = crui::plan(&[(CarrierId::Ws, 8443)], None);
+    assert!(p.invite[0].endpoint.is_none() && p.listen[0].endpoint.is_none());
     let p = crui::plan(&[(CarrierId::Ss, 7201)], None);
     assert!(p.invite[0].endpoint.is_none() && p.listen[0].endpoint.is_none());
     let p = crui::plan(&[(CarrierId::Ss, 7201)], Some("203.0.113.5"));

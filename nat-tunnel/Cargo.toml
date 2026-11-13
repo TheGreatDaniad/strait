@@ -1,6 +1,6 @@
 [package]
 name = "nat-tunnel"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/TheGreatDaniad/strait"
@@ -9,7 +9,7 @@ repository = "https://github.com/TheGreatDaniad/strait"
 crate-type = ["rlib", "staticlib"]
 
 [features]
-default = ["gui", "rv-sig", "rv-trk", "rv-nostr", "rv-dht", "rv-ntfy", "rv-mqtt"]
+default = ["gui", "rv-sig", "rv-trk", "rv-nostr", "rv-dht", "rv-ntfy", "rv-mqtt", "cr-ss", "cr-ws", "cr-awg"]
 gui = ["dep:eframe"]
 # C ABI for the iOS Network Extension (include/strait.h); on macOS it also swaps the TUN backend for the fd one (harness only).
 ffi = []
@@ -21,7 +21,8 @@ rv-nostr = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:secp256k1
 rv-dht = ["dep:mainline"]
 rv-ntfy = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
 rv-mqtt = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
-# Carrier placeholders (docs/TUNNEL_CARRIERS.md); each gets its deps when implemented. Not in default yet.
+# Carriers (docs/TUNNEL_CARRIERS.md). The pure-Rust ones are in `default`; `cr-xray` stays opt-in
+# because it needs the Xray program next to the app.
 cr-ss = ["dep:shadowsocks"]
 cr-ws = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots", "dep:tokio-tungstenite", "dep:rcgen"]
 cr-awg = []

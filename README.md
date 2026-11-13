@@ -32,7 +32,7 @@ for networks that block or inspect traffic:
 
 - Shadowsocks-2022
 - Obfuscated UDP in the style of AmneziaWG (our own envelope, not compatible with WireGuard or AmneziaWG clients)
-- WebSocket over TLS
+- WebSocket over TLS (TCP). When the host has no reachable TCP port, both sides open the connection to each other through their routers, the same way the UDP tunnel is hole-punched
 - Xray (VLESS + REALITY)
 
 ## No server of your own
@@ -100,11 +100,12 @@ invite key with HKDF, and only ChaCha20-Poly1305 sealed endpoints are published.
 ```bash
 cd nat-tunnel
 cargo build --release                      # CLI + GUI
-cargo test --no-default-features           # headless suite (some live-network tests are #[ignore])
+cargo test --no-default-features --features cr-ss,cr-ws,cr-awg   # headless suite (some live-network tests are #[ignore])
 cargo run --release -- check-host          # what NAT you are behind and who can reach you
 ```
 
-The Shadowsocks, AmneziaWG, WebSocket and Xray transports are opt-in build features (`cr-ss`, `cr-awg`, `cr-ws`, `cr-xray`).
+The Shadowsocks, AmneziaWG-style and WebSocket transports are built in by default (`cr-ss`, `cr-awg`, `cr-ws`). Xray is an opt-in
+build feature (`cr-xray`) because it needs the Xray program installed next to Strait.
 Mobile: `cd strait-mobile && npm install && npx jest`. Device builds are in `strait-mobile/ios/README_DEVICE_TESTING.md`.
 A packet-tunnel VPN on iOS needs a paid Apple Developer team.
 
@@ -154,6 +155,16 @@ Linux to Linux, UDP over trackers, ✅ = connects and moves data, ❌ = cannot c
 | symmetric (gateway) | 3.2 s | 43 / 58 |
 | symmetric (random) | 5.3 s | 32 / 37 |
 | carrier-grade | 11.3 s | 24 / 37 |
+
+**WebSocket without a reachable port** (version 0.4.1, two Linux peers behind port-restricted NATs in Frankfurt and Virginia,
+the host's TCP port closed to outside connections):
+
+| Case | Result |
+|---|---|
+| WebSocket only, both directions | ✅ 6 of 6, connected in 1.1 to 1.6 s, 0% loss, 47 to 77 Mbit/s |
+| Client with all UDP blocked | ✅ 4 of 4, WebSocket picked automatically when every transport is allowed |
+| Idle for 150 s, then traffic | ✅ same session, 0% loss |
+| Symmetric NAT on either side | ❌ as expected: the router picks a new port per destination |
 
 Not covered yet: Mac and Android as clients, IPv6, real mobile networks, real consumer routers under the port scan, and the
 Windows userspace-exit crash seen in 5 of about 380 early jobs (it is contained, its trigger was never reproduced).

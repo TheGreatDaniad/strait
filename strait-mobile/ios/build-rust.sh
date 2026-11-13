@@ -5,7 +5,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CRATE="$HERE/../../nat-tunnel"
 PROFILE="${PROFILE:-release}"
-FEATURES="ffi,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt"   # default features minus the desktop gui
+FEATURES="ffi,rv-trk,rv-nostr,rv-dht,rv-ntfy,rv-mqtt,cr-ss,cr-ws,cr-awg"   # default features minus the desktop gui
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$CRATE/target-ios}"
 export IPHONEOS_DEPLOYMENT_TARGET=15.1
 # Apple's nm/ld cannot read the newer-LLVM bitcode rustc embeds (LTO needs it): build without LTO/bitcode.

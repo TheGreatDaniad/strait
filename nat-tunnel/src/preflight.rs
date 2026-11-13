@@ -171,6 +171,60 @@ pub async fn release_kept_mapping() {
     if let Some(g) = guard {
         let _ = g.release().await;
     }
+    let tcp = KEPT_TCP.lock().map(|mut k| std::mem::take(&mut *k)).unwrap_or_default();
+    for g in tcp {
+        let _ = g.release().await;
+    }
+}
+
+/// TCP mappings opened by [`map_carrier_port`], waiting for the host to adopt them.
+static KEPT_TCP: Mutex<Vec<upnp::MappingGuard>> = Mutex::new(Vec::new());
+
+fn kept_tcp_has(port: u16) -> bool {
+    KEPT_TCP.lock().is_ok_and(|k| k.iter().any(|g| g.internal.port() == port))
+}
+
+/// Take over the TCP mapping kept for `port` (the carrier's listen port), if any.
+pub fn take_kept_tcp(port: u16) -> Option<upnp::MappingGuard> {
+    let mut k = KEPT_TCP.lock().ok()?;
+    let i = k.iter().position(|g| g.internal.port() == port)?;
+    Some(k.swap_remove(i))
+}
+
+/// Open a TCP port on the router for a stream carrier (ws, xray) before the invite is built.
+/// Returns the port to listen on and to publish. When the router hands out another external
+/// port, the mapping is redone on that port so listen port == invite port (which
+/// `--carriers-from-invite` relies on). A device with a public address gets `port` back untouched.
+pub async fn map_carrier_port(port: u16) -> Result<u16, String> {
+    if !upnp::behind_router().await {
+        return Ok(port);
+    }
+    map_carrier_port_with(port, |p| upnp::add_tcp_mapping(p, 3600)).await
+}
+
+/// [`map_carrier_port`] with the mapper supplied (tests point it at a mock router).
+#[doc(hidden)]
+pub async fn map_carrier_port_with<F, Fut>(port: u16, add: F) -> Result<u16, String>
+where
+    F: Fn(u16) -> Fut,
+    Fut: std::future::Future<Output = Option<upnp::MappingGuard>>,
+{
+    let mut want = port;
+    for _ in 0..2 {
+        if kept_tcp_has(want) {
+            return Ok(want);
+        }
+        let g = add(want).await.ok_or_else(|| format!("the router did not open TCP port {want}"))?;
+        if g.external_port == want {
+            if let Ok(mut k) = KEPT_TCP.lock() {
+                k.push(g);
+            }
+            return Ok(want);
+        }
+        want = g.external_port;
+        let _ = g.release().await;
+    }
+    Err(format!("the router did not give TCP port {port} or a stable replacement"))
 }
 
 /// Probe from the exact port the host will listen on: a NAT mapping belongs
@@ -866,6 +920,18 @@ pub mod crui {
     pub const INTRO: &str = "Plain UDP is always available. Add more ways for networks that block or inspect UDP:";
     pub const TCP_NOTE: &str =
         "needs this port reachable from the internet (public address or a forwarded port); it cannot be hole-punched";
+    pub const WS_NOTE: &str =
+        "uses this port when it is reachable from the internet (public address or a forwarded port); otherwise both sides connect to each other through the router, like UDP";
+
+    /// The note under a TCP carrier's row.
+    pub fn tcp_note(id: CarrierId) -> &'static str {
+        if id == CarrierId::Ws { WS_NOTE } else { TCP_NOTE }
+    }
+
+    /// Needs an address clients can dial (ws can hole-punch instead).
+    pub fn needs_host(id: CarrierId) -> bool {
+        is_tcp(id) && id != CarrierId::Ws
+    }
     pub const GUEST_ORDER: &str = "Tries plain UDP first, then the other ways in the host's order, and remembers what worked.";
     pub const NOT_SUPPORTED: &str = "not supported by this version";
 
@@ -1094,8 +1160,8 @@ pub mod crui {
                 _ => {}
             }
         }
-        // UDP carriers (ss, awg) punch through NAT like plain UDP, so only TCP ones need a reachable address.
-        if picks.iter().any(|p| is_tcp(p.id)) && host.is_none() {
+        // ss, awg and ws punch through NAT like plain UDP, so only xray needs a reachable address.
+        if picks.iter().any(|p| needs_host(p.id)) && host.is_none() {
             out.push("Public address unknown: forward the port and enter your address.".into());
         }
         out
@@ -1112,7 +1178,8 @@ pub mod crui {
         pub invite: Vec<CarrierEntry>,
     }
 
-    /// `host` is `None` behind NAT: UDP carriers then ride the punched UDP socket (no endpoint in the invite).
+    /// `host` is `None` behind NAT: UDP carriers then ride the punched UDP socket and ws punches
+    /// on a TCP port of its own (no endpoint in the invite).
     pub fn plan(picks: &[(CarrierId, u16)], host: Option<&str>) -> Plan {
         let mut p = Plan::default();
         for &(id, port) in picks {

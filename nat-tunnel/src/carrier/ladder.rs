@@ -167,7 +167,8 @@ pub fn plan(inp: &LadderInput) -> Plan {
         // rendezvous publishes (`MuxConfig::shared`); a host that predates this simply stays silent
         // and the attempt times out like any other.
         if !inp.host_reachable {
-            if !id.default_punchable() {
+            // ws without an address finds the host through rendezvous and a TCP punch.
+            if !id.default_punchable() && (id != CarrierId::Ws || entry.contains('@')) {
                 skipped.push((label, Reason::NeedsReachableHost));
                 continue;
             }

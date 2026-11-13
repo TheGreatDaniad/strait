@@ -49,7 +49,7 @@ fn spawn_pcp(mode: Mode, st: Arc<Pcp>) -> SocketAddr {
         nonce.copy_from_slice(&b[24..36]);
         // Client address must be the IPv4-mapped form of our fake LAN address.
         assert_eq!(&b[8..24], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 50]);
-        assert_eq!(b[36], 17);
+        assert!(b[36] == 17 || b[36] == 6);
         let mut r = [0u8; 60];
         r[..].copy_from_slice(&b[..60]);
         r[1] = 0x81;
@@ -298,4 +298,15 @@ async fn real_router_probe() {
     if let Some(g) = r.guard {
         println!("released: {:?}", g.release().await);
     }
+}
+
+#[tokio::test]
+async fn pcp_tcp_mapping_uses_protocol_6() {
+    // The mock echoes the protocol byte; the client accepts only the one it asked for.
+    let st = Arc::new(Pcp::default());
+    let srv = spawn_pcp(Mode::Normal, st.clone());
+    let g = probe_targets(Targets { tcp: true, ..t(Some(srv), None) }, 7950, 0).await.guard.expect("pcp tcp");
+    assert!(g.tcp);
+    g.release().await.unwrap();
+    assert!(st.maps.lock().unwrap().is_empty());
 }

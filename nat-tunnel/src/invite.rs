@@ -448,7 +448,7 @@ mod tests {
         ] {
             assert!(Invite::check_key(bad).is_err(), "{bad:?}");
         }
-        for good in ["0123456789abcdef0123456789abcdef", "00112233445566778899aabbccddeeff", "0123456789abcdef0123456789abcdef"] {
+        for good in ["00112233445566778899aabbccddeeff", "8f3a1c5e7b9d2046a1c3e5f7092b4d6e"] {
             assert!(Invite::check_key(good).is_ok(), "{good:?}");
         }
     }

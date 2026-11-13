@@ -4,6 +4,8 @@
 //! WireGuard and TURN server fallback, providing Anydesk-like
 //! remote access functionality.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
@@ -297,6 +299,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(windows)]
+    nat_tunnel::winlaunch::attach_parent_console();
     if let Err(e) = real_main().await {
         // Display, not Debug: connect failures carry user-facing sentences.
         eprintln!("error: {e}");
@@ -364,6 +368,25 @@ fn gui_fatal(msg: String) {
 fn guard_gui_root() {
     // Root GUI works from an app bundle (`sudo Strait.app/Contents/MacOS/nat-tunnel gui`),
     // the way users already run it; refusing here broke that.
+    // A double-clicked app is not root, so ask once for the administrator password and reopen as root.
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::geteuid() } != 0 && std::env::var_os("STRAIT_NO_ELEVATE").is_none() {
+        let (Ok(exe), Some(home)) = (std::env::current_exe(), std::env::var("HOME").ok()) else { return };
+        let sh = format!(
+            "HOME={} {} gui >{} 2>&1 </dev/null &",
+            privileged::sh_quote(&home),
+            privileged::sh_quote(&exe.display().to_string()),
+            privileged::sh_quote(&format!("{home}/Library/Logs/strait-gui-root.log"))
+        );
+        // shortcut: a cancelled prompt falls through to the unprivileged window, which says admin is needed.
+        let ok = std::process::Command::new("/usr/bin/osascript")
+            .args(privileged::osascript_args(&sh))
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if ok {
+            std::process::exit(0);
+        }
+    }
 }
 
 /// Raise SIGTERM on ourselves once the stop file appears, so the normal
@@ -525,7 +548,6 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 if nat_tunnel::winlaunch::elevate_if_needed() {
                     return Ok(());
                 }
-                nat_tunnel::winlaunch::detach_console_if_alone();
             }
             // A graphics failure can be an error or a panic (wgpu treats some as fatal): either way try
             // OpenGL once in a fresh process before giving up with a message the user can read.
@@ -999,14 +1021,14 @@ mod tests {
     #[tokio::test]
     async fn invite_from_env_and_weak_key_rejected() {
         // One test mutates STRAIT_INVITE so nothing else races on it.
-        let good = "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:7100";
+        let good = "STRAIT2|00112233445566778899aabbccddeeff|127.0.0.1:7100";
         std::env::set_var("STRAIT_INVITE", good);
         let r = resolve_endpoints(None, None, None, None, true).await.unwrap();
-        assert_eq!(r.key, "0123456789abcdef0123456789abcdef");
+        assert_eq!(r.key, "00112233445566778899aabbccddeeff");
         // --invite wins over the environment.
-        let other = "STRAIT2|0123456789abcdef0123456789abcdef|127.0.0.1:7100".to_string();
+        let other = "STRAIT2|8f3a1c5e7b9d2046a1c3e5f7092b4d6e|127.0.0.1:7100".to_string();
         let r = resolve_endpoints(Some(other), None, None, None, true).await.unwrap();
-        assert_eq!(r.key, "0123456789abcdef0123456789abcdef");
+        assert_eq!(r.key, "8f3a1c5e7b9d2046a1c3e5f7092b4d6e");
         // A weak key is refused, from an invite and from --key.
         let weak = "STRAIT2|00000000000000000000000000000000|127.0.0.1:7100".to_string();
         assert!(resolve_endpoints(Some(weak), None, None, None, true).await.is_err());

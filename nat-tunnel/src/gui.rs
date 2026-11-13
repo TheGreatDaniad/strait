@@ -825,6 +825,8 @@ struct GuiApp {
     host_port_text: String,
     /// Preflight run by "Start sharing" when a meeting point is needed (builds the invite).
     start_rx: Option<mpsc::Receiver<Result<Verdict, String>>>,
+    /// Router TCP mappings being requested for the ws / xray ports before the invite is built.
+    map_rx: Option<mpsc::Receiver<(Verdict, Vec<(CarrierId, u16)>)>>,
     start_error: Option<String>,
     tab: Tab,
     mode: Option<Mode>,
@@ -887,6 +889,7 @@ impl GuiApp {
             cr_listen: Vec::new(),
             host_port_text: settings.host_port.to_string(),
             start_rx: None,
+            map_rx: None,
             start_error: None,
             tab: Tab::Connect,
             mode: None,
@@ -1012,6 +1015,10 @@ impl GuiApp {
                     Err(e) => self.start_error = Some(e),
                 }
             }
+        }
+        if let Some((verdict, picks)) = self.map_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.map_rx = None;
+            self.finish_host(verdict, picks);
         }
         if self.task.as_ref().is_some_and(|task| task.is_finished()) {
             let was = self.mode;
@@ -1146,7 +1153,7 @@ impl GuiApp {
     }
 
     fn start_enabled(&self) -> bool {
-        if self.start_rx.is_some() || (self.busy() && self.mode != Some(Mode::Host)) {
+        if self.start_rx.is_some() || self.map_rx.is_some() || (self.busy() && self.mode != Some(Mode::Host)) {
             return false;
         }
         let stage = self.stage();
@@ -1232,6 +1239,33 @@ impl GuiApp {
     }
 
     fn begin_host(&mut self, verdict: Verdict) {
+        // Extra carriers: listeners on 0.0.0.0:<port>, and the public endpoints clients dial in `cr`.
+        let picks: Vec<(CarrierId, u16)> = self
+            .cr_picks()
+            .iter()
+            .filter_map(|p| rvui::parse_port(&p.port_text).ok().map(|n| (p.id, n)))
+            .collect();
+        if !picks.iter().any(|(id, _)| crui::is_tcp(*id)) {
+            return self.finish_host(verdict, picks);
+        }
+        // ws / xray need an open TCP port: ask the router first, so the invite carries the port
+        // it really granted. A refusal is not fatal (the port may be forwarded by hand); the
+        // host then says so when it starts.
+        let (tx, rx) = mpsc::channel();
+        self.map_rx = Some(rx);
+        tokio::spawn(async move {
+            let mut picks = picks;
+            for (id, port) in picks.iter_mut().filter(|(id, _)| crui::is_tcp(*id)) {
+                match crate::preflight::map_carrier_port(*port).await {
+                    Ok(p) => *port = p,
+                    Err(e) => log::warn!("carrier {id}: {e}"),
+                }
+            }
+            let _ = tx.send((verdict, picks));
+        });
+    }
+
+    fn finish_host(&mut self, verdict: Verdict, picks: Vec<(CarrierId, u16)>) {
         let port = self.settings.host_port;
         let invite = match parse_invite_input(&verdict.invite) {
             Ok(invite) => invite,
@@ -1240,17 +1274,11 @@ impl GuiApp {
                 return;
             }
         };
-        // Extra carriers: listeners on 0.0.0.0:<port>, and the public endpoints clients dial in `cr`.
-        let picks: Vec<(CarrierId, u16)> = self
-            .cr_picks()
-            .iter()
-            .filter_map(|p| rvui::parse_port(&p.port_text).ok().map(|n| (p.id, n)))
-            .collect();
         let mut listen = Vec::new();
         let mut invite = invite;
         if !picks.is_empty() {
             let host = crui::effective_host(Some(&verdict), &self.settings.carrier_public);
-            if host.is_none() && picks.iter().any(|(id, _)| crui::is_tcp(*id)) {
+            if host.is_none() && picks.iter().any(|(id, _)| crui::needs_host(*id)) {
                 self.start_error = Some("Public address unknown: forward the port and enter your address.".into());
                 return;
             }
@@ -2677,7 +2705,7 @@ impl GuiApp {
                 );
             }
         }
-        if self.start_rx.is_some() {
+        if self.start_rx.is_some() || self.map_rx.is_some() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -2843,7 +2871,7 @@ impl GuiApp {
                     });
                     ui.label(RichText::new(crui::short(id)).font(ui_font(12.0)).color(TEXT_MUTED));
                     if crui::is_tcp(id) {
-                        ui.label(RichText::new(crui::TCP_NOTE).font(ui_font(11.5)).color(TEXT_MUTED));
+                        ui.label(RichText::new(crui::tcp_note(id)).font(ui_font(11.5)).color(TEXT_MUTED));
                     }
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -3283,7 +3311,7 @@ impl GuiApp {
             let text = if cfg!(windows) {
                 "Full tunnel needs admin — run the app as administrator."
             } else {
-                "Full tunnel needs admin — quit and run the app with sudo."
+                "Full tunnel needs admin — reopen Strait and enter your password when asked."
             };
             ui.add(
                 egui::Label::new(

@@ -27,8 +27,10 @@ use tokio::task::JoinHandle;
 pub struct Mapping {
     /// Address the router reports for its WAN side, when it tells us.
     pub external_ip: Option<Ipv4Addr>,
-    /// External UDP port that now forwards to `internal`.
+    /// External port that now forwards to `internal`.
     pub external_port: u16,
+    /// TCP mapping (for the stream carriers); false = UDP.
+    pub tcp: bool,
     /// Local socket the router forwards to.
     pub internal: SocketAddr,
     /// `pcp`, `natpmp` or `upnp`.
@@ -143,8 +145,26 @@ pub async fn add_udp_mapping(port: u16, lifetime: u32) -> Option<MappingGuard> {
     report.guard
 }
 
+/// [`add_udp_mapping`] for a TCP port (the ws / xray carriers on a home host).
+pub async fn add_tcp_mapping(port: u16, lifetime: u32) -> Option<MappingGuard> {
+    let report = probe(port, lifetime, true).await;
+    if report.guard.is_none() {
+        log::info!("TCP port mapping failed: {}", explain(&report));
+    }
+    report.guard
+}
+
+/// False when this device's own address is public: there is no router to ask.
+pub async fn behind_router() -> bool {
+    tokio::task::spawn_blocking(local_ip).await.ok().flatten().is_some_and(gateway_ok)
+}
+
 /// Run PCP, NAT-PMP and UPnP against the default gateway and report each.
 pub async fn probe_mappers(port: u16, lifetime: u32) -> MapperReport {
+    probe(port, lifetime, false).await
+}
+
+async fn probe(port: u16, lifetime: u32, tcp: bool) -> MapperReport {
     let (local, gateway) = tokio::task::spawn_blocking(|| (local_ip(), default_gateway()))
         .await
         .unwrap_or((None, None));
@@ -152,7 +172,7 @@ pub async fn probe_mappers(port: u16, lifetime: u32) -> MapperReport {
         let e = Outcome::Error("no local IPv4 route".into());
         return MapperReport { pcp: e.clone(), natpmp: e.clone(), upnp: e, guard: None };
     };
-    probe_targets(Targets::for_gateway(local, gateway), port, lifetime).await
+    probe_targets(Targets { tcp, ..Targets::for_gateway(local, gateway) }, port, lifetime).await
 }
 
 /// Where to look for each protocol. Tests point these at loopback mocks.
@@ -169,6 +189,8 @@ pub struct Targets {
     pub upnp_probes: Vec<String>,
     /// Also search by SSDP multicast (and unicast to `gateway`).
     pub ssdp: bool,
+    /// Map TCP instead of UDP.
+    pub tcp: bool,
 }
 
 /// Unicast IGD description probes for routers that ignore SSDP multicast:
@@ -202,6 +224,7 @@ impl Targets {
                 .map(|g| UPNP_PROBES.iter().map(|(p, path)| format!("http://{g}:{p}{path}")).collect())
                 .unwrap_or_default(),
             ssdp: true,
+            tcp: false,
         }
     }
 }
@@ -248,13 +271,14 @@ pub async fn probe_targets(t: Targets, port: u16, lifetime: u32) -> MapperReport
         let e = Outcome::Error("no local IPv4 route".into());
         return MapperReport { pcp: e.clone(), natpmp: e.clone(), upnp: e, guard: None };
     };
-    let pcp: Job = t.pcp.map(|s| Box::new(move || pcp_add(s, local, port, lifetime)) as _);
-    let pmp: Job = t.natpmp.map(|s| Box::new(move || natpmp_add(s, local, port, lifetime)) as _);
+    let tcp = t.tcp;
+    let pcp: Job = t.pcp.map(|s| Box::new(move || pcp_add(s, local, port, lifetime, tcp)) as _);
+    let pmp: Job = t.natpmp.map(|s| Box::new(move || natpmp_add(s, local, port, lifetime, tcp)) as _);
     let has_upnp = t.ssdp || !t.upnp_locations.is_empty() || !t.upnp_probes.is_empty();
     let upnp: Job = has_upnp.then(|| {
         Box::new(move || {
             let location = discover_upnp(&t).ok_or(Outcome::NoAnswer)?;
-            upnp_add(&location, local, port, lifetime)
+            upnp_add(&location, local, port, lifetime, tcp)
         }) as _
     });
     let handles = vec![
@@ -378,13 +402,13 @@ pub async fn add_udp_mapping_at(
 fn renew_blocking(proto: &Proto, m: &Mapping, lease: u32) -> Result<(), String> {
     match proto {
         Proto::Upnp { control, service } => {
-            upnp_add_once(control, service, m.internal, m.external_port, lease).map(|_| ())
+            upnp_add_once(control, service, m.internal, m.external_port, lease, m.tcp).map(|_| ())
         }
-        Proto::NatPmp { server } => natpmp_request(*server, m.internal.port(), m.external_port, lease)
+        Proto::NatPmp { server } => natpmp_request(*server, m.internal.port(), m.external_port, lease, m.tcp)
             .map(|_| ())
             .map_err(|e| e.to_string()),
         Proto::Pcp { server, nonce } => {
-            pcp_request(*server, client_v4(m), nonce, m.internal.port(), m.external_port, lease)
+            pcp_request(*server, client_v4(m), nonce, m.internal.port(), m.external_port, lease, m.tcp)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
@@ -405,8 +429,9 @@ fn delete_blocking(proto: &Proto, m: &Mapping) -> Result<(), String> {
                 service,
                 "DeletePortMapping",
                 &format!(
-                    "<NewRemoteHost></NewRemoteHost><NewExternalPort>{}</NewExternalPort><NewProtocol>UDP</NewProtocol>",
-                    m.external_port
+                    "<NewRemoteHost></NewRemoteHost><NewExternalPort>{}</NewExternalPort><NewProtocol>{}</NewProtocol>",
+                    m.external_port,
+                    l4(m.tcp)
                 ),
             );
             match http_soap(control, service, "DeletePortMapping", &body) {
@@ -417,12 +442,12 @@ fn delete_blocking(proto: &Proto, m: &Mapping) -> Result<(), String> {
             }
         }
         // RFC 6886 3.4: lifetime 0 and external port 0 deletes the mapping.
-        Proto::NatPmp { server } => natpmp_request(*server, m.internal.port(), 0, 0)
+        Proto::NatPmp { server } => natpmp_request(*server, m.internal.port(), 0, 0, m.tcp)
             .map(|_| ())
             .map_err(|e| e.to_string()),
         // RFC 6887 11.4: lifetime 0 with the original nonce deletes it.
         Proto::Pcp { server, nonce } => {
-            pcp_request(*server, client_v4(m), nonce, m.internal.port(), 0, 0)
+            pcp_request(*server, client_v4(m), nonce, m.internal.port(), 0, 0, m.tcp)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         }
@@ -464,6 +489,10 @@ impl std::fmt::Display for SoapErr {
     }
 }
 
+fn l4(tcp: bool) -> &'static str {
+    if tcp { "TCP" } else { "UDP" }
+}
+
 fn soap(service: &str, action: &str, args: &str) -> String {
     format!(
         r#"<?xml version="1.0"?>
@@ -497,8 +526,9 @@ fn upnp_add_once(
     internal: SocketAddr,
     external_port: u16,
     lease: u32,
+    tcp: bool,
 ) -> Result<(), String> {
-    upnp_add_try(control, service, internal, external_port, lease).map_err(|e| e.to_string())
+    upnp_add_try(control, service, internal, external_port, lease, tcp).map_err(|e| e.to_string())
 }
 
 fn upnp_add_try(
@@ -507,16 +537,18 @@ fn upnp_add_try(
     internal: SocketAddr,
     external_port: u16,
     lease: u32,
+    tcp: bool,
 ) -> Result<(), SoapErr> {
     let body = soap(
         service,
         "AddPortMapping",
         &format!(
             "<NewRemoteHost></NewRemoteHost><NewExternalPort>{external_port}</NewExternalPort>\
-<NewProtocol>UDP</NewProtocol><NewInternalPort>{}</NewInternalPort>\
+<NewProtocol>{}</NewProtocol><NewInternalPort>{}</NewInternalPort>\
 <NewInternalClient>{}</NewInternalClient><NewEnabled>1</NewEnabled>\
 <NewPortMappingDescription>Strait</NewPortMappingDescription>\
 <NewLeaseDuration>{lease}</NewLeaseDuration>",
+            l4(tcp),
             internal.port(),
             internal.ip()
         ),
@@ -551,7 +583,7 @@ fn upnp_reason(code: u32) -> &'static str {
 }
 
 /// Returns the mapping, how to remove it, and the lease actually in force.
-fn upnp_add(location: &str, local: Ipv4Addr, port: u16, lifetime: u32) -> Result<Got, Outcome> {
+fn upnp_add(location: &str, local: Ipv4Addr, port: u16, lifetime: u32, tcp: bool) -> Result<Got, Outcome> {
     let (status, description) = http(location, "GET", "", "").map_err(Outcome::Error)?;
     if status != 200 {
         return Err(Outcome::Error(format!("description: HTTP {status}")));
@@ -563,11 +595,11 @@ fn upnp_add(location: &str, local: Ipv4Addr, port: u16, lifetime: u32) -> Result
     let mut last = Outcome::Error("no port tried".into());
     for i in 0..PORT_ATTEMPTS {
         let Some(external) = port.checked_add(i) else { break };
-        let mut result = upnp_add_try(&control, &service, internal, external, lease);
+        let mut result = upnp_add_try(&control, &service, internal, external, lease, tcp);
         // 725 OnlyPermanentLeasesSupported: many routers refuse finite leases.
         if matches!(result, Err(SoapErr::Fault(725))) && lease != 0 {
             lease = 0;
-            result = upnp_add_try(&control, &service, internal, external, lease);
+            result = upnp_add_try(&control, &service, internal, external, lease, tcp);
         }
         match result {
             Ok(()) => {
@@ -575,6 +607,7 @@ fn upnp_add(location: &str, local: Ipv4Addr, port: u16, lifetime: u32) -> Result
                 let mapping = Mapping {
                     external_ip,
                     external_port: external,
+                    tcp,
                     internal,
                     method: "upnp",
                 };
@@ -774,12 +807,13 @@ fn natpmp_reason(code: u16) -> &'static str {
     }
 }
 
-fn natpmp_add(server: SocketAddr, local: Ipv4Addr, port: u16, lifetime: u32) -> Result<Got, Outcome> {
+fn natpmp_add(server: SocketAddr, local: Ipv4Addr, port: u16, lifetime: u32, tcp: bool) -> Result<Got, Outcome> {
     let want = if lifetime == 0 { 3600 } else { lifetime };
-    let (external_port, granted) = natpmp_request(server, port, port, want)?;
+    let (external_port, granted) = natpmp_request(server, port, port, want, tcp)?;
     let mapping = Mapping {
         external_ip: natpmp_external_ip(server),
         external_port,
+        tcp,
         internal: SocketAddr::new(IpAddr::V4(local), port),
         method: "natpmp",
     };
@@ -787,20 +821,22 @@ fn natpmp_add(server: SocketAddr, local: Ipv4Addr, port: u16, lifetime: u32) -> 
     Ok((mapping, Proto::NatPmp { server }, granted.min(want).max(1)))
 }
 
-/// Opcode 1 (UDP map). Returns (external port, granted lifetime).
+/// Opcode 1 (UDP map) or 2 (TCP map). Returns (external port, granted lifetime).
 fn natpmp_request(
     server: SocketAddr,
     internal_port: u16,
     external_port: u16,
     lifetime: u32,
+    tcp: bool,
 ) -> Result<(u16, u32), Outcome> {
-    let mut request = vec![0u8, 1, 0, 0];
+    let op = if tcp { 2u8 } else { 1 };
+    let mut request = vec![0u8, op, 0, 0];
     request.extend_from_slice(&internal_port.to_be_bytes());
     request.extend_from_slice(&external_port.to_be_bytes());
     request.extend_from_slice(&lifetime.to_be_bytes());
     let buf = natpmp_exchange(server, &request, 16)?;
     // version, opcode|0x80, result, epoch, internal port, external port, lifetime
-    if buf[1] != 0x81 {
+    if buf[1] != 0x80 | op {
         return Err(Outcome::Error("NAT-PMP: wrong opcode in reply".into()));
     }
     let result = u16::from_be_bytes([buf[2], buf[3]]);
@@ -898,14 +934,19 @@ fn v4_mapped(ip: Ipv4Addr) -> [u8; 16] {
     a
 }
 
-fn pcp_build(client: Ipv4Addr, nonce: &[u8; 12], internal: u16, external: u16, lifetime: u32) -> [u8; PCP_LEN] {
+/// IANA protocol number in the MAP request.
+fn pcp_proto(tcp: bool) -> u8 {
+    if tcp { 6 } else { 17 }
+}
+
+fn pcp_build(client: Ipv4Addr, nonce: &[u8; 12], internal: u16, external: u16, lifetime: u32, tcp: bool) -> [u8; PCP_LEN] {
     let mut r = [0u8; PCP_LEN];
     r[0] = 2; // version
     r[1] = 1; // R=0, opcode MAP
     r[4..8].copy_from_slice(&lifetime.to_be_bytes());
     r[8..24].copy_from_slice(&v4_mapped(client));
     r[24..36].copy_from_slice(nonce);
-    r[36] = 17; // UDP
+    r[36] = pcp_proto(tcp);
     r[40..42].copy_from_slice(&internal.to_be_bytes());
     r[42..44].copy_from_slice(&external.to_be_bytes());
     // 44..60: suggested external address, all zeros = "any".
@@ -919,7 +960,7 @@ enum PcpReply {
     Ignore(&'static str),
 }
 
-fn pcp_parse(buf: &[u8], nonce: &[u8; 12], internal: u16) -> PcpReply {
+fn pcp_parse(buf: &[u8], nonce: &[u8; 12], internal: u16, tcp: bool) -> PcpReply {
     if buf.len() < 4 {
         return PcpReply::Ignore("short");
     }
@@ -947,7 +988,7 @@ fn pcp_parse(buf: &[u8], nonce: &[u8; 12], internal: u16) -> PcpReply {
         4 => return PcpReply::Final(Outcome::Unsupported),
         c => return PcpReply::Final(Outcome::Refused { code: c as u32, reason: pcp_reason(c).into() }),
     }
-    if buf[36] != 17 || u16::from_be_bytes([buf[40], buf[41]]) != internal {
+    if buf[36] != pcp_proto(tcp) || u16::from_be_bytes([buf[40], buf[41]]) != internal {
         return PcpReply::Ignore("protocol/port");
     }
     let ip = &buf[44..60];
@@ -969,11 +1010,12 @@ fn pcp_request(
     internal: u16,
     external: u16,
     lifetime: u32,
+    tcp: bool,
 ) -> Result<(u16, u32, Option<Ipv4Addr>), Outcome> {
     let io = |e: std::io::Error| Outcome::Error(e.to_string());
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(io)?;
     socket.connect(server).map_err(io)?;
-    let request = pcp_build(client, nonce, internal, external, lifetime);
+    let request = pcp_build(client, nonce, internal, external, lifetime, tcp);
     let mut ignored = None;
     let mut buf = [0u8; 1100];
     for _ in 0..2 {
@@ -983,7 +1025,7 @@ fn pcp_request(
             socket.set_read_timeout(Some(left)).map_err(io)?;
             // Errors (timeout, ICMP port unreachable) end this attempt.
             let Ok(n) = socket.recv(&mut buf) else { break };
-            match pcp_parse(&buf[..n], nonce, internal) {
+            match pcp_parse(&buf[..n], nonce, internal, tcp) {
                 PcpReply::Mapped { external_port, lifetime, external_ip } => {
                     return Ok((external_port, lifetime, external_ip))
                 }
@@ -998,13 +1040,14 @@ fn pcp_request(
     })
 }
 
-fn pcp_add(server: SocketAddr, local: Ipv4Addr, port: u16, lifetime: u32) -> Result<Got, Outcome> {
+fn pcp_add(server: SocketAddr, local: Ipv4Addr, port: u16, lifetime: u32, tcp: bool) -> Result<Got, Outcome> {
     let want = if lifetime == 0 { 3600 } else { lifetime };
     let nonce = pcp_nonce();
-    let (external_port, granted, external_ip) = pcp_request(server, local, &nonce, port, port, want)?;
+    let (external_port, granted, external_ip) = pcp_request(server, local, &nonce, port, port, want, tcp)?;
     let mapping = Mapping {
         external_ip,
         external_port,
+        tcp,
         internal: SocketAddr::new(IpAddr::V4(local), port),
         method: "pcp",
     };
