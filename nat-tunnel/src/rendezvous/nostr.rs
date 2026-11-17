@@ -255,7 +255,7 @@ async fn session(sh: &Shared, w: &mut ws::Ws, url: &str, pace: &mut Pace, cancel
                 ws::Frame::Ping(p) => w.send(10, &p).await?,
                 ws::Frame::Text(t) => {
                     for c in on_message(sh, pace, url, &t) {
-                        if sh.tx.send(Candidate { addr: c, via: "nostr" }).await.is_err() {
+                        if sh.tx.send(Candidate { addr: c, via: "nostr", verified: true }).await.is_err() {
                             return Err(SessionEnd::Receiver);
                         }
                     }

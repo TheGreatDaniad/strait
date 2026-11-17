@@ -8,7 +8,7 @@ chk "strait-host active" "systemctl is-active --quiet strait-host"
 chk "UDP 7100 listening" "ss -lunH | grep -q ':7100 '"
 chk "host.env is 0600" "[ \"\$(stat -c %a /etc/strait/host.env)\" = 600 ]"
 chk "lab key absent" "! grep -q 0123456789abcdef0123456789abcdef /etc/strait/host.env"
-chk "unit has no --relay" "! systemctl cat strait-host | grep -q -- --relay"
+chk "unit has no --signal" "! systemctl cat strait-host | grep -q -- --signal"
 if systemctl is-enabled --quiet strait-signal 2>/dev/null || systemctl is-active --quiet strait-signal; then
   echo "note strait-signal is enabled/active (optional; not default)"
   chk "UDP 7000 listening" "ss -lunH | grep -q ':7000 '"

@@ -125,7 +125,7 @@ impl Host {
         stun_init();
         let mut mux = MuxHost::bind(
             KEY,
-            MuxConfig { bind_port: Some(bind_port), stun: true, rv, shared, ..MuxConfig::default() },
+            MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), bind_port: Some(bind_port), stun: true, rv, shared, ..MuxConfig::default() },
         )
         .await
         .unwrap();
@@ -171,7 +171,7 @@ fn rv_join(b: Arc<dyn Rendezvous>, budget: Duration) -> RvJoin {
 }
 
 fn opts<'a>(hosts: Vec<SocketAddr>) -> ConnectOpts<'a> {
-    ConnectOpts { signal: None, peer: hosts.first().copied(), room: "", key: KEY, host: false, bind_port: None, hosts, mux: true }
+    ConnectOpts { signal: None, peer: hosts.first().copied(), room: "", key: KEY, host: false, bind_port: None, hosts, mux: true, auth: nat_tunnel::transport::JoinAuth::test() }
 }
 
 fn spec(endpoint: Option<String>, bind_port: Option<u16>) -> CarrierSpec {
@@ -289,9 +289,9 @@ async fn plain_ss_awg_share_one_socket() {
 /// `shared` without the plain socket is a startup error, not a silent no-op.
 #[tokio::test]
 async fn shared_needs_the_plain_socket() {
-    let e = MuxHost::bind(KEY, MuxConfig { udp: false, shared: vec![CarrierId::Ss], ..MuxConfig::default() }).await.err().expect("must fail");
+    let e = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), udp: false, shared: vec![CarrierId::Ss], ..MuxConfig::default() }).await.err().expect("must fail");
     assert!(e.to_string().contains("plain UDP socket"), "{e}");
-    let e = MuxHost::bind(KEY, MuxConfig { shared: vec![CarrierId::Ws], ..MuxConfig::default() }).await.err().expect("must fail");
+    let e = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), shared: vec![CarrierId::Ws], ..MuxConfig::default() }).await.err().expect("must fail");
     assert!(e.to_string().contains("cannot ride"), "{e}");
 }
 
@@ -311,7 +311,7 @@ async fn ws_without_an_address_connects_through_rendezvous() {
         let ws_port = ws.local_addr().unwrap().port();
         let mut mux = MuxHost::bind(
             KEY,
-            MuxConfig { stun: true, rv: Some(rv_host(hub.backend("trk").arc())), carriers: IoList(vec![ws]), ..MuxConfig::default() },
+            MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), stun: true, rv: Some(rv_host(hub.backend("trk").arc())), carriers: IoList(vec![ws]), ..MuxConfig::default() },
         )
         .await
         .unwrap();

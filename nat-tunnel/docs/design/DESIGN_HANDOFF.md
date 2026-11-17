@@ -34,7 +34,7 @@ Strait is a desktop app that lets one peer use another peer's internet connectio
 | `04-connect-failed` | Connect | Failed | Failed (ember) | First line grey with ember ✕ badge in the middle; host and internet greyed | Invite code with ember border + error helper text, **Paste** | **Try again** (deep sea, primary) |
 | `05-host-not-sharing` | Host | Not sharing | Idle | Peer (dashed empty circle) → You → Internet, grey | Relay row: current relay address + **Change** link (→ Settings) | **Start sharing** (deep sea, primary) |
 | `06-host-sharing` | Host | Sharing | Sharing (deep-sea tint) | Peer → **You** (solid deep-sea node) → Internet, deep-sea lines with packets | Invite code (masked key) + **Copy** button | **Stop sharing** (secondary) |
-| `07-settings` | Settings | — | Reflects current state | none | Privacy group: **Kill switch**, **Block IPv6** toggles; **Relay server** input; version footer | none |
+| `07-settings` | Settings | — | Reflects current state | none | Privacy group: **Traffic through the tunnel**, **IPv6 off** (status rows); **Signal server** input; version footer | none |
 
 ### State logic
 

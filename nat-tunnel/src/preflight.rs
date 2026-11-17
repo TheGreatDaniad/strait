@@ -321,7 +321,9 @@ pub async fn check_host_with(
         rv_ok,
     });
 
-    let mut inv = Invite::new(&key);
+    // Every invite names this device's host key: only this device can then answer it.
+    let hk = crate::tunnel::handshake::public_of(&crate::app::host_key().map_err(|e| e.to_string())?);
+    let mut inv = Invite::new(&key).with_host_key(hk);
     if let Some(sig) = best_signal {
         inv = inv.signal(sig);
     }
@@ -549,6 +551,9 @@ pub mod rvui {
             } else if id == "sig" && !has_signal {
                 notes.push("sig dropped: it needs at least one signal server".into());
             } else {
+                if id == "trk" {
+                    notes.push(TRK_WARNING.into());
+                }
                 out.push(id.clone());
             }
         }
@@ -561,10 +566,13 @@ pub mod rvui {
         compiled_ids().into_iter().filter(|c| ok.iter().any(|o| o == c)).map(String::from).collect()
     }
 
-    /// Methods offered in the Host list (`sig` only when a signal server is configured).
+    /// Methods offered in the Host list (`sig` only when a signal server is configured). Trackers
+    /// are never offered: their announces are cleartext (see [`TRK_WARNING`]).
     pub fn offered(has_signal: bool) -> Vec<&'static str> {
-        compiled_ids().into_iter().filter(|i| *i != "sig" || has_signal).collect()
+        compiled_ids().into_iter().filter(|i| (*i != "sig" || has_signal) && *i != "trk").collect()
     }
+
+    pub const TRK_WARNING: &str = "trk: tracker announces are not encrypted. Anyone on the network path learns the code from one announce, can list the host and every guest, and can add fake peers. Use it only on networks whose operators you trust, and prefer the sealed methods (nostr, dht, ntfy, mqtt).";
 
     /// Comma list -> ids, validated against `valid` (clear error listing the valid ids).
     pub fn parse_ids(input: &str, valid: &[&str]) -> Result<Vec<String>, String> {

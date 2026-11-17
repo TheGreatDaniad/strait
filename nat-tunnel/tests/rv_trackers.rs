@@ -109,7 +109,7 @@ fn backend(trk: &[&str]) -> Trackers {
 }
 fn ctx(role: Role) -> RvCtx {
     let port = if role == Role::Host { 4000 } else { 5000 };
-    RvCtx::new(KEY, role, vec![format!("127.0.0.1:{port}").parse().unwrap()])
+    RvCtx::new_test(KEY, role, vec![format!("127.0.0.1:{port}").parse().unwrap()])
 }
 
 struct Started {
@@ -141,7 +141,7 @@ async fn two_peers_find_each_other_with_mapped_port() {
     assert!(ann.iter().all(|s| s.port == 4000 || s.port == 5000));
     assert!(ann.iter().any(|s| s.port == 4000 && s.src_port == sock_port && s.src_port != 4000), "host used the shared socket");
     assert!(ann.iter().any(|s| s.port == 5000 && s.src_port != 5000));
-    assert!(ann.iter().all(|s| s.ih == nat_tunnel::rendezvous::derive::Derived::new(&KEY).room_info_hash()));
+    assert!(ann.iter().all(|s| s.ih == nat_tunnel::rendezvous::derive::Derived::new_test(&KEY).room_info_hash()));
     host.cancel.cancel();
     client.cancel.cancel();
 }
@@ -160,7 +160,7 @@ async fn own_address_is_filtered() {
 
 #[tokio::test]
 async fn no_ipv4_candidate_fails() {
-    let c = RvCtx::new(KEY, Role::Host, vec!["[2001:db8::1]:4000".parse().unwrap()]);
+    let c = RvCtx::new_test(KEY, Role::Host, vec!["[2001:db8::1]:4000".parse().unwrap()]);
     let r = backend(&["127.0.0.1:9"]).run(c, mpsc::channel(1).0, CancellationToken::new()).await;
     assert_eq!(r, Err(RvError::Failed("no mapped address".into())));
 }

@@ -36,7 +36,7 @@ async fn live_relays_find_each_other() {
         Role::Client => ("192.0.2.2:4000".parse().unwrap(), "192.0.2.1:4000".parse().unwrap()),
     };
     let n = Nostr::new(&RvConfig::default());
-    let ctx = RvCtx::new(key, role, vec![mine]);
+    let ctx = RvCtx::new_test(key, role, vec![mine]);
     let (tx, mut rx) = mpsc::channel(8);
     let cancel = CancellationToken::new();
     while now_ms() < t0 {

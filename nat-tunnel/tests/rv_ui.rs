@@ -32,7 +32,10 @@ fn selection_maps_to_invite_rv() {
 fn offered_hides_sig_without_a_server() {
     assert!(!rvui::offered(false).contains(&"sig"));
     assert!(rvui::offered(true).contains(&"sig"));
-    assert_eq!(rvui::offered(true).len(), all_disclosures().len());
+    // Trackers are never offered: their announces are cleartext.
+    assert!(!rvui::offered(true).contains(&"trk"));
+    let trk = all_disclosures().iter().any(|(id, _)| *id == "trk") as usize;
+    assert_eq!(rvui::offered(true).len(), all_disclosures().len() - trk);
 }
 
 #[test]

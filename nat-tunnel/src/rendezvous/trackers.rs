@@ -271,6 +271,7 @@ impl Rendezvous for Trackers {
             shared: &[
                 "your public IP address and port, the time, and a random-looking code derived from the invite",
                 "tracker operators can see BOTH peers' addresses in plaintext",
+                "announces are not encrypted: anyone on the network path can read them, list everyone using this invite, and add fake peers (guests never port-scan a tracker peer)",
             ],
             not_shared: &["your traffic", "the invite key", "anything readable about what you are doing"],
             why: "to tell the other device where you are so both can connect directly",
@@ -380,10 +381,13 @@ impl Rendezvous for Trackers {
                 _ = ctx.nudge.notified() => r.nudge(),
             }
             for a in peers {
+                if seen.len() >= SEEN_CAP {
+                    seen.clear(); // shortcut: a fake-peer flood only makes old peers repeat once
+                }
                 if a.port() == 0 || ctx.local.contains(&a) || !seen.insert(a) {
                     continue;
                 }
-                match tx.try_send(Candidate { addr: a, via: "trk" }) {
+                match tx.try_send(Candidate { addr: a, via: "trk", verified: false }) {
                     Ok(()) => have_peer = true,
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                     Err(_) => {
@@ -399,6 +403,9 @@ impl Rendezvous for Trackers {
         }
     }
 }
+
+/// Bound on remembered peers, so a flood of fake peers cannot grow memory within a day.
+const SEEN_CAP: usize = 4096;
 
 #[cfg(test)]
 mod tests {

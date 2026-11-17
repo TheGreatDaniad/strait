@@ -65,6 +65,11 @@ pub struct HostOpts {
     pub no_udp: bool,
     /// Local paths and parameters for carriers (xray binary, ...).
     pub carrier_cfg: CarrierCfg,
+    /// The host's private key; `None` = this device's ([`host_key`]). Its public half is what
+    /// the invite's `hk` names.
+    pub host_key: Option<[u8; 32]>,
+    /// Personal-invite rules: who may join beyond holding the invite.
+    pub guests: crate::transport::GuestPolicy,
 }
 
 /// Local, per-device carrier settings. Never travels in an invite, never holds a secret.
@@ -108,6 +113,8 @@ pub struct GuestOpts {
     pub last_working_file: Option<PathBuf>,
     /// Gap between ladder attempts; `None` = 300 ms.
     pub ladder_stagger: Option<Duration>,
+    /// The invite's host key and this guest's personal token.
+    pub auth: crate::transport::JoinAuth,
 }
 
 /// How long a silent client keeps its host slot (`NAT_TUNNEL_PEER_TIMEOUT_SECS`, default 60 s,
@@ -150,16 +157,94 @@ fn rv_config(cfg: &RvConfig) -> RvConfig {
 
 /// The ladder's file for the last working carrier: only an id, never a secret.
 fn last_working_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("last_carrier"))
+}
+
+/// Per-user settings directory (also the GUI's `gui.json`).
+pub fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/nat-tunnel"))?;
+    let base = home_dir()?.join("Library/Application Support/nat-tunnel");
     #[cfg(windows)]
-    let base = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("nat-tunnel"))?;
+    let base = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(|h| PathBuf::from(h).join("AppData").join("Roaming")))?
+        .join("nat-tunnel");
     #[cfg(not(any(target_os = "macos", windows)))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|_| unsafe { libc::geteuid() } != 0)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
+        .or_else(|| home_dir().map(|h| h.join(".config")))?
         .join("nat-tunnel");
-    Some(base.join("last_carrier"))
+    Some(base)
+}
+
+/// `$HOME`, except as root: then root's own home from the password database. The macOS window is
+/// relaunched as root with the user's HOME, and root must never write into a tree the user owns.
+#[cfg(unix)]
+fn home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return std::env::var_os("HOME").map(PathBuf::from);
+    }
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let rc = unsafe { libc::getpwuid_r(0, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() || pw.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+/// This device's host key: `STRAIT_HOST_KEY` (64 hex characters) when set, else the key in the
+/// settings directory, made on first use (owner-only file). Its public half is every invite's
+/// `hk`, so it must stay the same across sessions and must never leave this device.
+pub fn host_key() -> io::Result<[u8; 32]> {
+    use crate::tunnel::handshake;
+    if let Ok(h) = std::env::var("STRAIT_HOST_KEY") {
+        return handshake::unhex(&h).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "STRAIT_HOST_KEY must be 64 hex characters"));
+    }
+    let path = config_dir().ok_or_else(|| io::Error::other("no settings directory for the host key"))?.join("host_key");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        return handshake::unhex(&t).ok_or_else(|| io::Error::other(format!("{} is damaged; delete it to make a new host key", path.display())));
+    }
+    let k = handshake::new_host_key();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_private(&path, handshake::hex(&k).as_bytes(), false)?;
+    log::info!("made a new host key in {}", path.display());
+    Ok(k)
+}
+
+/// Create (`replace`: or overwrite) `path` readable by its owner only; refuse to follow a link
+/// someone placed there.
+fn write_private(path: &std::path::Path, data: &[u8], replace: bool) -> io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true);
+    if replace {
+        o.create(true).truncate(true);
+    } else {
+        o.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)?.write_all(data)
+}
+
+/// The host key of a host about to run with `invite_hk`: the invite must name this device's key.
+pub fn host_key_for(invite_hk: Option<[u8; 32]>) -> io::Result<[u8; 32]> {
+    let k = host_key()?;
+    match invite_hk {
+        Some(hk) if hk == crate::tunnel::handshake::public_of(&k) => Ok(k),
+        Some(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, "this invite names another host key: it was made on another device. Make a new invite here (check-host)")),
+        None => Err(io::Error::new(io::ErrorKind::InvalidInput, crate::transport::NO_HOST_KEY)),
+    }
 }
 
 /// Parse `NAT_TUNNEL_CARRIERS` (`ss@0.0.0.0:7201,ws@0.0.0.0:8443`); bad entries are skipped with a warning.
@@ -354,7 +439,7 @@ impl GuestOpts {
 fn permanent(e: &ConnectError) -> bool {
     matches!(
         e,
-        ConnectError::NoRendezvous | ConnectError::RendezvousFailed(_) | ConnectError::CarriersFailed(_)
+        ConnectError::NoRendezvous | ConnectError::RendezvousFailed(_) | ConnectError::CarriersFailed(_) | ConnectError::Refused
     )
 }
 
@@ -377,6 +462,7 @@ pub async fn guest_connect(opts: &GuestOpts, mux: bool) -> Result<Tunnel, Connec
         bind_port: None,
         hosts: opts.hosts.clone(),
         mux,
+        auth: opts.auth.clone(),
     };
     if !opts.carriers.iter().any(|c| c.id != CarrierId::Udp) {
         return Tunnel::connect_rv(udp_opts(), opts.rv_join()).await;
@@ -440,10 +526,10 @@ pub async fn guest_connect(opts: &GuestOpts, mux: bool) -> Result<Tunnel, Connec
         let (spec, factories, udp_opts) = (spec_of(&entry), &factories, &udp_opts);
         running.push(async move {
             tokio::time::sleep(delay).await;
-            let r: Result<Tunnel, (Reason, bool)> = if id == CarrierId::Udp {
+            let r: Result<Tunnel, (Reason, Option<ConnectError>)> = if id == CarrierId::Udp {
                 Tunnel::connect_rv(udp_opts(), opts.rv_join())
                     .await
-                    .map_err(|e| (reason_from_connect(&e, true), matches!(e, ConnectError::HostFull)))
+                    .map_err(|e| (reason_from_connect(&e, true), final_refusal(&e)))
             } else {
                 attempt(opts, mux, &entry, spec, factories).await
             };
@@ -459,20 +545,29 @@ pub async fn guest_connect(opts: &GuestOpts, mux: bool) -> Result<Tunnel, Connec
                     if let Some(dir) = f.parent() {
                         let _ = std::fs::create_dir_all(dir);
                     }
-                    let _ = std::fs::write(f, id.as_str());
+                    let _ = write_private(f, id.as_str().as_bytes(), true);
                 }
                 log::info!("connected over the {id} carrier");
                 return Ok(t);
             }
-            // Every carrier reaches the same host: a full host is final.
-            Err((_, true)) => return Err(ConnectError::HostFull),
-            Err((why, _)) => {
+            // Every carrier reaches the same host: its refusal is final.
+            Err((_, Some(e))) => return Err(e),
+            Err((why, None)) => {
                 log::info!("carrier {id}: {why}");
                 ladder.fail(id, why);
             }
         }
     }
     Err(ConnectError::CarriersFailed(ladder.summary()))
+}
+
+/// The host itself said no (full, or this invite is not accepted): no other carrier changes that.
+fn final_refusal(e: &ConnectError) -> Option<ConnectError> {
+    match e {
+        ConnectError::HostFull => Some(ConnectError::HostFull),
+        ConnectError::Refused => Some(ConnectError::Refused),
+        _ => None,
+    }
 }
 
 /// One non-UDP ladder attempt: dial the carrier, then join through it.
@@ -482,8 +577,8 @@ async fn attempt(
     entry: &CarrierEntry,
     spec: CarrierSpec,
     factories: &[Arc<dyn carrier::CarrierFactory>],
-) -> Result<Tunnel, (Reason, bool)> {
-    let fail = |r: Reason| (r, false);
+) -> Result<Tunnel, (Reason, Option<ConnectError>)> {
+    let fail = |r: Reason| (r, None);
     let f = factories.iter().find(|f| f.id() == entry.id).ok_or_else(|| fail(Reason::NotBuilt))?;
     let io = f.dial(&spec).await.map_err(|e| fail(reason_from_carrier(&e)))?;
     // The peer key the carrier understands is the resolved endpoint; punchable carriers without
@@ -509,11 +604,12 @@ async fn attempt(
         bind_port: None,
         hosts: hosts.clone(),
         mux,
+        auth: opts.auth.clone(),
     };
     let health = io.clone();
     Tunnel::connect_with_io(o, &hosts, crate::transport::has_v6_route(), false, rv, io)
         .await
-        .map_err(|e| (with_health(reason_from_connect(&e, false), health.health()), matches!(e, ConnectError::HostFull)))
+        .map_err(|e| (with_health(reason_from_connect(&e, false), health.health()), final_refusal(&e)))
 }
 
 pub async fn run_relay(port: u16) -> io::Result<()> {
@@ -541,12 +637,16 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
         check_mux_addr(cfg.addr)?;
         if cfg!(windows) {
             // main.rs forces userspace=true on Windows, so this must not depend on it
-            log::warn!("Windows hosts run userspace only (no TUN adapter is created): clients reach the internet and the LAN through the host's userspace exit");
+            log::warn!("Windows hosts run userspace only (no TUN adapter is created): clients reach the internet through the host's userspace exit (the host's LAN only with --allow-lan)");
         }
         let kernel = (!opts.userspace && !cfg!(windows)).then_some(cfg);
         return run_host_mux(&opts, kernel).await;
     }
     let mut limiter = RateLimiter::new(opts.rate_bytes);
+    let fwd_key = match opts.host_key {
+        Some(k) => k,
+        None => host_key()?,
+    };
     let forward = opts.forward.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -555,7 +655,7 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
     })?;
 
     loop {
-        let mut tunnel = match Tunnel::connect(ConnectOpts {
+        let tunnel = match Tunnel::connect(ConnectOpts {
             signal: opts.signal,
             peer: opts.peer,
             room: &opts.room,
@@ -564,6 +664,7 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
             bind_port: None,
             hosts: Vec::new(),
             mux: false,
+            auth: crate::transport::JoinAuth { host_secret: Some(fwd_key), guests: opts.guests.clone(), ..Default::default() },
         })
         .await
         {
@@ -584,18 +685,29 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
             tunnel.is_direct(),
         );
 
-        let service = match TcpStream::connect(forward).await {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("forward target {} unavailable: {}", forward, e);
-                tunnel.close().await.ok();
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
+        // A new guest session gets its own connection to the service, never the previous one's.
+        let mut tunnel = tunnel;
+        loop {
+            let service = match TcpStream::connect(forward).await {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("forward target {} unavailable: {}", forward, e);
+                    tunnel.close().await.ok();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    break;
+                }
+            };
+            match pipe(tunnel, service, "host", &mut limiter).await {
+                Ok(Some(t)) => {
+                    log::info!("a new guest session replaced the previous one; reconnecting to {forward}");
+                    tunnel = t;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("host session ended: {}", e);
+                    break;
+                }
             }
-        };
-
-        if let Err(e) = pipe(tunnel, service, "host", &mut limiter).await {
-            log::warn!("host session ended: {}", e);
         }
         ui::session_ended("host");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -604,6 +716,8 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
 
 /// Accept TCP connections and tunnel each one to the host side.
 pub async fn run_guest(opts: GuestOpts) -> io::Result<()> {
+    // Nothing a retry changes: say so once and stop.
+    crate::transport::check_host_key(&opts.auth).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let opts_ref = &opts;
     if let Some(cfg) = opts.tun.clone() {
         return run_tun_guest(&opts, cfg, "guest".to_string()).await;
@@ -663,7 +777,7 @@ fn path_name(tunnel: &Tunnel) -> &'static str {
     if tunnel.is_direct() {
         "direct"
     } else {
-        "relayed"
+        "not yet punched" // there is no other path: Strait never relays
     }
 }
 
@@ -751,7 +865,8 @@ async fn run_tun_guest(
                     pins = want_pins;
                     dev = Some((d, ip, mtu));
                 }
-                let (dev_ref, _, _) = dev.as_mut().expect("device opened above");
+                let (dev_ref, local, _) = dev.as_mut().expect("device opened above");
+                let local = *local;
 
                 // Fail-safe for the default-route mode: after the pump is running,
                 // open a real TCP connection through the tunnel. If it cannot pass
@@ -777,7 +892,7 @@ async fn run_tun_guest(
                 // Race the stop signal here so the host gets a BYE and frees the slot at once
                 // (the outer select would drop this future without closing the tunnel).
                 let piped = tokio::select! {
-                    r = pipe_tun(&mut tunnel, dev_ref, &label, Some(&probe_failed), &mut limiter) => r,
+                    r = pipe_tun(&mut tunnel, dev_ref, local, &label, Some(&probe_failed), &mut limiter) => r,
                     _ = stop_signal() => {
                         ui::session_ended(&label);
                         tunnel.close().await.ok();
@@ -872,11 +987,16 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
             max_clients: max,
             rate_bytes: opts.rate_bytes,
             signal: opts.signal,
-            stun: opts.signal.is_none(),
+            stun: true, // also learns the router's public address, which guests must not reach
             rv: opts.rv_host(),
             udp: !opts.no_udp,
             carriers: IoList(ios),
             shared,
+            host_key: Some(match opts.host_key {
+                Some(k) => k,
+                None => host_key()?,
+            }),
+            guests: opts.guests.clone(),
             timeout: peer_timeout(std::env::var("NAT_TUNNEL_PEER_TIMEOUT_SECS").ok().as_deref()),
             ..MuxConfig::default()
         },
@@ -952,6 +1072,9 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                 match event {
                     MuxEvent::Packet { data, .. } => {
                         from_clients += 1;
+                        if !guest_packet_allowed(&data) {
+                            continue;
+                        }
                         if let Some(d) = dev.as_mut() {
                             d.send(&data).await?;
                         } else if let Some(s) = stack_sink.as_mut() {
@@ -962,11 +1085,14 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                             }
                         }
                     }
-                    MuxEvent::Joined { ip, from, .. } => {
-                        log::info!("client {from} is {ip} ({} connected)", mux.peer_count());
+                    MuxEvent::Joined { id, ip, from, guest } => {
+                        HOST_PEERS.lock().unwrap().push(HostPeer { slot: id, ip, from, guest });
+                        let who = guest.map(|g| format!(", personal invite {g}")).unwrap_or_default();
+                        log::info!("client {from} is {ip}{who} ({} connected)", mux.peer_count());
                         ui::session_started(label, "host", opts.signal, &opts.room, Some(from), true);
                     }
-                    MuxEvent::Left { ip, reason, .. } => {
+                    MuxEvent::Left { id, ip, reason } => {
+                        HOST_PEERS.lock().unwrap().retain(|p| p.slot != id);
                         log::info!("client {ip} left: {reason} ({} connected)", mux.peer_count());
                         if mux.peer_count() == 0 {
                             ui::session_ended(label);
@@ -1009,6 +1135,13 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
                 }
                 _ = mux.readable() => {}
                 _ = ticker.tick() => {
+                    let kicks = std::mem::take(&mut *HOST_KICKS.lock().unwrap());
+                    for k in kicks {
+                        match k {
+                            Kick::Slot(s) => mux.kick(s).await,
+                            Kick::Guest(g) => mux.kick_guest(g).await,
+                        }
+                    }
                     mux.tick().await?;
                     if last_stats.elapsed() >= Duration::from_secs(1) {
                         ui::stats(label, mux.bytes_sent(), mux.bytes_received());
@@ -1034,6 +1167,8 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     }
     .await;
     mux.close().await;
+    HOST_PEERS.lock().unwrap().clear();
+    HOST_KICKS.lock().unwrap().clear();
     for g in tcp_guards.drain(..) {
         let _ = g.release().await;
     }
@@ -1042,6 +1177,51 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     }
     ui::session_ended(label);
     result
+}
+
+/// A client connected to the host running in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostPeer {
+    pub slot: usize,
+    pub ip: Ipv4Addr,
+    pub from: SocketAddr,
+    /// The personal invite it joined with, if any.
+    pub guest: Option<u32>,
+}
+
+enum Kick {
+    Slot(usize),
+    Guest(u32),
+}
+
+static HOST_PEERS: std::sync::Mutex<Vec<HostPeer>> = std::sync::Mutex::new(Vec::new());
+static HOST_KICKS: std::sync::Mutex<Vec<Kick>> = std::sync::Mutex::new(Vec::new());
+
+/// Who is connected to the host right now (for the window's list).
+pub fn host_peers() -> Vec<HostPeer> {
+    HOST_PEERS.lock().unwrap().clone()
+}
+
+/// Disconnect one client of the running host. It can join again unless its invite is withdrawn.
+pub fn kick_slot(slot: usize) {
+    HOST_KICKS.lock().unwrap().push(Kick::Slot(slot));
+}
+
+/// Disconnect everyone who joined with personal invite `id`.
+pub fn kick_guest(id: u32) {
+    HOST_KICKS.lock().unwrap().push(Kick::Guest(id));
+}
+
+/// May a guest's packet go on? One rule set for both exits (`userspace::packet_allowed`): never
+/// to another guest, the host itself, its LAN or its router, no mail delivery, IPv4 only.
+/// The host may only send the guest packets for its own tunnel address: anything else would be
+/// routed onward by a guest that forwards (Docker sets `ip_forward=1`) and reach its LAN.
+fn for_guest(packet: &[u8], local: Ipv4Addr) -> bool {
+    packet.len() >= 20 && packet[0] >> 4 == 4 && packet[16..20] == local.octets()
+}
+
+fn guest_packet_allowed(packet: &[u8]) -> bool {
+    userspace::packet_allowed(packet)
 }
 
 /// Deliver a packet from the host's TUN/stack to the client that owns its
@@ -1162,6 +1342,7 @@ fn is_dev_err(e: &io::Error) -> bool {
 async fn pipe_tun(
     tunnel: &mut Tunnel,
     dev: &mut tunmode::TunDevice,
+    local: Ipv4Addr,
     label: &str,
     probe_failed: Option<&std::sync::atomic::AtomicBool>,
     limiter: &mut Option<RateLimiter>,
@@ -1181,6 +1362,9 @@ async fn pipe_tun(
         loop {
             match tunnel.try_recv().await? {
                 Some(Event::Data(ip)) => {
+                    if !for_guest(&ip, local) {
+                        continue;
+                    }
                     if let Some(limiter) = limiter {
                         limiter.wait(ip.len()).await;
                     }
@@ -1271,7 +1455,7 @@ async fn pipe(
     stream: TcpStream,
     label: &str,
     limiter: &mut Option<RateLimiter>,
-) -> io::Result<()> {
+) -> io::Result<Option<Tunnel>> {
     let (mut tcp_read, mut tcp_write) = stream.into_split();
     let mut buf = vec![0u8; 8192];
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -1289,10 +1473,14 @@ async fn pipe(
                 Some(Event::Closed) => {
                     log::info!("peer closed the tunnel");
                     tcp_write.shutdown().await.ok();
-                    return Ok(());
+                    return Ok(None);
                 }
                 None => break,
             }
+        }
+        if tunnel.take_replaced() {
+            tcp_write.shutdown().await.ok(); // the old guest's service connection ends here
+            return Ok(Some(tunnel));
         }
         tunnel.tick().await?;
 
@@ -1303,7 +1491,7 @@ async fn pipe(
                 if n == 0 {
                     log::info!("local side closed; flushing before bye");
                     finish(tunnel, &mut tcp_write).await?;
-                    return Ok(());
+                    return Ok(None);
                 }
                 if let Some(limiter) = limiter {
                     limiter.wait(n).await;
@@ -1359,6 +1547,27 @@ pub fn lane_gateway(index: u8) -> std::net::Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guests_reach_the_internet_and_the_host_only() {
+        let to = |a: [u8; 4]| {
+            let mut p = vec![0u8; 20];
+            p[0] = 0x45;
+            p[9] = 1; // ICMP
+            p[16..20].copy_from_slice(&a);
+            p
+        };
+        assert!(guest_packet_allowed(&to([10, 7, 0, 1])), "the host's tunnel address (ping)");
+        assert!(!guest_packet_allowed(&to([10, 7, 0, 3])), "another guest");
+        assert!(guest_packet_allowed(&to([93, 184, 216, 34])), "the internet");
+        assert!(!guest_packet_allowed(&to([192, 168, 1, 1])), "the host's LAN");
+        let me = Ipv4Addr::new(10, 7, 0, 3);
+        assert!(for_guest(&to([10, 7, 0, 3]), me), "the guest's own address");
+        assert!(!for_guest(&to([192, 168, 1, 1]), me), "the guest's LAN");
+        assert!(!for_guest(&to([10, 7, 0, 4]), me), "another guest");
+        assert!(!for_guest(&[0x60; 40], me), "IPv6");
+        assert!(!for_guest(&[0x45; 10], me), "truncated");
+    }
 
     #[test]
     fn carriers_failed_is_permanent_and_worded() {

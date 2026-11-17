@@ -20,6 +20,8 @@ use super::{Candidate, ProbeStatus, Rendezvous, Role, RvCtx, RvError, StatusSink
 
 pub const MAX_RESTARTS: u32 = 3;
 const CLEANUP_GRACE: Duration = Duration::from_secs(1);
+/// Bound on remembered candidates, so a flood of fake peers cannot grow memory within a day.
+const SEEN_CAP: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -61,7 +63,7 @@ impl Runner {
         let (st_tx, st_rx) = watch::channel(init);
         let st_tx = Arc::new(st_tx);
         let (out_tx, out_rx) = mpsc::channel::<Candidate>(64);
-        let seen = Arc::new(Mutex::new(HashSet::<SocketAddr>::new()));
+        let seen = Arc::new(Mutex::new(HashSet::<(SocketAddr, bool)>::new()));
         let mut tasks = Vec::new();
         let role = ctx.role;
         // One wake-up per backend: the first client candidate the host learns (through any
@@ -84,7 +86,15 @@ impl Runner {
                             }
                         }
                     }
-                    if seen.lock().unwrap().insert(c.addr) && out.send(c).await.is_err() {
+                    // Keyed with the flag: a signed record of an address an unsigned source named first still counts.
+                    let new = {
+                        let mut s = seen.lock().unwrap();
+                        if s.len() >= SEEN_CAP {
+                            s.clear(); // shortcut: a fake-peer flood only makes old candidates repeat once
+                        }
+                        s.insert((c.addr, c.verified))
+                    };
+                    if new && out.send(c).await.is_err() {
                         break;
                     }
                 }

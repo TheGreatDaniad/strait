@@ -48,14 +48,23 @@ pub fn room_id(name: &str) -> u32 {
     u32::from_be_bytes(digest[..4].try_into().unwrap())
 }
 
-/// Room id derived from the invite key.
+/// Room id derived from the invite key, for the current UTC day.
 ///
 /// The key never leaves the two peers, so an observer of the server cannot
 /// guess the room, and the invite does not need to carry a room field.
 pub fn room_for_key(key: &str) -> u32 {
+    room_for_key_at(key, crate::rendezvous::derive::epoch_now())
+}
+
+/// Room id for UTC day `epoch` (see `derive::epoch_now`): it changes daily,
+/// like the other rendezvous identifiers, so the server operator cannot link
+/// one invite's sessions across days.
+pub fn room_for_key_at(key: &str, epoch: u32) -> u32 {
     let mut hasher = Sha256::new();
     hasher.update(b"strait-room");
     hasher.update(key.as_bytes());
+    hasher.update(b"@");
+    hasher.update(epoch.to_be_bytes());
     let digest = hasher.finalize();
     u32::from_be_bytes(digest[..4].try_into().unwrap())
 }
@@ -91,6 +100,14 @@ pub enum Incoming {
     Peer { role: u8, addr: SocketAddr },
     /// Answer to a [`encode_ping`], echoing the nonce.
     Pong(u32),
+}
+
+/// [`decode`], but a `PEER` for any room other than `room` is dropped.
+pub fn decode_for(room: u32, buf: &[u8]) -> Option<Incoming> {
+    if buf.first() == Some(&PEER) && buf.get(1..5) != Some(&room.to_be_bytes()[..]) {
+        return None;
+    }
+    decode(buf)
 }
 
 pub fn decode(buf: &[u8]) -> Option<Incoming> {
@@ -358,6 +375,11 @@ impl State {
         entry.expire(now, expiry);
         let reg = Registration { addr: from, seen: now };
         if role == 0 {
+            // A live host is replaced only by itself; another address waits for it to expire, so
+            // a spoofed or observed REGISTER cannot take the room over.
+            if entry.host.as_ref().is_some_and(|h| h.addr != from) {
+                return;
+            }
             entry.host = Some(reg);
             for c in entry.clients.iter().take(MAX_PEERS_PER_REGISTER) {
                 out.push((from, peer_msg(room, 1, c.addr)));
@@ -476,15 +498,41 @@ mod tests {
         assert_ne!(room_for_key("abc"), room_id("abc"));
     }
 
-    /// Canonical form SHA256("strait-room" || key)[0..4]; clients on every
-    /// platform must agree, so this must never change silently.
+    /// Canonical form SHA256("strait-room" || key || "@" || day u32 BE)[0..4];
+    /// clients on every platform must agree, so this must never change silently.
     #[test]
     fn room_for_key_is_pinned() {
-        assert_eq!(room_for_key("k"), 0x52b8_2d2f);
+        assert_eq!(room_for_key_at("k", 20000), 0xedb3_16f8);
         assert_eq!(
-            room_for_key("0123456789abcdef0123456789abcdef"),
-            0xecff_e956
+            room_for_key_at("0123456789abcdef0123456789abcdef", 20000),
+            0xfbb2_16d5
         );
+        assert_ne!(room_for_key_at("k", 20000), room_for_key_at("k", 20001));
+    }
+
+    #[test]
+    fn peer_for_another_room_is_dropped() {
+        let addr = sa("203.0.113.9:51820");
+        assert_eq!(decode_for(7, &peer_msg(7, 0, addr)), Some(Incoming::Peer { role: 0, addr }));
+        assert_eq!(decode_for(8, &peer_msg(7, 0, addr)), None);
+        assert_eq!(decode_for(8, &pong_msg(1)), Some(Incoming::Pong(1)));
+    }
+
+    #[test]
+    fn live_host_is_not_replaced_by_another_address() {
+        let t0 = Instant::now();
+        let mut st = State::new(Config { expiry: Duration::from_secs(30), ..Config::default() }, t0);
+        let (h, evil, c) = (sa("203.0.113.1:9"), sa("198.51.100.66:9"), sa("192.0.2.7:5"));
+        st.handle(&encode_register(4, 0), h, t0);
+        assert!(st.handle(&encode_register(4, 0), evil, t0).is_empty());
+        let out = st.handle(&encode_register(4, 1), c, t0);
+        assert!(out.contains(&(c, peer_msg(4, 0, h))), "clients still get the real host");
+        // The real host refreshes; once it stops, another address may take over after expiry.
+        st.handle(&encode_register(4, 0), h, t0 + Duration::from_secs(20));
+        assert!(st.handle(&encode_register(4, 0), evil, t0 + Duration::from_secs(40)).is_empty());
+        st.handle(&encode_register(4, 1), c, t0 + Duration::from_secs(55));
+        let out = st.handle(&encode_register(4, 0), evil, t0 + Duration::from_secs(55));
+        assert!(out.contains(&(evil, peer_msg(4, 1, c))), "expired host replaced");
     }
 
     #[test]

@@ -81,7 +81,7 @@ async fn proxy(host: SocketAddr, pct: u64, drop_first: bool, seed: u64) -> Socke
 }
 
 async fn run(pct: u64, drop_first: bool, seed: u64) {
-    let mut mux = MuxHost::bind(KEY, MuxConfig { max_clients: CLIENTS, bind_port: Some(0), ..MuxConfig::default() })
+    let mut mux = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), max_clients: CLIENTS, bind_port: Some(0), ..MuxConfig::default() })
         .await
         .unwrap();
     let host: SocketAddr = format!("127.0.0.1:{}", mux.local_port().unwrap()).parse().unwrap();
@@ -110,6 +110,7 @@ async fn run(pct: u64, drop_first: bool, seed: u64) {
                     bind_port: None,
                     hosts: vec![],
                     mux: true,
+                    auth: nat_tunnel::transport::JoinAuth::test(),
                 }),
             )
             .await

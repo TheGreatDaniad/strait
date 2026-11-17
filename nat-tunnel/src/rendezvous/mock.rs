@@ -161,7 +161,7 @@ impl Rendezvous for MockBackend {
                 for a in addrs {
                     if !seen.contains(&a) {
                         seen.push(a);
-                        if tx.send(Candidate { addr: a, via: self.id }).await.is_err() {
+                        if tx.send(Candidate { addr: a, via: self.id, verified: true }).await.is_err() {
                             break;
                         }
                     }

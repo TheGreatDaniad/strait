@@ -26,7 +26,7 @@ async fn live_ntfy_sh_roundtrip() {
         let (tx, r) = mpsc::channel(8);
         rx.push(r);
         let (n, c) = (n.clone(), cancel.clone());
-        joins.push(tokio::spawn(async move { n.run(RvCtx::new(key, role, vec![a]), tx, c).await }));
+        joins.push(tokio::spawn(async move { n.run(RvCtx::new_test(key, role, vec![a]), tx, c).await }));
     }
     let mut got = Vec::new();
     for r in rx.iter_mut() {

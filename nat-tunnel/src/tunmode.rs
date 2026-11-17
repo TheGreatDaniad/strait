@@ -324,9 +324,19 @@ fn primary_service(device: &str) -> Option<String> {
     None
 }
 
+/// The network tools run as root, so they are looked up in the system folders only, never through
+/// the caller's PATH (a user-writable folder such as /opt/homebrew/bin may come first there).
+/// Covers distros that keep `ip` in /usr/sbin, /sbin or /usr/bin.
+#[cfg(not(windows))]
+fn tool(program: &str) -> Command {
+    let mut c = Command::new(program);
+    c.env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+    c
+}
+
 #[cfg(target_os = "macos")]
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = tool(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -335,8 +345,8 @@ fn run_capture(program: &str, args: &[&str]) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn flush_dns() {
-    let _ = Command::new("dscacheutil").arg("-flushcache").output();
-    let _ = Command::new("killall")
+    let _ = tool("dscacheutil").arg("-flushcache").output();
+    let _ = tool("killall")
         .args(["-HUP", "mDNSResponder"])
         .output();
 }
@@ -352,6 +362,13 @@ struct WindowsDns {
     servers: Vec<String>,
 }
 
+/// Resolver addresses from captured command output. They are later put unquoted into an elevated
+/// PowerShell line, so anything that is not an IP address is dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn dns_servers(text: &str) -> Vec<String> {
+    text.lines().filter_map(|l| l.trim().parse::<std::net::IpAddr>().ok()).map(|a| a.to_string()).collect()
+}
+
 #[cfg(windows)]
 impl WindowsDns {
     /// Remember the physical adapter's resolvers, then point DNS at servers
@@ -360,12 +377,7 @@ impl WindowsDns {
         let original = powershell(&format!(
             "(Get-DnsClientServerAddress -InterfaceIndex {device} -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses"
         ))?;
-        let servers: Vec<String> = original
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect();
+        let servers = dns_servers(&original);
 
         let restore = Self {
             interface: device.to_string(),
@@ -457,10 +469,41 @@ impl WindowsV6 {
     }
 }
 
+/// `System32`, from the API: an elevated process must not let PATH, its own folder or an
+/// overridable `%SystemRoot%` decide which netsh / powershell runs.
+#[cfg(windows)]
+fn system_dir() -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return r"C:\Windows\System32".into();
+    }
+    std::ffi::OsString::from_wide(&buf[..n]).into()
+}
+
+/// `%ProgramFiles%` from the known-folder API (the environment variable can be overridden per
+/// user). Only administrators can create or change files under it.
+#[cfg(windows)]
+fn program_files() -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, std::ptr::null_mut(), &mut p) };
+    let dir = (hr == 0 && !p.is_null()).then(|| {
+        let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+        std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(p, len) })
+    });
+    unsafe { CoTaskMemFree(p as *const _) };
+    dir.map(Into::into).unwrap_or_else(|| r"C:\Program Files".into())
+}
+
 #[cfg(windows)]
 fn netsh(args: &[&str]) -> std::io::Result<bool> {
     use std::process::Stdio;
-    let status = Command::new("netsh")
+    let status = Command::new(system_dir().join("netsh.exe"))
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -472,26 +515,25 @@ fn netsh(args: &[&str]) -> std::io::Result<bool> {
 fn powershell(script: &str) -> Option<String> {
     use std::process::Stdio;
 
-    // Absolute path first: a service or a stripped PATH must not decide which
-    // powershell.exe runs.
-    let exe = std::env::var_os("SystemRoot")
-        .map(|root| {
-            std::path::Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
-        })
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("powershell"));
+    // Absolute path: PATH or the environment must not decide which powershell.exe runs.
+    let exe = system_dir().join(r"WindowsPowerShell\v1.0\powershell.exe");
 
     // Redirect to files and wait for the process, not for pipe EOF. Route and
     // DNS cmdlets can leave a WMI helper holding the stdout pipe, which makes
     // Command::output() wait forever and stalls the whole tunnel setup.
+    // The files live in the admin-only Strait folder under fresh random names (never an
+    // existing file or link), and are read back through the handles that created them.
+    let dir = program_files().join("Strait");
+    let _ = std::fs::create_dir_all(&dir);
     let seq = PS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut out_path = std::env::temp_dir();
-    out_path.push(format!("nat-tunnel-ps-{seq}.out"));
-    let mut err_path = std::env::temp_dir();
-    err_path.push(format!("nat-tunnel-ps-{seq}.err"));
-
-    let out = std::fs::File::create(&out_path).ok()?;
-    let err = std::fs::File::create(&err_path).ok()?;
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let out_path = dir.join(format!("ps-{seq}-{tag}.out"));
+    let err_path = dir.join(format!("ps-{seq}-{tag}.err"));
+    let new = |p: &std::path::Path| std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(p);
+    let (Ok(mut out), Ok(mut err)) = (new(&out_path), new(&err_path)) else {
+        let _ = std::fs::remove_file(&out_path);
+        return None;
+    };
     let mut child = Command::new(exe)
         .args([
             "-NoProfile",
@@ -501,8 +543,8 @@ fn powershell(script: &str) -> Option<String> {
             "-Command",
             script,
         ])
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
+        .stdout(Stdio::from(out.try_clone().ok()?))
+        .stderr(Stdio::from(err.try_clone().ok()?))
         .spawn()
         .ok()?;
 
@@ -536,8 +578,14 @@ fn powershell(script: &str) -> Option<String> {
         }
     }
 
-    let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
-    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    let read = |f: &mut std::fs::File| {
+        use std::io::{Read, Seek};
+        let mut s = String::new();
+        let _ = f.seek(std::io::SeekFrom::Start(0)).and_then(|_| f.read_to_string(&mut s));
+        s
+    };
+    let (stdout, stderr) = (read(&mut out), read(&mut err));
+    drop((out, err));
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
 
@@ -551,11 +599,12 @@ fn powershell(script: &str) -> Option<String> {
 /// Crash recovery (Windows). DNS and the IPv6 binding are system settings that
 /// outlive the process, so a `taskkill /F` or a crash would leave them changed.
 /// The captured state is kept in this file while a full tunnel runs; the next
-/// elevated start (or `recover_stale_state`) puts it back.
+/// elevated start (or `recover_stale_state`) puts it back. It lives in `%ProgramFiles%\Strait`,
+/// where only administrators can create or change files (any user can create folders in
+/// ProgramData and plant a file or a link there).
 #[cfg(windows)]
 fn state_path() -> std::path::PathBuf {
-    let base = std::env::var_os("ProgramData").unwrap_or_else(|| r"C:\ProgramData".into());
-    std::path::Path::new(&base).join("nat-tunnel").join("restore.json")
+    program_files().join("Strait").join("restore.json")
 }
 
 /// Everything a full tunnel changes outside the process. Written before the
@@ -663,7 +712,7 @@ pub fn recover_stale_state() -> bool {
     true
 }
 
-/// `nat-tunnel recover`: undo a crashed or killed full tunnel (Windows).
+/// `nat-tunnel recover`: undo a crashed or killed full tunnel.
 pub fn recover_cli() -> i32 {
     #[cfg(windows)]
     {
@@ -680,14 +729,23 @@ pub fn recover_cli() -> i32 {
     }
     #[cfg(target_os = "macos")]
     {
-        if run_capture("id", &["-u"]).is_none_or(|u| u.trim() != "0") {
+        if unsafe { libc::geteuid() } != 0 {
             eprintln!("recover needs root");
             return 1;
         }
         println!("{}", if recover_mac_state() { "restored DNS and IPv6 from the previous session" } else { "nothing to recover" });
         0
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("recover needs root");
+            return 1;
+        }
+        println!("{}", if recover_stale_state() { "restored the routes from the previous session" } else { "nothing to recover" });
+        0
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         println!("nothing to recover (this platform keeps no state outside the process)");
         0
@@ -710,22 +768,57 @@ const MAC_STATE: &str = "/Library/Application Support/Strait/restore.json";
 
 #[cfg(target_os = "macos")]
 fn save_mac_state(dns: &Option<DnsRestore>, v6: &Option<V6Restore>) {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let state = MacState {
         dns: dns.as_ref().map(|d| (d.service.clone(), d.servers.clone())),
         v6: v6.as_ref().map(|v| v.service.clone()),
     };
-    let path = std::path::Path::new(MAC_STATE);
+    save_root_state(MAC_STATE, &state);
+}
+
+/// Write a crash-recovery file into a root-only (0700) folder, never through a link.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn save_root_state(path: &str, state: &impl serde::Serialize) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let path = std::path::Path::new(path);
     let write = || -> io::Result<()> {
         let dir = path.parent().expect("has a parent");
         std::fs::create_dir_all(dir)?;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        io::Write::write_all(&mut f, serde_json::to_string(&state)?.as_bytes())
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
+        io::Write::write_all(&mut f, serde_json::to_string(state)?.as_bytes())
     };
     if let Err(e) = write() {
         log::warn!("could not write the crash-recovery state: {e}");
     }
+}
+
+/// Crash recovery (Linux). The routes, the fwmark rule and table 100 outlive a killed process and
+/// the deleted IPv4 default does not come back by itself. Kept in /run (gone after a reboot, like
+/// the routes) while a full tunnel runs; the next full tunnel (or `recover`) puts them back.
+#[cfg(target_os = "linux")]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LinuxState {
+    gateway: String,
+    device: String,
+    ipv6: Option<String>,
+    bypass: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+const LINUX_STATE: &str = "/run/strait/restore.json";
+
+/// Undo the routes of a full tunnel that did not exit cleanly. True when there was a file.
+#[cfg(target_os = "linux")]
+pub fn recover_stale_state() -> bool {
+    let Ok(text) = std::fs::read_to_string(LINUX_STATE) else { return false };
+    if let Ok(s) = serde_json::from_str::<LinuxState>(&text) {
+        log::warn!("restoring routes left by a previous session that did not exit cleanly");
+        restore_default(&s.gateway, &s.device);
+        restore_ipv6(s.ipv6.as_deref());
+        remove_bypass(&s.bypass, &s.device);
+    }
+    let _ = std::fs::remove_file(LINUX_STATE);
+    true
 }
 
 /// Put back DNS / IPv6 settings left by a full tunnel that did not exit cleanly.
@@ -773,6 +866,11 @@ impl RouteRestore {
         let ipv6 = capture_ipv6_default();
         #[cfg(target_os = "macos")]
         let _ = recover_mac_state();
+        #[cfg(target_os = "linux")]
+        save_root_state(
+            LINUX_STATE,
+            &LinuxState { gateway: gateway.into(), device: device.into(), ipv6: ipv6.clone(), bypass: bypass.to_vec() },
+        );
         #[cfg(target_os = "macos")]
         let dns = DnsRestore::capture_and_apply(device);
         #[cfg(windows)]
@@ -848,6 +946,8 @@ impl RouteRestore {
         let _ = std::fs::remove_file(state_path());
         #[cfg(target_os = "macos")]
         let _ = std::fs::remove_file(MAC_STATE);
+        #[cfg(target_os = "linux")]
+        let _ = std::fs::remove_file(LINUX_STATE);
     }
 }
 
@@ -973,7 +1073,8 @@ pub fn open(cfg: &TunConfig) -> io::Result<TunDevice> {
         ));
     }
 
-    #[cfg(windows)]
+    // Before reading the default route: a crashed Linux session left none behind.
+    #[cfg(any(windows, target_os = "linux"))]
     if cfg.default_via.is_some() {
         recover_stale_state();
     }
@@ -1005,14 +1106,9 @@ pub fn open(cfg: &TunConfig) -> io::Result<TunDevice> {
     });
 
     #[cfg(windows)]
+    let dll = verified_wintun()?;
+    #[cfg(windows)]
     config.platform_config(|p| {
-        // Prefer the DLL next to the executable; fall back to the working
-        // directory, which is what the packaging script and `cargo run` use.
-        let dll = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("wintun.dll")))
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| std::path::PathBuf::from("wintun.dll"));
         p.wintun_file(dll);
     });
 
@@ -1114,21 +1210,15 @@ fn capture_ipv6_default() -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
-        let output = Command::new("ip")
+        let output = tool("ip")
             .args(["-6", "route", "show", "default"])
             .output()
             .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let line = text.lines().next()?.trim();
-        if line.is_empty() {
-            None
-        } else {
-            Some(line.to_string())
-        }
+        original_ipv6_default(&String::from_utf8_lossy(&output.stdout))
     }
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("route")
+        let output = tool("route")
             .args(["-n", "get", "-inet6", "default"])
             .output()
             .ok()?;
@@ -1140,6 +1230,13 @@ fn capture_ipv6_default() -> Option<String> {
         }
         None
     }
+}
+
+/// The first real IPv6 default in `ip -6 route show default` output: never our own unreachable
+/// route (left by a crash, it must not be "restored" later as the original).
+#[cfg(any(target_os = "linux", test))]
+fn original_ipv6_default(text: &str) -> Option<String> {
+    text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("unreachable")).map(str::to_string)
 }
 
 #[cfg(target_os = "linux")]
@@ -1189,12 +1286,11 @@ fn restore_default(gateway: &str, device: &str, tun: &str) {
 
 #[cfg(target_os = "linux")]
 fn restore_ipv6(original: Option<&str>) {
+    let _ = run_route(&["ip", "-6", "route", "del", "unreachable", "default", "metric", V6_REJECT_METRIC]);
     if let Some(line) = original {
         let mut args = vec!["ip", "-6", "route", "replace"];
         args.extend(line.split_whitespace());
         let _ = run_route(&args);
-    } else {
-        let _ = run_route(&["ip", "-6", "route", "del", "default", "unreachable"]);
     }
 }
 
@@ -1254,9 +1350,14 @@ fn prefix_mask(prefix: u8) -> Ipv4Addr {
 ///
 /// The tunnel is IPv4-only, so a working IPv6 default would send traffic
 /// around it. Failing closed is the only safe default.
+/// Metric of the IPv6 reject default. It must beat router-advertised defaults (NetworkManager uses
+/// 100/600): metric 0 would not, the kernel turns an IPv6 metric of 0 into 1024.
+#[cfg(target_os = "linux")]
+const V6_REJECT_METRIC: &str = "1";
+
 #[cfg(target_os = "linux")]
 fn route_ipv6_fail_closed() {
-    if let Err(e) = run_route(&["ip", "-6", "route", "replace", "default", "unreachable"]) {
+    if let Err(e) = run_route(&["ip", "-6", "route", "replace", "unreachable", "default", "metric", V6_REJECT_METRIC]) {
         log::debug!("could not install the IPv6 blackhole route: {e}");
     }
 }
@@ -1524,11 +1625,11 @@ fn physical_route(skip_index: Option<i32>) -> io::Result<(String, String)> {
     #[cfg(not(windows))]
     {
         #[cfg(target_os = "linux")]
-        let output = Command::new("ip")
+        let output = tool("ip")
             .args(["route", "show", "default"])
             .output()?;
         #[cfg(target_os = "macos")]
-        let output = Command::new("route")
+        let output = tool("route")
             .args(["-n", "get", "default"])
             .output()?;
 
@@ -1603,7 +1704,7 @@ fn is_tunnel(dev: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn physical_default_from_netstat() -> Option<(String, String)> {
-    let output = Command::new("netstat")
+    let output = tool("netstat")
         .args(["-rn", "-f", "inet"])
         .output()
         .ok()?;
@@ -1624,7 +1725,7 @@ fn physical_default_from_netstat() -> Option<(String, String)> {
 
 #[cfg(target_os = "macos")]
 fn ipconfig_router(device: &str) -> Option<String> {
-    let output = Command::new("ipconfig")
+    let output = tool("ipconfig")
         .args(["getoption", device, "router"])
         .output()
         .ok()?;
@@ -1641,7 +1742,7 @@ fn ipconfig_router(device: &str) -> Option<String> {
 
 #[cfg(not(windows))]
 fn run_route(args: &[&str]) -> io::Result<()> {
-    let output = Command::new(args[0]).args(&args[1..]).output()?;
+    let output = tool(args[0]).args(&args[1..]).output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "{} failed: {}",
@@ -1670,6 +1771,20 @@ mod state_tests {
         // a /24 client address in the same /16 is a different network: not a conflict
         assert!(route_conflicts(&table, Ipv4Addr::new(10, 7, 0, 2), 24, "strait-mx").is_empty());
         assert!(route_conflicts(&table, Ipv4Addr::new(10, 7, 0, 1), 16, "carr0").len() == 1);
+    }
+
+    #[test]
+    fn our_own_ipv6_reject_route_is_never_the_original() {
+        let leftover = "unreachable default dev lo metric 1 pref medium\ndefault via fe80::1 dev wlan0 proto ra metric 600 pref medium\n";
+        assert_eq!(original_ipv6_default(leftover).as_deref(), Some("default via fe80::1 dev wlan0 proto ra metric 600 pref medium"));
+        assert_eq!(original_ipv6_default("unreachable default dev lo metric 1024\n"), None);
+        assert_eq!(original_ipv6_default(""), None);
+    }
+
+    #[test]
+    fn captured_dns_servers_are_addresses_only() {
+        let out = "1.1.1.1\r\n 2606:4700::1111 \n1.1.1.1; calc\n\nevil\n";
+        assert_eq!(dns_servers(out), ["1.1.1.1", "2606:4700::1111"]);
     }
 
     #[test]
@@ -1712,4 +1827,39 @@ mod state_tests {
             assert!(parse_state(&bad).is_none(), "accepted: {bad}");
         }
     }
+}
+
+/// SHA-256 of `wintun.dll` 0.14.1 (from the official zip, itself pinned in the packaging).
+#[cfg(windows)]
+const WINTUN_SHA256: &str = if cfg!(target_arch = "aarch64") {
+    "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
+} else {
+    "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+};
+
+/// The Wintun driver library to load, as an administrator. The copy next to the program (or in the
+/// working directory) may sit in a folder any user can write to, so it is loaded only if it is the
+/// pinned build, and from a copy of exactly those bytes in a folder only administrators can change
+/// (`%ProgramFiles%\Strait`): nothing can swap the file between the check and the load.
+#[cfg(windows)]
+fn verified_wintun() -> io::Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let found = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("wintun.dll")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("wintun.dll"));
+    let bytes = std::fs::read(&found).map_err(|e| io::Error::other(format!("wintun.dll not found next to Strait.exe ({e}); keep the two files together")))?;
+    let hex: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    if hex != WINTUN_SHA256 {
+        return Err(io::Error::other(format!("{} is not the Wintun 0.14.1 library Strait ships with; refusing to load it", found.display())));
+    }
+    let dir = program_files().join("Strait");
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join("wintun.dll");
+    let same = std::fs::read(&dest).is_ok_and(|b| b == bytes);
+    if !same {
+        std::fs::write(&dest, &bytes).map_err(|e| io::Error::other(format!("cannot place wintun.dll in {} ({e}); run Strait as administrator", dir.display())))?;
+    }
+    Ok(dest)
 }

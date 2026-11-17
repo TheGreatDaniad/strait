@@ -36,13 +36,6 @@ pub struct WireguardConfig {
 /// NAT traversal configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatTraversalConfig {
-    /// Public TURN server address
-    pub turn_server: String,
-    /// TURN server port
-    pub turn_port: u16,
-    /// TURN server credentials
-    pub turn_username: String,
-    pub turn_password: String,
     /// STUN server address
     pub stun_server: String,
     /// STUN server port
@@ -51,8 +44,6 @@ pub struct NatTraversalConfig {
     /// needed); the primary above is always queried too.
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<String>,
-    /// Use TURN servers (false = NAT hole punching only)
-    pub use_turn: bool,
 }
 
 /// Remote access configuration
@@ -107,17 +98,12 @@ impl Config {
                 endpoint: std::env::var("WIREGUARD_ENDPOINT").ok(),
             },
             nat_traversal: NatTraversalConfig {
-                turn_server: var("TURN_SERVER", "1.1.1.1".to_string()),
-                turn_port: var("TURN_PORT", 443),
-                turn_username: var("TURN_USERNAME", "user".to_string()),
-                turn_password: var("TURN_PASSWORD", "pass".to_string()),
                 stun_server: var("STUN_SERVER", "stun.l.google.com".to_string()),
                 stun_port: var("STUN_PORT", 3478),
                 stun_servers: std::env::var("STUN_SERVERS")
                     .ok()
                     .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                     .unwrap_or_else(default_stun_servers),
-                use_turn: var("USE_TURN", false),
             },
             remote_access: RemoteAccessConfig {
                 port: var("REMOTE_PORT", 8080),

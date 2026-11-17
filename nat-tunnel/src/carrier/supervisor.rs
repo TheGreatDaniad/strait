@@ -181,10 +181,12 @@ struct Inner {
 
 impl Inner {
     fn log(&self, tag: &str, line: &str) {
-        let mut l: String = line.chars().take(512).collect();
+        // Redact before truncating: a secret cut in two by the limit would not match.
+        let mut l = line.to_string();
         for r in self.redact.iter().filter(|r| !r.is_empty()) {
             l = l.replace(r.as_str(), "***");
         }
+        let l: String = l.chars().take(512).collect();
         let mut q = self.logs.lock().unwrap();
         if q.len() >= self.cap {
             q.pop_front();

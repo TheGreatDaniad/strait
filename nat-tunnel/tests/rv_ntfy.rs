@@ -195,10 +195,10 @@ fn msg_line(seq: u64, t: u64, topic: &str, body: &str) -> String {
 }
 
 fn topic() -> String {
-    Derived::new(&KEY).ntfy_topic()
+    Derived::new_test(&KEY).ntfy_topic()
 }
 fn ctx(role: Role) -> RvCtx {
-    RvCtx::new(KEY, role, vec![if role == Role::Host { HOST } else { CLIENT }.parse().unwrap()])
+    RvCtx::new_test(KEY, role, vec![if role == Role::Host { HOST } else { CLIENT }.parse().unwrap()])
 }
 fn quick() -> Timing {
     Timing {
@@ -266,14 +266,14 @@ async fn late_joiner_gets_cached_message() {
 async fn tampered_old_and_foreign_blobs_ignored() {
     let f = Fake::default();
     let base = format!("http://{}", f.start().await);
-    let d = Derived::new(&KEY);
+    let d = Derived::new_test(&KEY);
     let host_addr: SocketAddr = HOST.parse().unwrap();
     let good = seal(&d, Role::Host, &[host_addr]).unwrap();
     let mut bad = good.clone();
     let last = bad.len() - 1;
     bad[last] ^= 1;
     let old = seal_at(&d, Role::Host, &["203.0.113.9:1".parse().unwrap()], now() - 600, [7; 12]).unwrap();
-    let foreign = seal(&Derived::new(&[1; 16]), Role::Host, &["203.0.113.8:1".parse().unwrap()]).unwrap();
+    let foreign = seal(&Derived::new_test(&[1; 16]), Role::Host, &["203.0.113.8:1".parse().unwrap()]).unwrap();
     for body in [b64(&bad), b64(&old), b64(&foreign), "not base64 !!".into(), String::new()] {
         f.store(&topic(), &body);
     }
@@ -350,7 +350,7 @@ async fn stream_drop_reconnects_and_resumes() {
     f.kick();
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(f.0.lock().unwrap().gets > gets, "re-subscribed");
-    let good = seal(&Derived::new(&KEY), Role::Host, &[HOST.parse().unwrap()]).unwrap();
+    let good = seal(&Derived::new_test(&KEY), Role::Host, &[HOST.parse().unwrap()]).unwrap();
     f.store(&topic(), &b64(&good));
     assert_eq!(first(&mut c, 3).await.unwrap().addr, HOST.parse::<SocketAddr>().unwrap());
     stop(c).await;

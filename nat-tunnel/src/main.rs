@@ -16,6 +16,7 @@ use nat_tunnel::preflight::rvui;
 use nat_tunnel::{app, config, preflight, tunmode, tunnel, ui};
 #[cfg(unix)]
 use nat_tunnel::privileged;
+use nat_tunnel::tunnel::handshake;
 
 /// clap value parsers: unknown ids fail with a message listing the valid ones.
 fn parse_compiled_id(s: &str) -> Result<String, String> {
@@ -51,7 +52,31 @@ fn listen_entries(cr: &[nat_tunnel::carrier::CarrierEntry]) -> Vec<nat_tunnel::c
         .collect()
 }
 
-/// `host --rendezvous`: `sig` needs a signal server (--signal/--relay or the invite's).
+/// `personal-invite`: the invite with this host's public key and a token for person `id`.
+fn personal_invite(invite: &str, key: [u8; 32], id: u32, days: u32) -> Result<String, String> {
+    let inv = nat_tunnel::invite::Invite::parse(invite).ok_or("that is not an invite")?;
+    if inv.host_key != Some(handshake::public_of(&key)) {
+        return Err("this invite was not made with this device's host key".into());
+    }
+    let expires = if days == 0 { 0 } else { handshake::now_secs().saturating_add(days.saturating_mul(86_400)) };
+    let token = handshake::mint(&handshake::token_key(&key), handshake::Token { id, expires });
+    Ok(inv.with_host_key(handshake::public_of(&key)).with_token(Some(token)).encode())
+}
+
+/// `host --personal-only` and STRAIT_REVOKED (comma list of withdrawn personal-invite ids).
+fn guest_policy(personal_only: bool, revoked: Option<&str>) -> nat_tunnel::transport::GuestPolicy {
+    let p = nat_tunnel::transport::GuestPolicy::default();
+    p.revoked.lock().unwrap().extend(revoked.unwrap_or("").split(',').filter_map(|s| s.trim().parse::<u32>().ok()));
+    // A withdrawn person still holds the shared invite: withdrawing means personal invites only.
+    let only = personal_only || !p.revoked.lock().unwrap().is_empty();
+    if only && !personal_only {
+        log::warn!("STRAIT_REVOKED is set: taking personal invites only (the shared invite would let a withdrawn person back in)");
+    }
+    p.require_token.store(only, std::sync::atomic::Ordering::Relaxed);
+    p
+}
+
+/// `host --rendezvous`: `sig` needs a signal server (--signal or the invite's).
 fn check_host_rv(rv: &[String], has_signal: bool) -> Result<(), String> {
     if rv.iter().any(|r| r == "sig") && !has_signal {
         return Err("--rendezvous sig needs a signal server: pass --signal (or an invite that lists one)".into());
@@ -63,7 +88,7 @@ fn check_host_rv(rv: &[String], has_signal: bool) -> Result<(), String> {
 #[command(
     name = "nat-tunnel",
     version,
-    about = "NAT traversal tunnel with WireGuard and TURN support"
+    about = "Strait: a direct peer-to-peer tunnel through NAT, with no relay"
 )]
 struct Cli {
     /// Path to a YAML configuration file
@@ -84,7 +109,23 @@ enum UiRole {
 enum Command {
     /// Discover the public NAT mapping over STUN and print it
     CheckNat,
-    /// Undo DNS/IPv6/route changes left by a full tunnel that was killed or crashed (Windows)
+    /// Print this device's host key (public half; made on first use, kept in the settings
+    /// directory, or STRAIT_HOST_KEY). Every invite names it as `hk=`.
+    HostKey,
+    /// Turn a session invite of this host into one for a single person
+    PersonalInvite {
+        /// The session invite the host runs with
+        #[arg(long)]
+        invite: String,
+        /// A number for this person (1 and up); `host` logs it when they join and
+        /// STRAIT_REVOKED lists the withdrawn ones
+        #[arg(long)]
+        id: u32,
+        /// Days until it stops working (0 = no end)
+        #[arg(long, default_value_t = 0)]
+        days: u32,
+    },
+    /// Undo DNS/IPv6/route changes left by a full tunnel that was killed or crashed (run as administrator or root)
     Recover,
     /// Test whether this network can host a direct tunnel, and print an invite
     CheckHost {
@@ -134,9 +175,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the UDP rendezvous/signaling server
-    #[command(alias = "signal")]
-    Relay {
+    /// Run the optional self-hosted signal server (`sig` rendezvous): it only introduces two
+    /// devices by address and never carries tunnel traffic
+    Signal {
         /// UDP port to listen on
         #[arg(long, default_value_t = 7000)]
         port: u16,
@@ -147,7 +188,7 @@ enum Command {
         #[arg(long)]
         invite: Option<String>,
         /// Signaling address, only needed when the host is behind NAT
-        #[arg(long, alias = "signal")]
+        #[arg(long = "signal")]
         relay: Option<SocketAddr>,
         /// Rendezvous methods clients may use to find this host (comma list: sig,trk,nostr,dht,ntfy,mqtt);
         /// nothing is used unless named here. Exported to the transport as NAT_TUNNEL_RV.
@@ -201,6 +242,9 @@ enum Command {
         /// Do not open the plain UDP port (only the carriers are served)
         #[arg(long)]
         no_udp: bool,
+        /// Let in only people with a personal invite (see personal-invite)
+        #[arg(long)]
+        personal_only: bool,
     },
     /// Desktop dashboard with live session status and start/stop control
     #[cfg(feature = "gui")]
@@ -212,7 +256,7 @@ enum Command {
         role: UiRole,
         #[arg(long)]
         invite: Option<String>,
-        #[arg(long)]
+        #[arg(long = "signal")]
         relay: Option<SocketAddr>,
         #[arg(long)]
         room: Option<String>,
@@ -245,7 +289,7 @@ enum Command {
         #[arg(long)]
         invite: Option<String>,
         /// Signaling address, only needed when the host is behind NAT
-        #[arg(long)]
+        #[arg(long = "signal")]
         relay: Option<SocketAddr>,
         /// Room name shared with the host
         #[arg(long)]
@@ -273,7 +317,7 @@ enum Command {
         /// Replace the default route with this peer address, e.g. 10.7.0.1
         #[arg(long)]
         tun_default_route: Option<String>,
-        /// Keep this CIDR on the physical path, e.g. the relay's network
+        /// Keep this CIDR on the physical path, e.g. the signal server's network
         #[arg(long)]
         tun_bypass: Vec<String>,
         /// Existing TUN fd (Android VpnService); no interface/routes are created
@@ -369,20 +413,32 @@ fn guard_gui_root() {
     // Root GUI works from an app bundle (`sudo Strait.app/Contents/MacOS/nat-tunnel gui`),
     // the way users already run it; refusing here broke that.
     // A double-clicked app is not root, so ask once for the administrator password and reopen as root.
+    // Root never runs a file the user can change: it installs its own root-owned copy in a root-only
+    // folder, checks that copy against the hash of the bytes this process read, and runs it. Root's
+    // settings and host key live in root's home (`app::config_dir`), not in the HOME passed here. Its output goes to a root-owned
+    // log (a path in the user's home could be a link to a system file).
     #[cfg(target_os = "macos")]
     if unsafe { libc::geteuid() } != 0 && std::env::var_os("STRAIT_NO_ELEVATE").is_none() {
         let (Ok(exe), Some(home)) = (std::env::current_exe(), std::env::var("HOME").ok()) else { return };
+        let Ok(dir) = privileged::run_dir() else { return };
+        let paths = privileged::Paths::new(&dir);
+        let Ok(sha) = privileged::stage_exe(&paths, &exe) else { return };
+        let q = |s: &str| privileged::sh_quote(s);
+        let (stage, dest) = (q(&paths.stage.display().to_string()), q(privileged::INSTALL_EXE));
         let sh = format!(
-            "HOME={} {} gui >{} 2>&1 </dev/null &",
-            privileged::sh_quote(&home),
-            privileged::sh_quote(&exe.display().to_string()),
-            privileged::sh_quote(&format!("{home}/Library/Logs/strait-gui-root.log"))
+            "{{ install -d -m 0755 -o root -g wheel {dir} && install -m 0755 -o root -g wheel {stage} {dest} && \
+             [ \"$(shasum -a 256 {dest} | cut -d' ' -f1)\" = {sha} ]; }} >/dev/null 2>&1 || {{ rm -f {dest}; exit 1; }}; \
+             HOME={home} {dest} gui >>/var/log/strait-gui.log 2>&1 </dev/null &",
+            dir = q(privileged::INSTALL_DIR),
+            sha = q(&sha),
+            home = q(&home),
         );
         // shortcut: a cancelled prompt falls through to the unprivileged window, which says admin is needed.
         let ok = std::process::Command::new("/usr/bin/osascript")
             .args(privileged::osascript_args(&sh))
             .output()
             .is_ok_and(|o| o.status.success());
+        let _ = std::fs::remove_file(&paths.stage);
         if ok {
             std::process::exit(0);
         }
@@ -468,7 +524,12 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::RvTest { methods, signal, explain, json }) => {
             rv_test(methods, signal, explain, json).await;
         }
-        Some(Command::Relay { port }) => {
+        Some(Command::HostKey) => {
+            let k = app::host_key()?;
+            println!("{}", handshake::hex(&handshake::public_of(&k)));
+        }
+        Some(Command::PersonalInvite { invite, id, days }) => println!("{}", personal_invite(&invite, app::host_key()?, id, days)?),
+        Some(Command::Signal { port }) => {
             app::run_relay(port).await?;
         }
         Some(Command::Host {
@@ -490,6 +551,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             carrier,
             carriers_from_invite,
             no_udp,
+            personal_only,
         }) => {
             if allow_lan {
                 nat_tunnel::userspace::enable_allow_lan();
@@ -519,11 +581,13 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     std::env::set_var("NAT_TUNNEL_BIND_PORT", addr.port().to_string());
                 }
             }
+            let host_key = app::host_key_for(resolved.auth.host_key)?;
             app::run_host(app::HostOpts {
                 signal: resolved.signal,
                 peer: resolved.peer,
                 room: resolved.room,
                 key: resolved.key,
+                host_key: Some(host_key),
                 forward,
                 tun: tun_config(tun, tun_name, tun_default_route, tun_bypass, None, None)?,
                 userspace,
@@ -535,6 +599,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                     carrier
                 },
                 no_udp,
+                guests: guest_policy(personal_only, std::env::var("STRAIT_REVOKED").ok().as_deref()),
                 ..Default::default()
             })
             .await?;
@@ -608,6 +673,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         peer: resolved.peer,
                         room: resolved.room,
                         key: resolved.key,
+                        host_key: Some(app::host_key_for(resolved.auth.host_key)?),
                         forward,
                         tun,
                         userspace: userspace
@@ -627,6 +693,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                         hosts: resolved.hosts,
                         room: resolved.room,
                         key: resolved.key,
+                        auth: resolved.auth,
                         rv: resolved.rv,
                         listen,
                         tun,
@@ -695,6 +762,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 hosts: resolved.hosts,
                 room: resolved.room,
                 key: resolved.key,
+                auth: resolved.auth,
                 rv: resolved.rv,
                 carriers: resolved.cr,
                 carrier_disable,
@@ -748,6 +816,8 @@ struct Resolved {
     rv: Vec<String>,
     /// Carriers the invite lists (known ids only).
     cr: Vec<nat_tunnel::carrier::CarrierEntry>,
+    /// The invite's host key and personal token.
+    auth: nat_tunnel::transport::JoinAuth,
 }
 
 fn role_is_host(role: UiRole) -> bool {
@@ -763,6 +833,9 @@ async fn resolve_endpoints(
 ) -> Result<Resolved, Box<dyn std::error::Error>> {
     // Keeps the invite out of `ps`: STRAIT_INVITE (e.g. from a systemd EnvironmentFile) when no
     // --invite or --key was given. (clap's `env` feature is not enabled.)
+    if invite.is_some() || key.is_some() {
+        log::warn!("the invite key on the command line is visible to other users of this computer (process list); set STRAIT_INVITE instead");
+    }
     let invite = invite.or_else(|| {
         key.is_none().then(|| std::env::var("STRAIT_INVITE").ok().filter(|v| !v.trim().is_empty())).flatten()
     });
@@ -784,6 +857,7 @@ async fn resolve_endpoints(
             key: parsed.key,
             hosts,
             bind_hint,
+            auth: nat_tunnel::transport::JoinAuth { host_key: parsed.host_key, token: parsed.token, ..Default::default() },
             rv: parsed.rv,
             cr: parsed.cr,
         });
@@ -793,11 +867,11 @@ async fn resolve_endpoints(
     Invite::check_key(&key)?;
     let room = room.unwrap_or_default();
     if relay.is_some() && room.is_empty() {
-        return Err("--room is required when --relay is used".into());
+        return Err("--room is required when --signal is used".into());
     }
     if relay.is_none() {
         return Err(
-            "no way to reach the peer: pass --invite with the host endpoint, or --relay/--room/--key".into(),
+            "no way to reach the peer: pass --invite with the host endpoint, or --signal/--room/--key".into(),
         );
     }
     Ok(Resolved {
@@ -809,6 +883,7 @@ async fn resolve_endpoints(
         bind_hint: None,
         rv: Vec::new(),
         cr: Vec::new(),
+        auth: Default::default(),
     })
 }
 
@@ -976,6 +1051,23 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("nat-tunnel").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn personal_invite_and_guest_policy_from_the_command_line() {
+        let key = handshake::new_host_key();
+        let plain = "STRAIT2|00112233445566778899aabbccddeeff|203.0.113.10:7100";
+        assert!(personal_invite(plain, key, 1, 0).is_err(), "an invite of another host key");
+        let base = nat_tunnel::invite::Invite::parse(plain).unwrap().with_host_key(handshake::public_of(&key)).encode();
+        let text = personal_invite(&base, key, 4, 2).unwrap();
+        let inv = nat_tunnel::invite::Invite::parse(&text).unwrap();
+        assert_eq!(inv.host_key, Some(handshake::public_of(&key)));
+        let t = handshake::verify(&handshake::token_key(&key), &inv.token.unwrap(), handshake::now_secs()).unwrap();
+        assert!(t.id == 4 && t.expires > handshake::now_secs() + 86_000);
+        let p = guest_policy(false, Some("3, 9,x"));
+        assert!(p.require_token.load(std::sync::atomic::Ordering::Relaxed), "withdrawing implies personal invites only");
+        assert!(!guest_policy(false, None).require_token.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(*p.revoked.lock().unwrap(), [3u32, 9].into_iter().collect());
     }
 
     #[test]

@@ -172,7 +172,7 @@ impl Rendezvous for FixedHost {
         ProbeStatus::Reachable { rtt_ms: 0 }
     }
     async fn run(&self, _ctx: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
-        let _ = tx.send(Candidate { addr: self.0, via: "trk" }).await;
+        let _ = tx.send(Candidate { addr: self.0, via: "trk", verified: true }).await;
         cancel.cancelled().await;
         Ok(())
     }
@@ -230,7 +230,7 @@ async fn attempt_carrier(bd: Birthday, budget: Duration, full_cone: bool, carrie
     let host_pub = cone.sock.local_addr().unwrap();
     let mut mux = MuxHost::bind(
         KEY,
-        MuxConfig {
+        MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY),
             udp: false,
             carriers: IoList(vec![Arc::new(ConeHandle(cone.clone()))]),
             shared: carrier.into_iter().collect(),
@@ -241,7 +241,7 @@ async fn attempt_carrier(bd: Birthday, budget: Duration, full_cone: bool, carrie
     .await
     .unwrap();
     // The client's STUN-observed endpoint: valid toward STUN only, not toward the host.
-    mux.add_punch_target("127.0.0.1:50000".parse().unwrap());
+    mux.add_punch_target("127.0.0.1:50000".parse().unwrap(), true);
     let host_got = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
     let hg = host_got.clone();
     let (stop, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -276,7 +276,7 @@ async fn attempt_carrier(bd: Birthday, budget: Duration, full_cone: bool, carrie
         ..Default::default()
     };
     let t0 = Instant::now();
-    let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true };
+    let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true, auth: nat_tunnel::transport::JoinAuth::test() };
     let r = match carrier {
         None => Tunnel::connect_rv(opts, rv).await,
         #[cfg(all(feature = "cr-ss", feature = "cr-awg"))]
@@ -482,7 +482,7 @@ async fn sym_host_carrier(restricted: bool, guest_bd: Birthday, budget: Duration
     let host_bd = Birthday { enabled: false, ..Birthday::default() };
     let mut mux = MuxHost::bind(
         KEY,
-        MuxConfig {
+        MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY),
             udp: false,
             carriers: IoList(vec![Arc::new(SymHostHandle(sym))]),
             shared: carrier.into_iter().collect(),
@@ -494,7 +494,7 @@ async fn sym_host_carrier(restricted: bool, guest_bd: Birthday, budget: Duration
     .unwrap();
     let cone = ConeIo::new();
     let client_addr = cone.sock.local_addr().unwrap();
-    mux.add_punch_target(client_addr);
+    mux.add_punch_target(client_addr, true);
     let (stop, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         loop {
@@ -516,7 +516,7 @@ async fn sym_host_carrier(restricted: bool, guest_bd: Birthday, budget: Duration
         birthday: guest_bd,
         ..Default::default()
     };
-    let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true };
+    let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true, auth: nat_tunnel::transport::JoinAuth::test() };
     let t0 = Instant::now();
     let r = if restricted {
         // the other branch uses a plain socket: bind the filter socket's port for it too

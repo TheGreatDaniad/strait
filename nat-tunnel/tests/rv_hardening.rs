@@ -50,7 +50,7 @@ impl Rendezvous for Probe {
     }
     async fn run(&self, ctx: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
         if let Some(addr) = self.emit {
-            let _ = tx.send(Candidate { addr, via: self.id }).await;
+            let _ = tx.send(Candidate { addr, via: self.id, verified: true }).await;
         }
         let end = tokio::time::Instant::now() + self.listen;
         loop {
@@ -72,7 +72,7 @@ async fn host_learning_a_client_nudges_the_other_methods_once() {
     let (finder, other) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     // `other` also reports a candidate later: the nudge must not fire a second time for it
     let r = Runner::new(vec![probe("dht", Some("192.0.2.5:5000"), &finder), probe("trk", Some("192.0.2.6:6000"), &other)]);
-    let mut h = r.start(RvCtx::new([1; 16], Role::Host, vec!["192.0.2.1:1".parse().unwrap()]));
+    let mut h = r.start(RvCtx::new_test([1; 16], Role::Host, vec!["192.0.2.1:1".parse().unwrap()]));
     h.next().await.expect("first candidate");
     h.next().await.expect("second candidate");
     tokio::time::sleep(Duration::from_millis(1700)).await;
@@ -85,7 +85,7 @@ async fn host_learning_a_client_nudges_the_other_methods_once() {
 async fn guest_side_never_nudges() {
     let n = Arc::new(AtomicUsize::new(0));
     let r = Runner::new(vec![probe("dht", Some("192.0.2.5:5000"), &n), probe("trk", None, &n)]);
-    let h = r.start(RvCtx::new([1; 16], Role::Client, vec![]));
+    let h = r.start(RvCtx::new_test([1; 16], Role::Client, vec![]));
     tokio::time::sleep(Duration::from_millis(1700)).await;
     h.stop().await;
     assert_eq!(n.load(SeqCst), 0);
@@ -96,7 +96,7 @@ async fn status_changes_and_summary_are_logged() {
     capture();
     let n = Arc::new(AtomicUsize::new(0));
     let r = Runner::new(vec![probe("zzlog", Some("192.0.2.7:7000"), &n)]);
-    let mut h = r.start(RvCtx::new([2; 16], Role::Host, vec![]));
+    let mut h = r.start(RvCtx::new_test([2; 16], Role::Host, vec![]));
     h.next().await.expect("candidate");
     h.stop().await;
     let log = LOG.lock().unwrap().join("\n");

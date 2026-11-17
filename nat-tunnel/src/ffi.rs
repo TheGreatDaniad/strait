@@ -260,6 +260,7 @@ async fn run_client(raw_invite: String, disable: Vec<String>) -> Result<(), Stri
         signal,
         peer: hosts.first().copied(),
         hosts,
+        auth: inv.auth(),
         room: inv.room,
         key: inv.key,
         rv: inv.rv,

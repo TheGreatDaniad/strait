@@ -32,6 +32,7 @@ fn opts<'a>(signal: SocketAddr, room: &'a str, key: &'a str, host: bool) -> Conn
         bind_port: None,
         hosts: vec![],
         mux: false,
+        auth: nat_tunnel::transport::JoinAuth::test(),
     }
 }
 

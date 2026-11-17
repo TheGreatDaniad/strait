@@ -119,9 +119,32 @@ pub fn guest_args(s: &LaunchSpec) -> Vec<String> {
     a
 }
 
-/// Root-owned install location of the tunnel binary.
+/// Root-owned install location of the tunnel binary. macOS: not /usr/local, which Homebrew
+/// often hands to the user.
+#[cfg(target_os = "macos")]
+pub const INSTALL_DIR: &str = "/Library/PrivilegedHelperTools/strait";
+#[cfg(target_os = "macos")]
+pub const INSTALL_EXE: &str = "/Library/PrivilegedHelperTools/strait/nat-tunnel";
+#[cfg(not(target_os = "macos"))]
 pub const INSTALL_DIR: &str = "/usr/local/libexec/strait";
+#[cfg(not(target_os = "macos"))]
 pub const INSTALL_EXE: &str = "/usr/local/libexec/strait/nat-tunnel";
+
+/// Root runs the binary from `dir`, so `dir` and every folder above it must be owned by root and
+/// writable by nobody else, or a user could swap the file between the hash check and the exec.
+/// Folders that do not exist yet are fine: root creates them. Only root can change a root-owned
+/// folder, so checking from the unprivileged side cannot be raced.
+#[cfg(unix)]
+pub fn install_dir_ok(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    for d in dir.ancestors() {
+        let Ok(m) = std::fs::symlink_metadata(d) else { continue };
+        if !m.is_dir() || m.uid() != 0 || m.mode() & 0o022 != 0 {
+            return Err(format!("{} must be a folder owned by root and writable only by root", d.display()));
+        }
+    }
+    Ok(())
+}
 
 /// Everything the one root shell line needs.
 pub struct ShellSpec<'a> {
@@ -158,16 +181,27 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Copy `exe` into the user's stage dir (0700) and return the copy's hash.
-/// Root later installs from here, so root never executes from ~/Documents.
+/// Copy `exe` into the user's stage dir (0700) and return the hash of the bytes read from `exe`.
+/// Root later installs its own copy from here and checks that copy against this hash, so a stage
+/// file changed after this point is refused, and root never executes from ~/Documents.
+/// Refuses when the install folder is not root-only (`install_dir_ok`).
 #[cfg(unix)]
 pub fn stage_exe(paths: &Paths, exe: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    install_dir_ok(Path::new(INSTALL_DIR)).map_err(std::io::Error::other)?;
+    let bytes = std::fs::read(exe)?;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&paths.stage_dir)?;
     let _ = std::fs::remove_file(&paths.stage);
-    std::fs::copy(exe, &paths.stage)?;
-    std::fs::set_permissions(&paths.stage, std::fs::Permissions::from_mode(0o700))?;
-    sha256_file(&paths.stage)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&paths.stage)?
+        .write_all(&bytes)?;
+    Ok(Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Last non-empty line of a text file, trimmed and length-capped.
@@ -622,6 +656,15 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         assert_eq!(sha, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(std::fs::metadata(&paths.stage).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&paths.stage_dir).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn install_dir_must_be_root_only_all_the_way_up() {
+        assert!(install_dir_ok(Path::new("/strait-missing/a/b")).is_ok(), "missing folders are made by root");
+        // A user-owned (or world-writable) folder anywhere in the chain is refused.
+        let d = scratch("instdir");
+        assert!(install_dir_ok(&d.join("strait")).is_err());
+        assert!(install_dir_ok(Path::new("/tmp/strait-x")).is_err(), "/tmp is world-writable");
     }
 
     #[test]

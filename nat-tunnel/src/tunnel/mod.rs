@@ -1,16 +1,15 @@
 //! NAT Traversal Module
 //!
 //! Public-address discovery over STUN, a cheap NAT classification heuristic,
-//! TURN allocations for relayed addresses, and WireGuard config rendering.
+//! and WireGuard config rendering.
 
 pub mod crypto;
+pub mod handshake;
 pub mod reliable;
 pub mod stun;
-pub mod turn;
 pub mod wireguard;
 
 pub use stun::{classify, resolve_servers, survey, NatType, Sample, StunClient, StunError, StunServerConfig};
-pub use turn::{Allocation, TurnError, TurnServer, TurnServerConfig};
 pub use wireguard::{WireguardConfig, WireguardError};
 
 use std::net::SocketAddr;
@@ -28,15 +27,13 @@ pub struct NatReport {
 
 /// NAT Traversal Module
 ///
-/// Manages NAT traversal using STUN/TURN servers.
+/// Public-address discovery and NAT classification over STUN (no relay of any kind).
 #[derive(Debug, Clone)]
 pub struct NatTraversalModule {
     /// Configured STUN server
     stun: StunClient,
     /// `host:port` list used for classification (primary first)
     servers: Vec<String>,
-    /// TURN server, present only when `use_turn` is enabled
-    turn: Option<TurnServerConfig>,
 }
 
 impl NatTraversalModule {
@@ -50,18 +47,8 @@ impl NatTraversalModule {
         let mut servers = vec![format!("{}:{}", cfg.stun_server, cfg.stun_port)];
         servers.extend(cfg.stun_servers.iter().cloned());
 
-        let turn = cfg.use_turn.then(|| TurnServerConfig {
-            address: cfg.turn_server.clone(),
-            port: cfg.turn_port,
-            username: cfg.turn_username.clone(),
-            password: cfg.turn_password.clone(),
-        });
 
-        Self {
-            stun,
-            servers,
-            turn,
-        }
+        Self { stun, servers }
     }
 
     /// Ask the configured STUN server for our public address.
@@ -129,10 +116,4 @@ impl NatTraversalModule {
         }
     }
 
-    /// TURN client for the configured server, if TURN is enabled.
-    pub fn turn_server(&self) -> Option<TurnServer> {
-        self.turn
-            .as_ref()
-            .map(|config| TurnServer::new(config.clone()))
-    }
 }

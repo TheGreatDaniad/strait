@@ -26,10 +26,10 @@ Invariants every carrier must keep: payload only between the two peers; no third
 
 | # | Carrier | Rides the hole punch? | Needs reachable host? | What it really adds | Main caveat |
 |---|---|---|---|---|---|
-| 1 | Shadowsocks-2022 | UDP mode yes (in principle) | TCP mode yes | Standard AEAD wrapper, replay and probing resistance on TCP, plugin hook | Looks like "fully encrypted traffic", which the GFW has blocked since 2021 (V). Adds little over our own AEAD on UDP |
+| 1 | Shadowsocks-2022 | UDP mode yes (in principle) | TCP mode yes | Standard AEAD wrapper, replay and probing resistance on TCP, plugin hook | Looks like random bytes, which some networks treat as suspicious |
 | 2 | wstunnel | no | yes | TLS/WebSocket/HTTP-2 on 443 with a real certificate and domain | Stream semantics (TCP-in-TCP); `wstunnel` library crate is not on crates.io (V, 404) |
 | 3 | AmneziaWG | yes (UDP) | no | DPI-resistant UDP handshake shape (junk packets, header ranges, padding) | WireGuard identity model clashes with 1-to-many invites; Rust implementation is young |
-| 4 | Xray VLESS + REALITY / XHTTP | no | yes | Strongest TCP/443 camouflage in the list | Fast-moving, Go, large; active blocking events in Russia and Iran (V, anecdotal) |
+| 4 | Xray VLESS + REALITY / XHTTP | no | yes | Strongest TCP/443 camouflage in the list | Fast-moving, Go, large; needs a reachable TCP port |
 
 - Two findings that shape the work:
   1. A TLS-in-TLS fingerprint still applies to Strait: the user's own HTTPS handshakes appear as packet-size patterns inside any stream carrier. XTLS-Vision cannot help because our payload is already AEAD-sealed (Vision pads only inner TLS it can see). The mitigation must be in our carrier layer: frame padding and coalescing, plus XHTTP's multiplexing (section 6.4).
@@ -160,11 +160,6 @@ Phase A total (trait, UDP carrier, stream carrier, loopback carrier, MTU, ladder
 - TCP mode (for UDP-hostile networks): `ProxyClientStream` / `ProxyListener` carrying our length-prefixed frames. Stream semantics, so TCP-in-TCP caveats.
 - Both layers encrypt (SS-2022 outer, Strait AEAD inner). Derive the SS PSK from the invite with HKDF (`"strait-cr-ss"`), never from the AEAD key directly.
 
-### 3.3 Obfuscation and plugin status (evidence)
-- GFW "fully encrypted traffic" detector live since November 2021: passively detects and blocks high-entropy flows with a few exemptions (e.g. first 6 bytes printable ASCII) (V, GFW Report / OTF summary). SS and our own raw AEAD datagrams are exactly this class, so SS buys no stealth against it. No source measuring SS-2022 specifically in 2025 to 2026 was found (V, absent evidence).
-- Russia (anecdotal): in the November 2025 net4people thread SS-2022 was reported to work where VLESS+Vision failed, "but considered unreliable because it could be blocked as unknown encrypted traffic" (V, issue #546).
-- Plugins: official v2ray-plugin is stale and "not currently affected because it has not been updated for a long time"; simple-obfs deprecated (V, Exclave wiki); ShadowTLS last release v0.2.25 on 2023-12-13 (V). The embedded crate has a SIP003 `plugin` module that launches an external plugin binary (V) which we should not rely on. Conclusion: do not promise camouflage; offer SS as a cheap, well-reviewed AEAD UDP/TCP carrier and a base layer under wstunnel or XHTTP if ever needed.
-
 ### 3.4 Plan
 | Step | Files | Tests (no third-party binaries) | Effort |
 |---|---|---|---|
@@ -182,10 +177,6 @@ Phase A total (trait, UDP carrier, stream carrier, loopback carrier, MTU, ladder
 - Library: the repo is a workspace with `wstunnel` (library) and `wstunnel-cli`. `lib.rs` exposes `run_client`, `create_client(args, executor)` (for embedding), `run_server`, `ClientConfig`, `TlsClientConfig`, `LocalProtocol` (V). Caveats from the code: needs a Tokio runtime and an executor you supply; several setup failures **panic** (bad certificate/key, resolver config, malformed `restrict-to`), so wrap calls; `Stdio` listener calls `process::exit` (never use it embedded); TProxy is Linux-only (V).
 - **`wstunnel` is not published on crates.io** (API returned 404, V). Embedding therefore means a pinned git dependency (`git = ..., tag = "v11.1.0"`), which needs network access at build time, or vendoring the tag. Dependencies: tokio-rustls 0.26, rcgen, hickory-resolver, hyper 1.x, fastwebsockets 0.10, web-transport-quinn; crypto backend `aws-lc-rs` by default or `ring` by feature; edition 2024 (V). The project already uses rustls with `ring` (L Cargo.toml), so build with `default-features = false, features = ["ring"]` (U: confirm it compiles and that Android/Windows cross builds do not need cmake).
 - Alternative: our own `ws` carrier on `tokio-tungstenite` 0.30.0 (MIT, 2026-07-11, V), already a dev-dependency, plus `rustls` already used by rendezvous. About 400 lines, no wire compatibility with wstunnel, and no git dependency.
-
-### 4.2 Evidence on effectiveness
-- wstunnel presents ordinary TLS + WebSocket/HTTP-2 to a real domain. It has no REALITY-style "borrowed handshake", so against a censor that scores IP/AS and SNI (section 6.3) it is weaker than REALITY and falls under the same Russian IP-range and 15 to 20 KB per-connection findings.
-- Android: README documents Termux only; iOS not mentioned (V). In-process embedding is the Android/iOS path.
 
 ### 4.3 How our frames ride it
 Two modes, same carrier id `ws`:
@@ -207,10 +198,8 @@ Two modes, same carrier id `ws`:
 ## 5. Carrier 3: AmneziaWG
 
 ### 5.1 Facts
-- Protocol line (V, Amnezia docs, 2026): 1.5 (mimic QUIC/DNS, randomized handshake sizes, header changes); 2.0 (ranged headers H1-H4, random bytes added to special packets, I1-I5 "CPS" signature packets sent before the handshake); 3.x (3.0 changes the overall connection profile; 3.1 varies packet sizes, sequences, timing and cookie behavior, "written in response to blocking in Russia in June and July 2026"). Cryptographic core is plain WireGuard (Noise_IK, Curve25519, ChaCha20-Poly1305); with all masking parameters zero/off it is byte-compatible with WireGuard.
 - Parameters (V): `Jc/Jmin/Jmax` (junk packets after the I chain), `S1-S4` (random prefix on Init/Response/Cookie/Data), `H1-H4` (non-overlapping ranges of message type ids), `I1-I5` (custom signature packets built from static, timestamp and random tags), `HeaderProtectionKey` (32 B, ChaCha20-based header protection, requires S1-S4 at least 12), `ContentPaddingAddition`, timer ranges, `RandomTrailers`, `DisableCookies`.
 - Implementations: `amneziawg-go` (Go, MIT, fork of wireguard-go; latest tag v3.1.20260828, date taken from the tag name; 1,088 commits; runs as a userspace daemon with a TUN; library-style use only through the Windows module) (V). `awgtun` (Rust, BSD-3-Clause, boringtun fork implementing AmneziaWG 2.0, 3.0 and 3.1; `Tunn::new_with_amnezia`/`new_with_amnezia3`; the crate does no I/O, the caller drains `poll_outgoing_packet` and sends; **4 stars, 2 forks, no releases, not on crates.io, no version number**; README badge suggests Rust 1.97+, newer than this machine's 1.96.0 (U); self-reported interop with amneziawg-go, tools and kernel module) (V). Kernel module and tools are GPL-2.0 (V via awgtun README). Mullvad's GotaTun (Rust, boringtun fork) is at 0.10.2 (2026-10-20), MPL-2.0 for 0.10.x, no AmneziaWG (V). boringtun 0.7.1 (2026-05-01, BSD-3) is the upstream (V).
-- Evidence on real-world value (thin): TechRadar-type coverage says Roskomnadzor blocked a large share of Amnezia's own servers in a June window and that 3.0 targets signature-based detection; vendor blogs call it effective but sell VPNs; one forum comment notes randomized headers raise the bar for rules but statistical analysis may still find it (V search summary, mixed quality). No independent measurement was found. Treat AmneziaWG as "defeats fixed-signature WireGuard filters", not "undetectable".
 
 ### 5.2 Two ways to use it, and why one is preferred
 - **A. As a data plane (alternative to handshake v2):** rejected (section 2.5). Per-peer static keys vs invite-only capability; 1-to-many needs one WG peer per client and a registration channel.
@@ -239,26 +228,8 @@ Two modes, same carrier id `ws`:
 
 ### 6.2 What each piece does for our case
 - **VLESS + REALITY (TCP/443):** the server answers unauthenticated clients by relaying to a real target site, so active probes see that site. Needs no certificate of our own. Stream semantics.
-- **XTLS-Vision:** padding that removes the TLS-in-TLS signature **of inner TLS that Xray can see**. Our payload is AEAD-sealed Strait frames, so Vision sees no inner TLS and has nothing to pad; it also intercepts UDP/443 (V docs; `xtls-rprx-vision-udp443` to keep it). Recommendation: **no Vision** for this carrier (the signature, if any, comes from our carrier's packet-size pattern, see 6.4). Corroborating field note: Vision-flow REALITY on port 443 was the failing configuration in the November 2025 Russian reports (V, anecdotal, section 6.3).
 - **XHTTP (formerly SplitHTTP, from mid-2024):** HTTP-shaped transport with modes `packet-up` (sequenced POSTs plus one download stream; works through almost any server/CDN; default for h3), `stream-up` (single streaming POST disguised as gRPC; works through Cloudflare over h2 with gRPC enabled), `stream-one` (one bidirectional POST; default under REALITY); `auto` = stream-up for TLS h2, stream-one for REALITY, else packet-up. Random padding in Referer/response headers, SSE-style response headers, XMUX with randomized concurrency and connection lifetimes, no `http/1.1` ALPN signature, upload and download can be split over different paths/IPs (`downloadSettings`). Do not enable `mux.cool` with XHTTP (server accepts only plain XUDP now). Running h3 directly on the server is discouraged; QUIC/h3 is blocked in some regions (V, XHTTP: Beyond REALITY, discussion #4113). CDN fronting would make a third party terminate TLS and forward: excluded by default (section 10, D1).
 - **VLESS Encryption (post-quantum):** `encryption = mlkem768x25519plus.<native|xorpub|random>.<0rtt|1rtt>.<padding blocks>.<server auth>`, generated with `xray vlessenc`; with it `security: none` is allowed and XTLS is unrestricted on any transport (V docs). `xorpub` masks the handshake public key; padding blocks randomize sizes and delays. Optional hardening layer, not a replacement for REALITY: the maintainer suggested wrapping 1-RTT VLESS Encryption **inside** REALITY with custom padding to change the traffic profile (V, issue #5332, speculative). Our payload is already AEAD-encrypted, so the value is traffic shaping only.
-
-### 6.3 Field evidence, 2025 to 2026 (what works, what does not, how sure)
-| Date | Region | Report | Source | Reliability |
-|---|---|---|---|---|
-| 2023-12 to 2025-04 | Iran | IPs carrying sustained REALITY traffic get blocked within hours to days (Irancell about day two at roughly 100 to 120 GB; heavy-traffic VPS blocked after about 2 h; low-traffic VPS survived a week); handshakes to blocked IPs on 443 never complete while port 80 works. In January 2025 one tester saw XHTTP split modes unblocked while single-stream REALITY was blocked in about four days; "self-steal" (a real site on the VPS with the same domain as SNI) and domestic-domain SNI behind a CDN each carried about 454 GB. | Xray-core discussion #3269 | Anecdotal, small samples, confounded variables; the thread says so itself |
-| 2025-06 onward | Russia | Foreign data-center IPs (e.g. Hetzner, DigitalOcean) on affected mobile operators: a TLS connection freezes after roughly 15 to 20 KB (about 25 packets each direction) regardless of protocol, TLS 1.2/1.3, TCP and UDP; no RST; splitting across many connections works but is slow; later an SNI/Host whitelist and a CIDR whitelist. SSH/SFTP reportedly survive. Reports continue to October 2026. | net4people/bbs #490 | Self-reported by the original poster; thresholds approximate |
-| 2025-11 | Russia | "TLS connection-based policing" on some home ISPs (MTS/MGTS, JustLan, LanInterCom, RTK): REALITY + Vision on 443 stops working once real data flows; port other than 443 works; removing Vision and enabling mux on 443 reported to work; XHTTP or h2/h3 with mux reported to work, later "does not help much for all users"; SS-2022 works but unreliable; trigger described as number of concurrent active TLS connections, not bytes (title changed from "PPS-based" to "connection-based"). | net4people/bbs #546 | Anecdotal; no root cause confirmed |
-| 2025-11 to 2026-05 | Russia | REALITY TCP + Vision with `www.google.com` SNI and `chrome` fingerprint suddenly fails on some ISPs ("failed to read client hello" on the server); changing SNI, fingerprint, fragmentation, IP, even country does not help; a Russian-hosted Xray server over the same ISP works; Yandex/VK Cloud ranges work. Maintainers suspect HTTP/2-like characteristics of early packets are checked; suggested XHTTP (with Browser Dialer) and a coming "Seed" feature; no confirmed fix. | Xray-core #5332 | Anecdotal, closed without resolution |
-| 2026-05 | Russia | One operator's account of three failure modes: (1) active probing of a stray non-REALITY inbound scored it "obviously VPN" and the IP was then dropped; (2) behavioral scoring of ClientHello by subnet/AS/SNI/fingerprint and a freeze of about 120 s (600 s if the fingerprint rotates) after three or more concurrent TLS connections to one host within about 20 to 50 ms; Firefox/Android/OkHttp/Edge fingerprints reportedly pass where Chrome/Safari from suspicious ranges are held; (3) the 15 to 20 KB cutoff. Mitigations offered: real nginx fallback and real certificate on any other port, multiplexed transport (gRPC, XHTTP), `mux.cool` off on h2. | avsisp.com blog | Single-vendor opinion plus links; thresholds from community threads |
-| 2026-06 | general | Troubleshooting guide: if DPI drops silently after handshake try a port above 40000, a high-traffic SNI target, `firefox`/`qq` fingerprint, XHTTP; config errors that silently break REALITY (`dest` with `https://` prefix, empty `serverNames`, client core without `mlkem768x25519plus`). | semenov.work | Blog; consistent with others but no measurements |
-| 2024 (academic) | ISP measurement | Encapsulated TLS handshakes (TLS-in-TLS) in obfuscated proxies are fingerprintable with true-positive rates above 70% under standard configurations; random padding helps only slightly; stream multiplexing is the most promising countermeasure but not sufficient alone; layering shadowsocks inside websocket inside TLS helps little. | Xue, Kallitsis, Houmansadr, Ensafi, USENIX Security 2024 | Peer-reviewed; measured on a mid-size ISP |
-| 2021 to ongoing | China | Fully-encrypted-traffic detector (passive, entropy-based, blocks dynamically); October 2022 simultaneous blocking of TLS-based servers (Trojan, Xray, V2Ray TLS+WS, VLESS, gRPC) reported by 100+ users. | GFW Report / OTF summary | Research reports; older |
-
-What this adds up to (my reading, U where marked):
-1. There is **no config that is reported to work everywhere**. Russia, Iran and China each defeat different things; the best-supported commonalities are: use a **fresh, low-traffic IP**, a **real site on the same IP (self-steal)** or a domestic SNI, **multiplexed XHTTP rather than raw Vision**, **short-lived connections**, and offer **more than one port**.
-2. The per-connection 15 to 20 KB cutoff on foreign data-center IPs (Russian mobile) defeats any single long-lived TCP/TLS flow; the only mitigations reported are an IP the censor does not treat as foreign data center (domestic or whitelisted ASN/SNI) or many short connections (XHTTP `packet-up` and XMUX connection rotation are the closest built-in fit; effectiveness against this specific rule is not reported, U).
-3. Sing-box lacks XHTTP (U), which is the transport with the most positive anecdotes. Primary sidecar = Xray; sing-box is optional and for REALITY-only profiles.
 
 ### 6.4 Strait-side hardening that the sidecar cannot provide
 Our stream carriers and the Xray sidecar both expose the *sizes and timing of the inner user traffic*. Mitigations we control:
@@ -331,9 +302,9 @@ Client (sidecar next to the Strait guest):
 `mode: auto` selects `stream-one` under REALITY (V). Make `mode` a profile switch (`stream-one` default; `packet-up` fallback when stream-one is throttled; `stream-up` + `downloadSettings` only if the user accepts the complexity). `fingerprint` is a profile switch too (`firefox`, `chrome`, `qq`, `android`...): the evidence conflicts (6.3), so ship a short ordered list the ladder can walk. Optional hardening profile B: `encryption` = a generated `mlkem768x25519plus.xorpub.0rtt...` string on both ends (needs the same Xray build).
 
 What to avoid:
-- `flow: xtls-rprx-vision` with this carrier (nothing to pad; the failing config in the Russian reports; intercepts UDP/443).
-- `mux.cool` together with XHTTP (V); relying on one long TCP flow in Russia (section 6.3).
-- Small, single-purpose SNI targets or a target whose IP is unrelated to your IP: both are reported as easy to spot (Iran thread, hypothesis). Do not pick the same famous site for every host. Prefer self-steal; otherwise a popular domestic-looking target near the server's ASN (U).
+- `flow: xtls-rprx-vision` with this carrier (nothing to pad; intercepts UDP/443).
+- `mux.cool` together with XHTTP (V).
+- Small, single-purpose SNI targets or a target whose IP is unrelated to your IP: both are reported as easy to spot. Do not pick the same famous site for every host. Prefer self-steal; otherwise a popular domestic-looking target near the server's ASN (U).
 - Any extra public listener on the VPS (SSH on 22, stray Xray ports, admin panels) and a self-signed or short-lived certificate on the fallback site (V avsisp: one reported cause of being scored as a VPN).
 - CDN-fronted XHTTP (a third party forwards; REALITY also cannot run behind a CDN, V).
 - `dest` with an `https://` prefix, empty `serverNames` (V semenov: silent breakage).
@@ -407,7 +378,6 @@ e.g. cr=ss@203.0.113.10:8388,ws@host.example:443;p=/x,xray@host.example:443;m=so
 Secrets (SS PSK, WS path, VLESS UUID, REALITY keys, short id) are HKDF-derived from the invite key with per-carrier labels, so the invite stays short and "invite = whole capability" still holds. Public parameters that cannot be derived (host, port, SNI or domain, fingerprint, XHTTP mode) travel in `cr`. Consequence: any invite holder can also derive the carrier's server-side keys, so carriers do not authenticate the host against another invite holder; this is the same documented limit as in handshake v2.
 
 ### 7.2 Disclosures (same `Disclosure` struct as rendezvous; nothing preselected)
-Per carrier: what the network observer sees; which third parties are involved (none); what is required (reachable server, domain, certificate); honest caveat. Examples: SS-UDP "looks like random UDP; some networks block that"; ws "looks like HTTPS/WebSocket to your domain"; xray-reality "looks like a visit to <domain> over HTTPS; blocked IPs and some mobile networks in Russia/Iran still defeat it"; awg-style "WireGuard-like UDP with random headers".
 
 ### 7.3 Client ladder with explicit reasons
 Order from the invite, staggered 300 ms (Happy-Eyeballs style); the first carrier whose **sealed ACCEPT** arrives wins; the rest are cancelled. Default order for a typical host: UDP direct/punch, UDP-obfs/AWG, SS-UDP, then TCP 443 carriers (xray-reality, ws). Reason set per carrier: `NotInInvite`, `DisabledLocally`, `NeedsReachableHost`, `SidecarMissing`, `SidecarExited(code)`, `Timeout`, `ConnectionRefused`, `Reset` (typical DPI sign), `TlsFailed`/`CertMismatch`, `HandshakeRejected` (wrong invite or non-Strait peer), `PeerCollision`, `MtuTooSmall`, `ThrottledSuspected` (throughput collapse after N KB, to name the 15 to 20 KB pattern). Remember the last working carrier locally. Never fall back to a relay.
@@ -449,7 +419,6 @@ All Xray/wstunnel/ss tests in sections 3 to 6 marked "without third-party binari
 - **D1: third parties that forward data.** DNS tunnelling traverses recursive resolvers; CDN-fronted XHTTP/WS goes through a CDN that terminates TLS. Both strain "no third-party relay". Proposal: exclude CDN fronting; allow DNS only later, off by default, with the disclosure "your DNS provider carries the encrypted data".
 - **D2: bundling Go binaries** (supply chain, size, licences). Proposal: Xray as an optional "carrier pack", built from a pinned tag in our CI, off by default.
 - **D3: the AmneziaWG form:** 3a (in-tree AWG-style shape, N clients) first, 3b (literal AmneziaWG, 1 client) only if interoperability is wanted.
-- **D4: Russia/Iran expectations.** The evidence says no carrier is reliable there; the product text must not promise it.
 
 ---
 
@@ -461,10 +430,10 @@ All Xray/wstunnel/ss tests in sections 3 to 6 marked "without third-party binari
 | Protocol churn (REALITY, XHTTP, VLESS Encryption, FinalMask, field renames, pulled releases) | profile generator is the only code that knows Xray's schema; golden tests per pinned version; two-release upgrade policy |
 | TCP-in-TCP meltdown and bufferbloat | bounded drop-oldest queues, small MTU, padding optional, prefer UDP carriers |
 | Routing loop / leak of the sidecar socket | per-platform exemption plus a test "sidecar socket never appears on the TUN device" |
-| Kill switch interplay | allow-list each carrier endpoint (`tunmode.rs` firewall rules currently know the UDP endpoint only, L) |
+| Full-tunnel routes | allow-list each carrier endpoint (`tunmode.rs` firewall rules currently know the UDP endpoint only, L) |
 | MTU mistakes | static per-carrier table, lab MTU probe, counted drops |
 | Detection arms race | carriers selectable by id; never claim undetectability |
-| Legal | circumvention tools are restricted in some jurisdictions and stores may reject them; neutral wording; consult counsel for target markets (U) |
+| Legal | VPN apps are restricted in some jurisdictions and stores may reject them; consult counsel for target markets (U) |
 | Panic in embedded wstunnel | wrap calls in `catch_unwind` or run in a dedicated task and map to `CarrierError` (V, library panics on bad TLS config) |
 | Young crates (awgtun) | pin commit, 1:1 only, review |
 
@@ -490,13 +459,9 @@ All Xray/wstunnel/ss tests in sections 3 to 6 marked "without third-party binari
 - sing-box: https://api.github.com/repos/SagerNet/sing-box/releases/latest (v1.14.4)
 - Xray docs: https://xtls.github.io/en/config/outbounds/vless.html , https://xtls.github.io/en/config/inbounds/tunnel.html , https://xtls.github.io/en/config/transports/finalmask.html
 - XHTTP: Beyond REALITY: https://github.com/XTLS/Xray-core/discussions/4113
-- Iran REALITY blocking: https://github.com/XTLS/Xray-core/discussions/3269
-- Russia: https://github.com/net4people/bbs/issues/546 , https://github.com/net4people/bbs/issues/490 , https://github.com/XTLS/Xray-core/issues/5332 , https://www.avsisp.com/blog/our-takes/three-ways-russia-breaks-xray/ , https://semenov.work/posts/vless-reality-troubleshooting/
 - TLS-in-TLS: https://www.usenix.org/conference/usenixsecurity24/presentation/xue (Xue, Kallitsis, Houmansadr, Ensafi)
-- GFW fully-encrypted-traffic blocking: https://www.opentech.fund/news/exposing-the-great-firewalls-dynamic-blocking-of-fully-encrypted-traffic/
 - Shadowsocks: https://shadowsocks.org/doc/sip022.html , https://crates.io/api/v1/crates/shadowsocks , https://docs.rs/shadowsocks/latest/shadowsocks/ , https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest , https://github.com/ExclaveNetwork/Exclave/wiki/Configuration , https://api.github.com/repos/ihciah/shadow-tls/releases/latest
 - wstunnel: https://github.com/erebe/wstunnel , https://raw.githubusercontent.com/erebe/wstunnel/main/wstunnel/src/lib.rs , https://raw.githubusercontent.com/erebe/wstunnel/main/wstunnel/Cargo.toml , https://api.github.com/repos/erebe/wstunnel/releases/latest , https://crates.io/api/v1/crates/tokio-tungstenite
-- AmneziaWG: https://docs.amnezia.org/documentation/amnezia-wg , https://github.com/amnezia-vpn/amneziawg-go , https://api.github.com/repos/amnezia-vpn/amneziawg-go/tags , https://github.com/AYastrebov/awgtun , https://crates.io/api/v1/crates/gotatun , https://crates.io/api/v1/crates/boringtun , https://www.techradar.com/vpn/vpn-privacy-security/amnezia-vpn-improves-anti-censorship-protocol-as-russia-escalates-anti-vpn-regime
 - DNS: https://github.com/Mygod/dnstt , https://github.com/Mygod/slipstream-rust/discussions/111
 - Hysteria 2: https://v2.hysteria.network/docs/developers/Protocol/ ; quinn: https://docs.rs/quinn/latest/quinn/struct.Connection.html
 - Android W^X: https://developer.android.com/about/versions/10/behavior-changes-10 ; iOS NE memory: https://developer.apple.com/forums/thread/106377

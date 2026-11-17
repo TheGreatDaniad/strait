@@ -1066,7 +1066,9 @@ fn default_gateway() -> Option<Ipv4Addr> {
             }
         }
     }
+    // System folders only: this can run as root, and the caller's PATH may hold user folders.
     let output = std::process::Command::new("route")
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .args(["-n", "get", "default"])
         .output()
         .ok()?;

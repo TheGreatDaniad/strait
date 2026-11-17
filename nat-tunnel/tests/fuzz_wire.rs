@@ -90,7 +90,7 @@ fn client_side_decode_ignores_client_to_server_messages() {
 // ---- AEAD sealed frames ----
 
 fn pair() -> (AeadSession, AeadSession) {
-    (AeadSession::new("secret", true), AeadSession::new("secret", false))
+    (AeadSession::from_key(&[7; 32], true), AeadSession::from_key(&[7; 32], false))
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn every_bit_flip_rejected() {
     let (mut host, _) = pair();
     let sealed = host.seal(b"payload under attack");
     for bit in 0..sealed.len() * 8 {
-        let mut guest = AeadSession::new("secret", false);
+        let mut guest = AeadSession::from_key(&[7; 32], false);
         let mut f = sealed.clone();
         f[bit / 8] ^= 1 << (bit % 8);
         assert!(guest.open(&f).is_err(), "bit {bit} flip accepted");
@@ -130,6 +130,7 @@ fn replay_and_reorder_rejected() {
     let c = host.seal(b"c");
     assert!(guest.open(&b).is_ok());
     assert_eq!(guest.open(&b), Err(CryptoError::Replay));
+    assert!(guest.open(&a).is_ok(), "reordered within the window");
     assert_eq!(guest.open(&a), Err(CryptoError::Replay));
     assert!(guest.open(&c).is_ok());
     assert_eq!(guest.open(&c), Err(CryptoError::Replay));
@@ -139,9 +140,9 @@ fn replay_and_reorder_rejected() {
 fn wrong_key_and_reflection_rejected() {
     let (mut host, _) = pair();
     let sealed = host.seal(b"x");
-    assert!(AeadSession::new("other", false).open(&sealed).is_err());
+    assert!(AeadSession::from_key(&[8; 32], false).open(&sealed).is_err());
     // reflecting a host frame back to the host must fail (direction bit)
-    assert!(AeadSession::new("secret", true).open(&sealed).is_err());
+    assert!(AeadSession::from_key(&[7; 32], true).open(&sealed).is_err());
 }
 
 #[test]

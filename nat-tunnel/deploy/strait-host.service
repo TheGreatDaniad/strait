@@ -1,6 +1,6 @@
 # Multiplexed host: one UDP port, many clients. Default exit is userspace (--userspace):
 # TCP/UDP from clients is terminated inside the process and re-dialled from this machine,
-# so no TUN device, no capabilities, no NAT rules. No --relay: no relay, no default server.
+# so no TUN device, no capabilities, no NAT rules. No --signal: no signal server.
 # The invite (which contains the key) lives in /etc/strait/host.env, never in this file or in
 # the command line (visible in `ps`): the binary reads STRAIT_INVITE from the environment itself.
 # STRAIT_HOST_ARGS (also in host.env) selects the mode; --tun only selects the multiplexed
@@ -25,8 +25,9 @@ ExecStart=/usr/local/bin/nat-tunnel host $STRAIT_HOST_ARGS
 DynamicUser=yes
 Restart=on-failure
 RestartSec=2
-# Caps a runaway or abusive flow count (userspace exit holds per-flow state).
-MemoryMax=256M
+# Caps a runaway or abusive flow count (userspace exit holds per-flow state). Sized for the
+# worst case of full TCP buffers: 512 flows x 2 MiB (64 per guest) plus the process itself.
+MemoryMax=1280M
 TasksMax=512
 # setuid binaries cannot raise privileges.
 NoNewPrivileges=yes

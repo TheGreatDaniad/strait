@@ -7,7 +7,7 @@
 //! client ports out of ~64k, the expected number of matching pairs is N*K/64512 (512*256 -> ~2).
 //! A match opens the host's filter for that client port and the JOIN gets through.
 //!
-//! Direct only: no frame ever goes anywhere but the peer's IP. Kill switch: `NAT_TUNNEL_BIRTHDAY=0`.
+//! Direct only: no frame ever goes anywhere but the peer's IP. Off switch: `NAT_TUNNEL_BIRTHDAY=0`.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

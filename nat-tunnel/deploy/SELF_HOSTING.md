@@ -83,7 +83,7 @@ redistribute the new one. A plain re-run keeps the current key.
 ## Verifying a deployment
 
 Run `deploy/verify.sh` on the VPS (service active, UDP 7100 listening, host.env
-0600, lab key absent, no `--relay`). Then connect a client with the printed
+0600, lab key absent, no `--signal`). Then connect a client with the printed
 invite and check `journalctl -u strait-host` shows `client ... is 10.7.0.x`.
 Before deploying, `deploy/selftest.sh` checks deploy.sh offline in a temp dir;
 `deploy.sh --print-units` shows the exact units that would be installed.
@@ -94,7 +94,7 @@ One binary (`nat-tunnel`), no database, no accounts, state in memory only
 (rooms expire after 45 s; restart loses only rendezvous).
 
 ```
-nat-tunnel relay --port 7000      # subcommand is currently `relay`; a `signal` alias may be added
+nat-tunnel signal --port 7000
 ```
 
 (The subcommand name is historical; the server has no DATA message and cannot

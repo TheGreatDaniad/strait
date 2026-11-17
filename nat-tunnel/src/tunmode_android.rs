@@ -125,6 +125,11 @@ impl TunDevice {
 pub mod proto;
 
 /// Connect to Kotlin's fd socket, announce the assigned address, receive the TUN fd.
+///
+/// Note: an abstract-namespace name (`@...`) can be bound by any app on the device that gets there
+/// first, which could then hand over a fake TUN fd. The Kotlin side should use a fresh random name
+/// per session (or a socketpair passed to this process) and check the peer's uid (SO_PEERCRED);
+/// not verified here.
 fn recv_fd(name: &str, ip: Ipv4Addr, prefix: u8, gw: Ipv4Addr) -> io::Result<i32> {
     use std::mem::{size_of, zeroed};
     use std::os::unix::ffi::OsStrExt;

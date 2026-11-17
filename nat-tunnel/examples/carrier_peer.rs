@@ -57,7 +57,7 @@ async fn host(a: &[String]) {
                 Ok((len, from)) => {
                     n += 1;
                     let out = if seal {
-                        let ss = sess.entry(from).or_insert_with(|| AeadSession::new(&psk, true));
+                        let ss = sess.entry(from).or_insert_with(|| AeadSession::from_key(&test_key(&psk), true));
                         match ss.open(&buf[..len]) { Ok((p, _)) => ss.seal(&p), Err(_) => continue }
                     } else { buf[..len].to_vec() };
                     if let Err(e) = io.send_to(&out, from).await {
@@ -96,7 +96,7 @@ async fn client(a: &[String]) {
     let redial = a.iter().any(|x| x == "--redial");
     let label = arg(a, "--label").unwrap_or_default();
     let seal = a.iter().any(|x| x == "--seal");
-    let mut ses = AeadSession::new(&arg(a, "--key").unwrap(), false);
+    let mut ses = AeadSession::from_key(&test_key(&arg(a, "--key").unwrap()), false);
     let size = if seal { size - 32 } else { size }; // wire size stays as asked
     assert!(size >= 16);
     let (s, peer) = spec(a, false);
@@ -222,6 +222,12 @@ async fn client(a: &[String]) {
         jn(pct(&rtts, 0.0)), jn(pct(&rtts, 0.5)), jn(pct(&rtts, 0.95)), jn(pct(&rtts, 1.0)),
         bytes_rx as f64 * 8.0 / dur.max(0.001) / 1e6,
     );
+}
+
+/// Measurement tool only: both ends derive the frame key from `--key` (no handshake).
+fn test_key(k: &str) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(k.as_bytes()).into()
 }
 
 #[tokio::main]

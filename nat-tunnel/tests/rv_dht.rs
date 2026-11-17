@@ -43,7 +43,7 @@ fn start(b: Dht, key: [u8; 16], role: Role, local: Vec<SocketAddr>) -> (mpsc::Re
     let (tx, rx) = mpsc::channel(16);
     let c = CancellationToken::new();
     let c2 = c.clone();
-    let h = tokio::spawn(async move { b.run(RvCtx::new(key, role, local), tx, c2).await });
+    let h = tokio::spawn(async move { b.run(RvCtx::new_test(key, role, local), tx, c2).await });
     (rx, c, h)
 }
 async fn recv(rx: &mut mpsc::Receiver<Candidate>, secs: u64) -> Option<Candidate> {
@@ -56,7 +56,7 @@ async fn stop(c: CancellationToken, h: Handle) {
 
 /// Raw publisher standing in for a peer: put `blob` under `role`'s key at the window of `clock`.
 fn raw_put(tn: &Testnet, key: [u8; 16], role: Role, blob: &[u8], seq: i64, cas: Option<i64>, clock: u64) {
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let seed = if role == Role::Host { d.dht_host_seed } else { d.dht_client_seed };
     let node = Node::builder().bootstrap(&tn.bootstrap).bind_address(Ipv4Addr::LOCALHOST).build().unwrap();
     assert!(node.bootstrapped());
@@ -71,8 +71,8 @@ async fn host_and_client_find_each_other() {
     let (hc, cc) = (sa("192.0.2.1:1111"), sa("198.51.100.2:2222"));
     let (mut hrx, hcancel, hh) = start(dht(&tn), key, Role::Host, vec![hc]);
     let (mut crx, ccancel, ch) = start(dht(&tn), key, Role::Client, vec![cc]);
-    assert_eq!(recv(&mut hrx, 20).await, Some(Candidate { addr: cc, via: "dht" }));
-    assert_eq!(recv(&mut crx, 20).await, Some(Candidate { addr: hc, via: "dht" }));
+    assert_eq!(recv(&mut hrx, 20).await, Some(Candidate { addr: cc, via: "dht", verified: true }));
+    assert_eq!(recv(&mut crx, 20).await, Some(Candidate { addr: hc, via: "dht", verified: true }));
     stop(hcancel, hh).await;
     stop(ccancel, ch).await;
 }
@@ -92,7 +92,7 @@ async fn wrong_key_finds_nothing() {
 async fn seq_update_replaces_record() {
     let tn = net();
     let key = [3u8; 16];
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let (x, y) = (sa("192.0.2.10:1000"), sa("192.0.2.11:1001"));
     let t = now() as i64;
     raw_put(&tn, key, Role::Host, &seal(&d, Role::Host, &[x]).unwrap(), t, None, now());
@@ -122,7 +122,7 @@ async fn previous_window_is_read() {
 async fn own_tampered_and_stale_blobs_are_ignored() {
     let tn = net();
     let key = [5u8; 16];
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let a = sa("192.0.2.20:2000");
     let t = now() as i64;
     // host-sealed blob sitting under the CLIENT key: a host polling it must ignore it (own role)
@@ -153,7 +153,7 @@ async fn bootstrap_failure_is_blocked() {
     t.bootstrap_timeout = Duration::from_secs(4);
     let b = Dht::with_network(vec!["127.0.0.1:9".into()], Ipv4Addr::LOCALHOST, Arc::new(now), t);
     let (tx, _rx) = mpsc::channel(1);
-    let r = b.run(RvCtx::new([1; 16], Role::Host, vec![sa("192.0.2.1:1")]), tx, CancellationToken::new()).await;
+    let r = b.run(RvCtx::new_test([1; 16], Role::Host, vec![sa("192.0.2.1:1")]), tx, CancellationToken::new()).await;
     assert!(matches!(r, Err(RvError::Blocked(_))), "{r:?}");
 }
 
@@ -242,7 +242,7 @@ async fn client_behind_reads_next_window() {
 async fn blob_from_a_fast_clock_is_accepted() {
     let tn = net();
     let key = [12u8; 16];
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let a = sa("192.0.2.30:3000");
     raw_put(&tn, key, Role::Host, &seal_at(&d, Role::Host, &[a], now() + 100, [3u8; 12]).unwrap(), now() as i64, None, now());
     let (mut crx, cc, ch) = start(dht(&tn), key, Role::Client, vec![sa("198.51.100.2:2222")]);
@@ -255,7 +255,7 @@ async fn blob_from_a_fast_clock_is_accepted() {
 async fn junk_in_current_window_does_not_hide_previous() {
     let tn = net();
     let key = [13u8; 16];
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let a = sa("192.0.2.31:3100");
     let t = now() as i64;
     raw_put(&tn, key, Role::Host, &seal(&d, Role::Host, &[a]).unwrap(), t, None, now() - 600);
@@ -272,7 +272,7 @@ async fn junk_in_current_window_does_not_hide_previous() {
 async fn host_overwrites_a_higher_seq_record() {
     let tn = net();
     let key = [14u8; 16];
-    let d = Derived::new(&key);
+    let d = Derived::new_test(&key);
     let (old, fresh) = (sa("192.0.2.40:4000"), sa("192.0.2.41:4001"));
     let t = now() as i64;
     raw_put(&tn, key, Role::Host, &seal(&d, Role::Host, &[old]).unwrap(), t + 5000, None, now());
@@ -302,7 +302,7 @@ async fn host_repeats_its_put_early() {
     let dd = Dht::with_network(tn.bootstrap.clone(), Ipv4Addr::LOCALHOST, Arc::new(now), t);
     let t0 = now() as i64; // the host's seq starts at its start time and rises by one per PUT
     let (_rx, c, h) = start(dd, key, Role::Host, vec![sa("192.0.2.1:1111")]);
-    let pk = SigningKey::from_bytes(&Derived::new(&key).dht_host_seed).verifying_key().to_bytes();
+    let pk = SigningKey::from_bytes(&Derived::new_test(&key).dht_host_seed).verifying_key().to_bytes();
     let salt = (now() / 600).to_be_bytes();
     let reader = Node::builder().bootstrap(&tn.bootstrap).bind_address(Ipv4Addr::LOCALHOST).build().unwrap();
     assert!(reader.bootstrapped());

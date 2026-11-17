@@ -8,7 +8,7 @@ separate choices.
 
 ## Current state
 
-- Linux and macOS TUN work end to end (full tunnel, relay fallback, restore).
+- Linux and macOS TUN work end to end (full tunnel, restore).
 - Desktop GUI 0.3.0: connect/host/settings, connection history, max clients,
   per-client bandwidth, route/DNS/IPv6 restore, fail-safe probe.
 - TCP forwarding and raw-IP TUN over the custom ChaCha20-Poly1305 tunnel.

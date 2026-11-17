@@ -19,7 +19,7 @@ async fn pair(brokers: &str) -> Result<(Duration, Duration), String> {
     let cancel = CancellationToken::new();
     let mk = |role, addr: &str| {
         let (tx, rx) = mpsc::channel(8);
-        let (b, c, ctx) = (b.clone(), cancel.clone(), RvCtx::new(key, role, vec![addr.parse().unwrap()]));
+        let (b, c, ctx) = (b.clone(), cancel.clone(), RvCtx::new_test(key, role, vec![addr.parse().unwrap()]));
         (tokio::spawn(async move { b.run(ctx, tx, c).await }), rx)
     };
     let (hj, mut hrx) = mk(Role::Host, "203.0.113.1:4000");

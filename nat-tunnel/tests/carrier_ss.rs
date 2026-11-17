@@ -253,7 +253,7 @@ fn key_is_distinct_and_pinned() {
     let p = derive_psk(&k);
     assert_eq!(p, derive_psk(&k));
     assert_ne!(p, derive_psk(&parse_key(KEY2).unwrap()));
-    let d = Derived::new(&k);
+    let d = Derived::new_test(&k);
     for other in [&d.seal_key, &d.room_trk, &d.room_mqtt, &d.room_ntfy, &d.room_nostr, &d.dht_host_seed, &d.dht_client_seed] {
         assert_ne!(&p[..], &other[..16]);
     }

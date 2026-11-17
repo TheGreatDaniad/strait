@@ -365,7 +365,7 @@ async fn session(spec: &Spec, sh: &Shared, pace: &mut Pace, connected: &mut bool
                             for addr in addrs {
                                 let new = sh.seen.lock().unwrap().insert(addr);
                                 fresh |= new;
-                                if new && sh.tx.send(Candidate { addr, via: "mqtt" }).await.is_err() {
+                                if new && sh.tx.send(Candidate { addr, via: "mqtt", verified: true }).await.is_err() {
                                     return Ok(());
                                 }
                             }

@@ -181,11 +181,11 @@ fn backend(urls: &[String], t: Tuning) -> Arc<Mqtt> {
 const KEY: [u8; 16] = [7; 16];
 
 fn ctx(role: Role, key: [u8; 16], addr: &str) -> RvCtx {
-    RvCtx::new(key, role, vec![addr.parse().unwrap()])
+    RvCtx::new_test(key, role, vec![addr.parse().unwrap()])
 }
 
 fn topic_of(key: [u8; 16]) -> String {
-    Derived::new(&key).mqtt_topic()
+    Derived::new_test(&key).mqtt_topic()
 }
 
 struct Peer {
@@ -243,7 +243,7 @@ async fn find_each_other_through_one_broker() {
     hc.status = StatusSink::new(move |s| s2.lock().unwrap().push(s));
     let mut h = spawn(&b, hc);
     let mut c = spawn(&b, ctx(Role::Client, KEY, "203.0.113.2:5000"));
-    assert_eq!(h.got().await, Candidate { addr: "203.0.113.2:5000".parse().unwrap(), via: "mqtt" });
+    assert_eq!(h.got().await, Candidate { addr: "203.0.113.2:5000".parse().unwrap(), via: "mqtt", verified: true });
     assert_eq!(c.got().await.addr, "203.0.113.1:4000".parse().unwrap());
     // no duplicates despite repeated publishes
     h.nothing_for(400).await;
@@ -293,7 +293,7 @@ async fn tampered_and_stale_ignored() {
     let b = backend(&[f.url()], fast());
     let mut h = spawn(&b, ctx(Role::Host, KEY, "203.0.113.1:4000"));
     wait_for(|| f.st.subscribes.load(SeqCst) == 1).await;
-    let (d, topic) = (Derived::new(&KEY), topic_of(KEY));
+    let (d, topic) = (Derived::new_test(&KEY), topic_of(KEY));
     let peer: SocketAddr = "203.0.113.9:9".parse().unwrap();
     let mut bad = seal(&d, Role::Client, &[peer]).unwrap();
     let last = bad.len() - 1;
@@ -302,7 +302,7 @@ async fn tampered_and_stale_ignored() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     f.inject(&topic, &seal_at(&d, Role::Client, &[peer], now - 600, [1; 12]).unwrap());
     f.inject(&topic, b"garbage");
-    f.inject(&topic, &seal(&Derived::new(&[9; 16]), Role::Client, &[peer]).unwrap()); // wrong key
+    f.inject(&topic, &seal(&Derived::new_test(&[9; 16]), Role::Client, &[peer]).unwrap()); // wrong key
     h.nothing_for(300).await;
     let good: SocketAddr = "203.0.113.10:10".parse().unwrap();
     f.inject(&topic, &seal(&d, Role::Client, &[good]).unwrap());

@@ -21,7 +21,7 @@ use egui::{
 
 use crate::app;
 use crate::privileged::{self, LogEvent};
-use crate::tunnel::{StunClient, StunServerConfig};
+use crate::tunnel::{handshake, StunClient, StunServerConfig};
 use crate::invite::{self, Endpoint, Invite};
 use std::str::FromStr;
 use std::sync::mpsc;
@@ -449,6 +449,16 @@ struct Settings {
     /// Public address typed by the host when it cannot be found automatically.
     #[serde(default)]
     carrier_public: String,
+    /// Let in only people with a personal invite.
+    #[serde(default)]
+    personal_only: bool,
+    /// Personal invites made by this host, removed ones included: their ids stay withdrawn
+    /// across restarts (the host key, and so every token, outlives a session).
+    #[serde(default)]
+    guests: Vec<GuestRow>,
+    /// Next personal invite id; never reused.
+    #[serde(default)]
+    guest_next_id: u32,
 }
 
 impl Default for Settings {
@@ -470,29 +480,17 @@ impl Default for Settings {
             xray_path: String::new(),
             xray_sha256: String::new(),
             carrier_public: String::new(),
+            personal_only: false,
+            guests: Vec::new(),
+            guest_next_id: 0,
         }
     }
 }
 
 impl Settings {
+    /// As root this is root's own home, not `$HOME` (see `app::config_dir`).
     fn path() -> Option<PathBuf> {
-        #[cfg(target_os = "macos")]
-        let base = std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/nat-tunnel"))?;
-        #[cfg(windows)]
-        let base = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("USERPROFILE")
-                    .map(|h| PathBuf::from(h).join("AppData").join("Roaming"))
-            })?
-            .join("nat-tunnel");
-        #[cfg(not(any(target_os = "macos", windows)))]
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
-            .join("nat-tunnel");
-        Some(base.join("gui.json"))
+        Some(app::config_dir()?.join("gui.json"))
     }
 
     fn load() -> Self {
@@ -520,7 +518,7 @@ impl Settings {
         {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+            let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&path)?;
             f.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
         }
         #[cfg(not(unix))]
@@ -531,14 +529,17 @@ impl Settings {
 }
 
 /// Unix: file 0600 and its directory 0700 (fixes modes left by older builds). No-op elsewhere.
+/// Changes the mode through a handle opened without following links, never a link's target.
 fn restrict_perms(path: &std::path::Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let set = |p: &std::path::Path, m| {
-            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+            if let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(p) {
+                let _ = f.set_permissions(std::fs::Permissions::from_mode(m));
+            }
         };
-        if path.exists() {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
             set(path, 0o600);
             if let Some(dir) = path.parent() {
                 set(dir, 0o700);
@@ -553,7 +554,7 @@ fn restrict_perms(path: &std::path::Path) {
 fn system_reduce_motion() -> bool {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("defaults")
+        if let Ok(out) = std::process::Command::new("/usr/bin/defaults")
             .args(["read", "com.apple.universalaccess", "reduceMotion"])
             .output()
         {
@@ -838,6 +839,9 @@ struct GuiApp {
     check_rx: Option<mpsc::Receiver<Result<Verdict, String>>>,
     /// Invite of the running host session.
     host_invite: String,
+    guest_name: String,
+    guest_days: u32,
+    guest_policy: crate::transport::GuestPolicy,
     new_signal: String,
     signal_error: Option<String>,
 
@@ -870,7 +874,10 @@ struct GuiApp {
 
 impl GuiApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let settings = Settings::load();
+        Self::with_settings(Settings::load())
+    }
+
+    fn with_settings(settings: Settings) -> Self {
         let ui = UIModule::new();
         ui::install(&ui);
 
@@ -897,6 +904,9 @@ impl GuiApp {
             check: CheckState::Idle,
             check_rx: None,
             host_invite: String::new(),
+            guest_name: String::new(),
+            guest_days: 0,
+            guest_policy: Default::default(),
             new_signal: String::new(),
             signal_error: None,
             rate_value: if settings.rate_bytes == 0 {
@@ -1286,6 +1296,16 @@ impl GuiApp {
             invite = crui::with_carriers(&invite, &plan.invite);
             listen = plan.listen;
         }
+        // Every invite names this host's key; personal invites are made from it while sharing.
+        let Some(host_key) = self.host_key() else { return };
+        invite = invite.with_host_key(handshake::public_of(&host_key));
+        self.guest_policy = Default::default();
+        self.guest_policy.revoked.lock().unwrap().extend(self.settings.guests.iter().filter(|g| g.removed).map(|g| g.id));
+        if self.settings.guests.iter().any(|g| g.removed) {
+            self.settings.personal_only = true; // a removed person must not return with the shared invite
+        }
+        self.guest_policy.require_token.store(self.settings.personal_only, std::sync::atomic::Ordering::Relaxed);
+        let policy = self.guest_policy.clone();
         let carrier_cfg = self.cr_cfg();
         self.cr_listen = listen.clone();
         let lanes = self.settings.max_clients.clamp(1, app::MAX_LANES);
@@ -1301,8 +1321,8 @@ impl GuiApp {
             std::env::set_var("NAT_TUNNEL_RV", invite.rv.join(","));
         }
         self.settings.rv_over.to_env();
-        let shown = if listen.is_empty() { verdict.invite.clone() } else { invite.encode() };
-        if self.start(Mode::Host, move || spawn_host(invite, lanes, rate, listen, carrier_cfg)) {
+        let shown = invite.encode();
+        if self.start(Mode::Host, move || spawn_host(invite, lanes, rate, listen, carrier_cfg, host_key, policy)) {
             self.host_invite = shown;
         } else if self.error.is_some() {
             self.failure = self.error.clone();
@@ -1857,6 +1877,8 @@ struct Resolved {
     rv: Vec<String>,
     /// Carriers listed in the invite (`cr`).
     carriers: Vec<crate::carrier::CarrierEntry>,
+    /// The invite's host key and personal token.
+    auth: crate::transport::JoinAuth,
 }
 
 async fn resolve_invite(invite: &Invite) -> Result<Resolved, String> {
@@ -1869,6 +1891,7 @@ async fn resolve_invite(invite: &Invite) -> Result<Resolved, String> {
         key: invite.key.clone(),
         rv: invite.rv.clone(),
         carriers: invite.cr.clone(),
+        auth: invite.auth(),
     })
 }
 
@@ -1892,6 +1915,8 @@ fn spawn_host(
     rate: u64,
     carriers: Vec<crate::carrier::CarrierEntry>,
     cfg: app::CarrierCfg,
+    host_key: [u8; 32],
+    guests: crate::transport::GuestPolicy,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
         let result = async {
@@ -1899,6 +1924,8 @@ fn spawn_host(
             let mut opts = host_opts(&resolved, lanes, rate);
             opts.carriers = carriers;
             opts.carrier_cfg = cfg;
+            opts.host_key = Some(host_key);
+            opts.guests = guests;
             app::run_host(opts).await
         }
         .await;
@@ -1928,6 +1955,7 @@ fn client_opts(r: &Resolved) -> app::GuestOpts {
         key: r.key.clone(),
         rv: r.rv.clone(),
         carriers: r.carriers.clone(),
+        auth: r.auth.clone(),
         listen: None,
         tun: Some(TunConfig {
             addr: client,
@@ -1982,6 +2010,44 @@ fn host_opts(r: &Resolved, max_clients: u8, rate_bytes: u64) -> app::HostOpts {
         rate_bytes,
         ..Default::default()
     }
+}
+
+/// One personal invite this host made.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct GuestRow {
+    id: u32,
+    name: String,
+    /// Unix seconds; 0 = no end.
+    expires: u32,
+    removed: bool,
+}
+
+const PEOPLE_INTRO: &str = "The invite above works for anyone who has it. A personal invite is for one person: you see when they are connected, and you can remove just them.";
+
+fn valid_for_label(days: u32) -> &'static str {
+    match days {
+        0 => "No end",
+        1 => "1 day",
+        7 => "1 week",
+        _ => "30 days",
+    }
+}
+
+fn guest_status(online: usize, expires: u32, now: u32) -> (&'static str, Chip) {
+    if online > 0 {
+        ("Connected", Chip::Good)
+    } else if expires != 0 && now >= expires {
+        ("Expired", Chip::Bad)
+    } else {
+        ("Not connected", Chip::Neutral)
+    }
+}
+
+/// The session invite with guest `id`'s token: the text to give that one person.
+fn personal_invite(session_invite: &str, host_key: &[u8; 32], id: u32, expires: u32) -> Option<String> {
+    let inv = Invite::parse(session_invite)?;
+    let token = handshake::mint(&handshake::token_key(host_key), handshake::Token { id, expires });
+    Some(inv.with_token(Some(token)).encode())
 }
 
 /// Hex token with `len` characters, from UUID v4 randomness.
@@ -2639,10 +2705,18 @@ impl GuiApp {
             // The picker is hidden while sharing; stopping returns to the first stage.
             let full = self.host_invite.clone();
             if !full.is_empty() {
-                self.invite_with_copy(ui, &full, time);
-                let ids = Invite::parse(&full).map(|i| i.rv).unwrap_or_default();
-                rv_footer(ui, &ids);
-                self.carriers_sharing(ui, &full);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .max_height((ui.available_height() - 64.0).max(120.0))
+                    .show(ui, |ui| {
+                        ui.set_width((CONTENT_W - 12.0).max(0.0));
+                        self.invite_with_copy(ui, &full, time);
+                        let ids = Invite::parse(&full).map(|i| i.rv).unwrap_or_default();
+                        rv_footer(ui, &ids);
+                        self.people_section(ui);
+                        self.carriers_sharing(ui, &full);
+                    });
             }
             return;
         }
@@ -3014,6 +3088,109 @@ impl GuiApp {
         ui.label(RichText::new(rvui::TRAFFIC_LINE).font(ui_font(12.0)).color(TEXT_MUTED));
     }
 
+    /// This device's host key (made and saved on first use; see [`app::host_key`]).
+    fn host_key(&mut self) -> Option<[u8; 32]> {
+        app::host_key().map_err(|e| self.start_error = Some(format!("Could not read or create the host key: {e}"))).ok()
+    }
+
+    /// While sharing: personal invites and who is connected, with a way to remove one person.
+    fn people_section(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(16.0);
+        section_label(ui, "People");
+        ui.add_space(4.0);
+        ui.label(RichText::new(PEOPLE_INTRO).font(ui_font(12.0)).color(TEXT_MUTED));
+        ui.add_space(8.0);
+        // While a removed person's invite could still work, the shared invite stays closed.
+        let now = handshake::now_secs();
+        self.settings.guests.retain(|g| !(g.removed && g.expires != 0 && g.expires < now));
+        let locked = self.settings.guests.iter().any(|g| g.removed);
+        let mut only = self.settings.personal_only || locked;
+        let hint = if locked { "Stays on while someone you removed could use the shared invite" } else { "The invite above stops letting new people in" };
+        toggle_row(ui, "Personal invites only", hint, &mut only, !locked);
+        if only != self.settings.personal_only {
+            self.settings.personal_only = only;
+            self.guest_policy.require_token.store(only, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.settings.save();
+        }
+        ui.add_space(8.0);
+        let mut create = false;
+        ui.horizontal(|ui| {
+            field_input(ui, &mut self.guest_name, "Name", false, false, 150.0, 34.0, 13.0);
+            egui::ComboBox::from_id_salt("guest_days")
+                .width(86.0)
+                .selected_text(valid_for_label(self.guest_days))
+                .show_ui(ui, |ui| {
+                    for d in [0, 1, 7, 30] {
+                        ui.selectable_value(&mut self.guest_days, d, valid_for_label(d));
+                    }
+                });
+            let ok = !self.guest_name.trim().is_empty() && self.settings.guests.iter().filter(|g| !g.removed).count() < 64;
+            create = button_sized(ui, "Create", ButtonKind::Secondary, ok, egui::vec2(72.0, 34.0), 10, 13.0).clicked() && ok;
+        });
+        if create {
+            let id = self.settings.guest_next_id.max(self.settings.guests.iter().map(|g| g.id).max().unwrap_or(0)) + 1;
+            self.settings.guest_next_id = id;
+            let expires = if self.guest_days == 0 { 0 } else { handshake::now_secs().saturating_add(self.guest_days * 86_400) };
+            self.settings.guests.push(GuestRow { id, name: self.guest_name.trim().chars().take(32).collect(), expires, removed: false });
+            self.guest_name.clear();
+            let _ = self.settings.save();
+        }
+        let peers = app::host_peers();
+        let Some(host_key) = self.host_key() else { return };
+        let base = self.host_invite.clone();
+        let (mut copy, mut remove, mut drop_slot) = (None, None, None);
+        for g in self.settings.guests.iter().filter(|g| !g.removed) {
+            ui.add_space(6.0);
+            let online = peers.iter().filter(|p| p.guest == Some(g.id)).count();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&g.name).font(medium_font(13.0)).color(TEXT));
+                let (text, tone) = guest_status(online, g.expires, handshake::now_secs());
+                chip_label(ui, text, tone);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button_sized(ui, "Remove", ButtonKind::Danger, true, egui::vec2(72.0, 28.0), 8, 12.0).clicked() {
+                        remove = Some(g.id);
+                    }
+                    if button_sized(ui, "Copy invite", ButtonKind::Secondary, true, egui::vec2(92.0, 28.0), 8, 12.0).clicked() {
+                        copy = personal_invite(&base, &host_key, g.id, g.expires);
+                    }
+                });
+            });
+        }
+        for p in peers.iter().filter(|p| p.guest.is_none()) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Shared invite · {}", p.from.ip())).font(ui_font(13.0)).color(TEXT));
+                chip_label(ui, "Connected", Chip::Good);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button_sized(ui, "Disconnect", ButtonKind::Danger, true, egui::vec2(92.0, 28.0), 8, 12.0).clicked() {
+                        drop_slot = Some(p.slot);
+                    }
+                });
+            });
+        }
+        if let Some(text) = copy {
+            ui.ctx().copy_text(text);
+        }
+        if let Some(id) = remove {
+            // Withdraw first, so the person cannot come straight back, then disconnect them. The
+            // shared invite would let them back in, so personal invites only from now on.
+            self.guest_policy.revoked.lock().unwrap().insert(id);
+            if !self.settings.personal_only {
+                self.settings.personal_only = true;
+                self.guest_policy.require_token.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.settings.save();
+            }
+            app::kick_guest(id);
+            if let Some(g) = self.settings.guests.iter_mut().find(|g| g.id == id) {
+                g.removed = true;
+            }
+            let _ = self.settings.save(); // the withdrawal must survive a restart
+        }
+        if let Some(slot) = drop_slot {
+            app::kick_slot(slot);
+        }
+    }
+
     fn invite_with_copy(&mut self, ui: &mut egui::Ui, invite: &str, time: f64) {
         let copied = self.copied_at.is_some_and(|t| time - t < 1.5);
         let label = if copied { "Copied" } else { "Copy" };
@@ -3049,16 +3226,16 @@ impl GuiApp {
                     let mut block_ipv6 = true;
                     toggle_row(
                         ui,
-                        "Kill switch",
-                        "Always on — traffic stops if the tunnel drops",
+                        "Traffic through the tunnel",
+                        "While connected. If Strait stops, your normal connection is used again",
                         &mut kill_switch,
                         false,
                     );
                     divider(ui);
                     toggle_row(
                         ui,
-                        "Block IPv6",
-                        "Always on — IPv6 is blocked around the tunnel",
+                        "IPv6 off",
+                        "Turned off on your main connection while connected",
                         &mut block_ipv6,
                         false,
                     );
@@ -4360,6 +4537,7 @@ fn draw_mark(painter: &egui::Painter, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::TEST_HOST_KEY;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
@@ -4535,6 +4713,44 @@ mod tests {
         assert_eq!(failure_message(&io::Error::other("boom")), "boom");
     }
 
+    /// The People section lays out and draws headless (fonts and theme as in the real window),
+    /// with a personal invite, a removed one and nobody connected.
+    #[tokio::test]
+    async fn people_section_renders() {
+        std::env::set_var("STRAIT_HOST_KEY", handshake::hex(&TEST_HOST_KEY));
+        let key = TEST_HOST_KEY;
+        let mut app = GuiApp::with_settings(Settings::default());
+        app.host_invite = Invite::parse(&format!("STRAIT2|{KEY}||||trk")).unwrap().with_host_key(handshake::public_of(&key)).encode();
+        app.settings.guests = vec![
+            GuestRow { id: 1, name: "Sara".into(), expires: 0, removed: false },
+            GuestRow { id: 2, name: "Old".into(), expires: 1, removed: false },
+            GuestRow { id: 3, name: "Gone".into(), expires: 0, removed: true },
+        ];
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply_theme(&ctx);
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.people_section(ui));
+            assert!(!out.shapes.is_empty());
+            out.textures_delta.clear(); // no renderer here to hand the font atlas to
+        }
+        assert_eq!(app.settings.guests.len(), 3, "drawing changes nothing");
+    }
+
+    #[test]
+    fn a_personal_invite_is_the_session_invite_plus_a_token_the_host_accepts() {
+        let key = handshake::new_host_key();
+        let session = Invite::parse(&format!("STRAIT2|{KEY}||||trk")).unwrap().with_host_key(handshake::public_of(&key)).encode();
+        let text = personal_invite(&session, &key, 3, 0).unwrap();
+        let inv = Invite::parse(&text).unwrap();
+        assert_eq!((inv.key.as_str(), inv.host_key, inv.rv.clone()), (KEY, Some(handshake::public_of(&key)), vec!["trk".to_string()]));
+        let t = handshake::verify(&handshake::token_key(&key), &inv.token.unwrap(), 0).unwrap();
+        assert_eq!((t.id, t.expires), (3, 0));
+        assert_eq!(guest_status(1, 0, 5).0, "Connected");
+        assert_eq!(guest_status(0, 4, 5).0, "Expired");
+        assert_eq!(guest_status(0, 0, 5).0, "Not connected");
+    }
+
     fn resolved() -> Resolved {
         Resolved {
             signal: Some("198.51.100.9:7000".parse().unwrap()),
@@ -4543,6 +4759,7 @@ mod tests {
             key: KEY.into(),
             rv: vec!["trk".into(), "nostr".into()],
             carriers: Vec::new(),
+            auth: Default::default(),
         }
     }
 

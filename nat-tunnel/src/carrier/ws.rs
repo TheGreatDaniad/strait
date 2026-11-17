@@ -17,8 +17,10 @@
 //! Auth and decoy: the host answers an upgrade only for `GET <path>` with `Authorization: Bearer
 //! <derived token>` and a valid WebSocket handshake. Anything else (wrong path, wrong or missing
 //! token, plain browser GET, wrong method, garbage) gets one fixed `404` page, byte-identical for
-//! every cause, so a scanner learns nothing. A header that never completes is closed silently
-//! after [`HEAD_TIMEOUT`]. Token and path are derivable by any invite holder (same documented
+//! every cause, so the HTTP layer does not tell a scanner which check failed. It does not hide the
+//! service: with TLS on, any prober completes the handshake and sees the self-signed certificate
+//! described below before any token check, and that certificate is distinctive. A header that
+//! never completes is closed silently after [`HEAD_TIMEOUT`]. Token and path are derivable by any invite holder (same documented
 //! limit as handshake v2); the end-to-end AEAD, not this token, protects the tunnel.
 //!
 //! TLS identity: a self-signed Ed25519 certificate that is a pure function of the invite key (TLS
@@ -76,6 +78,15 @@ const MAX_HEAD: usize = 8 * 1024;
 const MAX_PENDING_HANDSHAKES: usize = 256;
 /// Pending handshakes one source address may hold (a NAT with a few guests still fits).
 const MAX_PENDING_PER_IP: u8 = 8;
+/// Upgraded connections the host keeps at once, in all and per source IP (loopback, i.e. a
+/// reverse proxy, has no per-IP cap); extras are refused. Above `max_clients` (a u8) on purpose.
+const MAX_CONNS: usize = 256;
+const MAX_CONNS_PER_IP: usize = 16;
+
+/// Room for one more upgraded connection from `ip`, given the connected `peers`.
+fn conn_room(peers: &[SocketAddr], ip: std::net::IpAddr) -> bool {
+    peers.len() < MAX_CONNS && (ip.is_loopback() || peers.iter().filter(|p| p.ip() == ip).count() < MAX_CONNS_PER_IP)
+}
 
 /// Per-source count of pending handshakes; the guard gives its slot back on drop.
 #[derive(Default, Clone)]
@@ -608,8 +619,13 @@ impl Serve {
         .ok()
         .flatten();
         let (Some(ws), Some(sc)) = (ws, self.sc.upgrade()) else { return };
-        let side = spawn_pump(ws, self.cfg.idle, self.cfg.ping, self.cfg.pipe);
         let mut peer = norm(remote);
+        let peers = sc.peers();
+        if !conn_room(&peers, peer.ip()) {
+            log::debug!("ws carrier: refuse {remote}: too many connections");
+            return; // dropping `ws` closes it
+        }
+        let side = spawn_pump(ws, self.cfg.idle, self.cfg.ping, self.cfg.pipe);
         while sc.peers().contains(&peer) {
             peer.set_port(1024 + self.ctr.fetch_add(1, Ordering::Relaxed) % 60000);
         }
@@ -1039,5 +1055,22 @@ mod pending_tests {
         assert_eq!(a.serial, b.serial);
         assert_ne!(a.serial, a.seed[..16]);
         assert_eq!(a.pin_hex(), b.pin_hex());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgraded_connections_are_capped() {
+        let ip = |i: u32| std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        let one_ip: Vec<SocketAddr> = (0..MAX_CONNS_PER_IP as u16).map(|p| SocketAddr::new(ip(1), p)).collect();
+        assert!(!conn_room(&one_ip, ip(1)), "per-IP cap");
+        assert!(conn_room(&one_ip, ip(2)));
+        let lo: Vec<SocketAddr> = (0..100u16).map(|p| SocketAddr::from(([127, 0, 0, 1], p))).collect();
+        assert!(conn_room(&lo, "127.0.0.1".parse().unwrap()), "a reverse proxy has no per-IP cap");
+        let full: Vec<SocketAddr> = (0..MAX_CONNS as u32).map(|i| SocketAddr::new(ip(i), 1)).collect();
+        assert!(!conn_room(&full, ip(99_999)), "total cap");
     }
 }

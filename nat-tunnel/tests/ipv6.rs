@@ -12,7 +12,7 @@ fn v6_loopback_port() -> Option<u16> {
 }
 
 fn opts<'a>(host: bool, port: Option<u16>) -> ConnectOpts<'a> {
-    ConnectOpts { signal: None, peer: None, room: "", key: "k6", host, bind_port: port, hosts: vec![], mux: false }
+    ConnectOpts { signal: None, peer: None, room: "", key: "k6", host, bind_port: port, hosts: vec![], mux: false, auth: nat_tunnel::transport::JoinAuth::test() }
 }
 
 async fn next_data(t: &mut Tunnel) -> Vec<u8> {

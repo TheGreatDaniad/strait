@@ -263,6 +263,15 @@ async fn our_host_follows_a_roaming_client() {
         }
     };
     assert_eq!((&buf[..n], p2), (&b"two"[..], peer), "peer key must survive the source-port change");
+    // Replies move to a new source after two consecutive valid packets from it (a single raced
+    // replay cannot redirect them).
+    cli.send_to(b"three", mid).await.unwrap();
+    loop {
+        host.readable().await.unwrap();
+        if host.try_recv_from(&mut buf).is_ok() {
+            break;
+        }
+    }
     host.send_to(b"back", peer).await.unwrap();
     assert_eq!(recv(&*cli, 2000).await.as_deref(), Some(&b"back"[..]), "reply must follow the new source port");
 }
@@ -285,7 +294,7 @@ fn entropy_report(label: &str, pk: &[Vec<u8>]) {
     let mut lens: Vec<usize> = pk.iter().map(|p| p.len()).collect();
     lens.sort();
     println!(
-        "{label}: n={} bytes={} chi2(all)={:.1} (df255 mean 255 sd 22.6) chi2(first byte, n={})={:.1} | GFW-style exemptions hit: popcount-outside-3.4..4.6 {}, first6-printable {}, >50%-printable {}, run>20-printable {} | len min/med/max {}/{}/{}",
+        "{label}: n={} bytes={} chi2(all)={:.1} (df255 mean 255 sd 22.6) chi2(first byte, n={})={:.1} | fully-encrypted-traffic-style exemptions hit: popcount-outside-3.4..4.6 {}, first6-printable {}, >50%-printable {}, run>20-printable {} | len min/med/max {}/{}/{}",
         pk.len(), all.len(), chi(&all), first.len(), chi(&first), ex1, ex2, ex3, ex4, lens[0], lens[lens.len() / 2], lens[lens.len() - 1]
     );
 }

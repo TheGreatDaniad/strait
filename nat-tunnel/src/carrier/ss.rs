@@ -131,10 +131,26 @@ impl Window {
 struct Sess {
     peer: SocketAddr,
     real: SocketAddr,
+    /// A new source seen once; replies move to it on its next consecutive packet.
+    moving: Option<SocketAddr>,
     server_sid: u64,
     next_pid: u64,
     win: Window,
     seen: Instant,
+}
+
+impl Sess {
+    /// True when replies move to `src`: only after two consecutive valid packets from it, so one
+    /// replayed packet raced ahead from a spoofed address cannot redirect them.
+    fn note_src(&mut self, src: SocketAddr) -> bool {
+        if src == self.real || self.moving != Some(src) {
+            self.moving = (src != self.real).then_some(src);
+            return false;
+        }
+        self.real = src;
+        self.moving = None;
+        true
+    }
 }
 
 #[derive(Default)]
@@ -289,12 +305,11 @@ impl Shared {
             if !s.win.accept(c.packet_id) {
                 return;
             }
-            if s.real != src {
+            if s.note_src(src) {
                 if let Some(p) = &t.port {
                     p.mark_known(src);
                 }
             }
-            s.real = src;
             s.seen = Instant::now();
             let peer = s.peer;
             self.push(buf, peer);
@@ -317,7 +332,7 @@ impl Shared {
         win.accept(c.packet_id);
         let sid = c.client_session_id;
         let server_sid = u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap()) | 1;
-        t.by_sid.insert(sid, Sess { peer: src, real: src, server_sid, next_pid: 0, win, seen: Instant::now() });
+        t.by_sid.insert(sid, Sess { peer: src, real: src, moving: None, server_sid, next_pid: 0, win, seen: Instant::now() });
         t.by_peer.insert(src, sid);
         if let Some(p) = &t.port {
             p.mark_known(src);
@@ -621,6 +636,18 @@ mod tests {
         assert!(w.accept(3) && !w.accept(3));
         assert!(w.accept(200) && !w.accept(5)); // 5 fell out of the 128 window
         assert!(w.accept(199) && !w.accept(199));
+    }
+
+    #[test]
+    fn reply_address_moves_after_two_consecutive_packets() {
+        let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let mut s = Sess { peer: a("1.1.1.1:1"), real: a("1.1.1.1:1"), moving: None, server_sid: 1, next_pid: 0, win: Window::default(), seen: Instant::now() };
+        assert!(!s.note_src(a("6.6.6.6:6")), "one raced replay does not move it");
+        assert!(!s.note_src(a("1.1.1.1:1")) && s.real == a("1.1.1.1:1"));
+        assert!(!s.note_src(a("6.6.6.6:6")), "not consecutive: starts over");
+        assert!(!s.note_src(a("2.2.2.2:2")));
+        assert!(s.note_src(a("2.2.2.2:2")) && s.real == a("2.2.2.2:2"), "a real roam moves it");
+        assert!(!s.note_src(a("2.2.2.2:2")));
     }
 
     #[test]

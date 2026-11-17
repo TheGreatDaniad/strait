@@ -294,7 +294,7 @@ impl Rendezvous for Dht {
                 ctx.status.set(Status::Waiting);
             }
             for a in got {
-                if seen.insert(a) && tx.send(Candidate { addr: a, via: "dht" }).await.is_err() {
+                if seen.insert(a) && tx.send(Candidate { addr: a, via: "dht", verified: true }).await.is_err() {
                     return Ok(());
                 }
             }

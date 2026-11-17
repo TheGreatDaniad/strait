@@ -70,6 +70,9 @@ if [ -f "$ENV_FILE" ]; then
     echo "existing key kept ($ENV_FILE); use --rotate to replace it"
   fi
 fi
+if [ -n "$existing" ] && [ "$ROTATE" = 0 ] && ! grep -q '^STRAIT_HOST_KEY=' "$ENV_FILE" 2>/dev/null; then
+  die "$ENV_FILE predates host keys (every invite now names the host's key); re-run with --rotate"
+fi
 if [ -n "$existing" ] && [ "$ROTATE" = 0 ]; then
   KEY="$existing"; NEWKEY=0
 else
@@ -77,7 +80,10 @@ else
   [ "$KEY" != "$LAB_KEY" ] || die "generated the lab key (impossible); retry"
   NEWKEY=1
 fi
-INVITE="STRAIT2|$KEY|$ENDPOINT"
+# The host key: its public half goes into the invite (hk=), so only this server can answer it.
+HOSTKEY="$(openssl rand -hex 32)"
+if [ "$DRY" = 1 ]; then HK="<public host key>"; else HK="$(STRAIT_HOST_KEY="$HOSTKEY" "$BIN_SRC" host-key)"; fi
+INVITE="STRAIT2|$KEY|$ENDPOINT|||||hk=$HK"
 
 echo "== install binary and units"
 run mkdir -p "$(dirname "$BIN_DST")" "$UNIT_DIR"
@@ -90,11 +96,11 @@ fi
 echo "== write $ENV_FILE (0600)"
 if [ "$NEWKEY" = 1 ]; then
   if [ "$DRY" = 1 ]; then
-    echo "[dry-run] install -d -m 0755 $ENV_DIR; write STRAIT_INVITE=<new key> + STRAIT_HOST_ARGS='$HOST_ARGS' to $ENV_FILE (umask 077)"
+    echo "[dry-run] install -d -m 0755 $ENV_DIR; write STRAIT_INVITE=<new key> + STRAIT_HOST_KEY=<new host key> + STRAIT_HOST_ARGS='$HOST_ARGS' to $ENV_FILE (umask 077)"
   else
     install -d -m 0755 "$ENV_DIR"
     # DynamicUser reads EnvironmentFile via systemd (root), so 0600 root is fine.
-    ( umask 077; printf 'STRAIT_INVITE=%s\nSTRAIT_HOST_ARGS=%s\n' "$INVITE" "$HOST_ARGS" > "$ENV_FILE.tmp" )
+    ( umask 077; printf 'STRAIT_INVITE=%s\nSTRAIT_HOST_KEY=%s\nSTRAIT_HOST_ARGS=%s\n' "$INVITE" "$HOSTKEY" "$HOST_ARGS" > "$ENV_FILE.tmp" )
     chmod 0600 "$ENV_FILE.tmp"; mv "$ENV_FILE.tmp" "$ENV_FILE"
   fi
 fi

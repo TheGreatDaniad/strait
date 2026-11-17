@@ -1,6 +1,6 @@
 [package]
 name = "nat-tunnel"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/TheGreatDaniad/strait"
@@ -29,7 +29,7 @@ cr-awg = []
 cr-xray = []
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_Foundation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Com"] }
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -54,6 +54,8 @@ eframe = { version = "0.37.0", optional = true, features = ["glow"] }
 futures = "0.3"
 netstack-smoltcp = "0.2.4"
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
+# Host key: Ed25519 (invite `hk`, signed rendezvous records); its X25519 form is the Noise static key.
+ed25519-dalek = { version = "3", default-features = false, features = ["zeroize"] }
 zeroize = "1"
 # Shared TLS for the rv-nostr / rv-ntfy / rv-mqtt backends: rustls + ring (no OpenSSL, no aws-lc: Android/Windows build).
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
@@ -69,6 +71,8 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "rin
 mainline = { version = "=8.0.1", optional = true, default-features = false, features = ["async"] }
 # cr-ss: embedded Shadowsocks-2022 (UDP relay only; no server/local binaries, no TLS).
 shadowsocks = { version = "=1.25.0", optional = true, default-features = false, features = ["aead-cipher-2022"] }
+# Join handshake: Noise NKpsk0 (host static key in the invite, invite key as the pre-shared key). RustCrypto backends only.
+snow = { version = "0.10.0", default-features = false, features = ["std", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "risky-raw-split"] }
 
 [dev-dependencies]
 # test-only fake Nostr relay (WebSocket server side)

@@ -71,22 +71,22 @@ pub async fn mapped(port: u16, want: usize) -> Vec<SocketAddr> {
     mapped_with(port, &servers().await, want).await
 }
 
-/// [`mapped`] against the given servers.
+/// [`mapped`] against the given servers, all asked at once (a server a network blocks costs no
+/// extra time); answers keep the order of `servers`.
 pub async fn mapped_with(port: u16, servers: &[SocketAddr], want: usize) -> Vec<SocketAddr> {
-    let mut out = Vec::new();
-    for &s in servers {
-        if out.len() >= want {
-            break;
-        }
+    let asks = servers.iter().map(|&s| async move {
         match tokio::time::timeout(Duration::from_secs(2), ask(port, s)).await {
             Ok(Some(m)) => {
                 log::debug!("TCP port {port} is {m} from outside (STUN {s})");
-                out.push(m);
+                Some(m)
             }
-            r => log::debug!("TCP STUN {s}: no usable answer{}", if r.is_err() { " (timeout)" } else { "" }),
+            r => {
+                log::debug!("TCP STUN {s}: no usable answer{}", if r.is_err() { " (timeout)" } else { "" });
+                None
+            }
         }
-    }
-    out
+    });
+    futures::future::join_all(asks).await.into_iter().flatten().take(want).collect()
 }
 
 #[cfg(test)]
@@ -114,9 +114,8 @@ mod tests {
         assert_eq!(m.len(), 2, "{m:?}");
     }
 
-    /// A TCP STUN server's answer is read as the mapping of the shared port.
-    #[tokio::test]
-    async fn mapping_comes_from_a_tcp_stun_answer() {
+    /// A fake TCP STUN server that reports the caller's own address.
+    async fn fake_stun() -> SocketAddr {
         let srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = srv.local_addr().unwrap();
         tokio::spawn(async move {
@@ -132,10 +131,17 @@ mod tests {
                 c.write_all(&stun::message(0x0101, &attr, &id)).await.unwrap();
             }
         });
+        at
+    }
+
+    /// TCP STUN answers are read as the mapping of the shared port; a dead server costs nothing.
+    #[tokio::test]
+    async fn mapping_comes_from_tcp_stun_answers() {
+        let (a, b) = (fake_stun().await, fake_stun().await);
         let l = listen(0).unwrap();
         let port = l.local_addr().unwrap().port();
         let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
-        let m = mapped_with(port, &[dead, at, at], 2).await;
+        let m = mapped_with(port, &[dead, a, b], 2).await;
         assert_eq!(m, vec![SocketAddr::new([127, 0, 0, 1].into(), port); 2]);
     }
 }

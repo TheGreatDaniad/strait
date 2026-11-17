@@ -14,7 +14,9 @@ async fn signal_latency_and_invite() {
     // Port 0 is not allowed by the host; any free high port works for the probe.
     let free = std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
     let dead: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    std::env::set_var("STRAIT_HOST_KEY", nat_tunnel::tunnel::handshake::hex(&nat_tunnel::transport::TEST_HOST_KEY));
     let v = preflight::check_host(free, Some("k".repeat(32)), vec![dead, srv], vec![]).await.unwrap();
+    assert!(v.invite.contains("hk="), "every invite names the host key: {}", v.invite);
     preflight::release_kept_mapping().await;
 
     assert_eq!(v.signal.as_deref(), Some(srv.to_string().as_str()));

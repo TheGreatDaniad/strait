@@ -431,8 +431,10 @@ async fn launch(spec: &CarrierSpec, c: Ctx, mut cfg: serde_json::Value, role: Ro
     .map_err(|e| failed(format!("cannot run Xray: {e}")))?;
     if !test.status.success() {
         let msg = format!("{}{}", String::from_utf8_lossy(&test.stderr), String::from_utf8_lossy(&test.stdout));
-        let tail: String = msg.trim().chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-        return Err(failed(format!("Xray rejected the generated config: {}", redact(tail, &c.secrets))));
+        // Redact before cutting the tail: a secret split by the cut would not match.
+        let msg = redact(msg.trim().to_string(), &c.secrets);
+        let tail: String = msg.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
+        return Err(failed(format!("Xray rejected the generated config: {tail}")));
     }
     let mut sc = SidecarConfig::new(&c.bin);
     sc.args = vec![OsString::from("run"), OsString::from("-c"), path.into_os_string()];
@@ -474,7 +476,7 @@ impl CarrierFactory for XrayFactory {
                 "The host needs an extra program (Xray) installed and run next to this app.",
             ],
             not_shared: &["Your payload and your keys: the tunnel stays sealed end to end inside the carrier."],
-            why: "Carry the tunnel when UDP is blocked or VPN protocols are fingerprinted. Evidence of effectiveness in censored regions is mixed and changes over time: no guarantee.",
+            why: "Carry the tunnel when UDP is blocked or VPN protocols are fingerprinted. It does not guarantee that a network cannot tell it apart.",
             operator: "None: it connects only to the host itself, no third-party relay.",
         }
     }

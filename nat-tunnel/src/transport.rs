@@ -13,65 +13,51 @@
 //! If a direct path cannot be established (for example both peers are behind
 //! symmetric NAT) the session fails instead of silently relaying data.
 //!
-//! # Host multiplexing (M2)
+//! # Host multiplexing
 //!
 //! [`MuxHost`] owns one UDP port and serves N peers, each with its own AEAD
-//! session. [`Tunnel`] with `ConnectOpts::mux` is the matching client. The
-//! legacy 1:1 `Tunnel` (TCP forward mode) is unchanged.
+//! session. [`Tunnel`] with `ConnectOpts::mux` is the matching client; forward
+//! mode (`mux: false`, one guest, a TCP bridge) runs the same join handshake.
 //!
-//! Handshake v2 (all fields fixed length; `base = SHA256("strait-mux-v2" || key)`,
-//! `mac = HMAC-SHA256(base, ..)[..16]`; `cpub`/`hpub` are ephemeral X25519
-//! public keys, fresh per join):
+//! Join handshake v3: Noise `NKpsk0` (see `tunnel::handshake` and
+//! `docs/HANDSHAKE.md`). `base = SHA256("strait-mux-v3" || invite key)` is the
+//! Noise pre-shared key and the key of the outer tag
+//! `mac = HMAC-SHA256(base, ..)[..16]`:
 //!
 //! ```text
-//! client -> host  JOIN   [F5][cn 16][cpub 32][mac("join", cn, cpub)]
-//! host   -> client ACCEPT [F6][slot u16][cn][hn 16][hpub 32]
-//!                         [mac("accept", slot, cn, cpub, hn, hpub)]
-//!                 REJECT [F7][cn][mac("reject", cn)]            (no free slot)
-//! then both sides seal with a per-peer key (the AeadSession key)
-//!   dh = X25519(own eph secret, peer eph pub)         (all-zero dh is refused)
-//!   k  = HMAC(base, "strait-session-v2" || dh || cn || hn || cpub || hpub)
-//! data    [F4][slot u16][AeadSession datagram]      both directions
+//! client -> host  JOIN   [F8][cn 16][Noise msg 1: e, es; payload clock | token?][mac("join", cn, msg1)]
+//! host   -> client ACCEPT [F9][cn 16][Noise msg 2: e, ee; payload slot | cn | verdict][mac("accept", cn, msg2)]
+//! data    [F4][slot u16][AeadSession datagram]      both directions (forward mode: no slot header)
 //! host -> client sealed control ASSIGN [C0][ip 4][prefix][gateway 4]
 //! either way     sealed control KEEPALIVE [C1], BYE [C2]
 //! ```
 //!
-//! The v1 handshake (tags F1-F3, `strait-mux-v1`, no DH) is gone: v1 datagrams
-//! have different tags and lengths and a different MAC base, so old and new
-//! peers silently drop each other's handshakes and the join times out
-//! (`HostUnreachable`) instead of misparsing.
+//! Older handshakes (F1-F3, F5-F7) have other tags and lengths and are dropped.
 //!
 //! Threat model:
 //!
-//! * The invite key is the admission capability. Every handshake message is
-//!   MACed with it, so an outsider can neither take a slot nor burn one, and
-//!   an on-path attacker without the invite learns nothing (the session key
-//!   also needs the DH secret, which never crosses the wire).
-//! * An invite holder can still join as a legitimate peer (that is what the
-//!   invite means) and can still sniff or forge handshake MACs, but the
-//!   per-peer key depends on DH secrets only the two endpoints hold, so it can
-//!   no longer derive or decrypt another peer's key even from a full capture
-//!   of that peer's JOIN/ACCEPT.
-//! * `cn`/`hn` are random per join and every peer has its own counter/replay
-//!   window: peer A's datagram fails peer B's tag, a replay against the same
-//!   peer fails its counter. The host remembers recently used `cn`s, so a
-//!   captured JOIN replayed from elsewhere cannot burn slots or rebind a peer.
-//! * Limits: an invite holder can actively race/impersonate the *host* to a
-//!   client whose JOIN it sees (it can forge a valid ACCEPT with its own hpub;
-//!   authenticating the host needs a host identity key, which the invite model
-//!   does not have). There is no forward secrecy against later invite leaks
-//!   for admission, but the session keys themselves are ephemeral (past
-//!   traffic stays safe if the invite later leaks). Ephemeral secrets are
-//!   zeroized on drop; the ChaCha20 key schedule inside `AeadSession` is not.
+//! * The invite key is the admission capability: without it no JOIN passes the
+//!   outer tag and no Noise message opens.
+//! * The host is authenticated: the client encrypts message 1 to the host key
+//!   the invite names (`hk`) and only its holder can produce a readable message
+//!   2, so an invite holder cannot pose as the host. Refusals (full, withdrawn
+//!   invite, wrong clock) are message 2 as well, so they cannot be forged.
+//! * Both sides add ephemeral keys: a recording stays unreadable when the
+//!   invite or the host key leaks later, and one peer cannot read another's.
+//! * Replays: message 1 carries the client's clock and is refused outside
+//!   `handshake::JOIN_MAX_SKEW`; inside it the host remembers `cn`s. A join holds
+//!   a slot only once a packet under its session key arrives.
+//! * Personal tokens (in message 1, encrypted to the host) name a guest; the
+//!   host can withdraw one, or take personal invites only.
 //!
 //! Slots map to addresses in 10.7.0.0/16 (host 10.7.0.1, slot i -> offset i+2).
 //! The host drops IPv4 packets whose source is not the sender's assigned
 //! address. Idle peers get a sealed keepalive after 15 s and are evicted after
 //! 60 s of silence; each peer has non-blocking token buckets (`rate_bytes`).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,9 +75,8 @@ use crate::rendezvous::{self, Rendezvous, Role, RunnerHandle, RvConfig, RvCtx, R
 
 use crate::relay;
 use crate::tunnel::crypto::{AeadSession, CryptoError};
+use crate::tunnel::handshake;
 use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, PublicKey};
-use zeroize::Zeroizing;
 use crate::tunnel::reliable::{self, Frame, Reliable};
 
 const PEER_WAIT: Duration = Duration::from_secs(15);
@@ -129,6 +114,8 @@ const RV_HOST_PUNCH_TOTAL: Duration = Duration::from_secs(200);
 /// Candidates the birthday fan fires at (256 sockets x this = its live NAT entries).
 const FAN_MAX_TARGETS: usize = 4;
 const RV_MAX_TARGETS: usize = 64;
+/// Distinct client addresses a host port-sprays per hour.
+const SPRAY_IPS_PER_HOUR: usize = 16;
 /// Host IPs port-scanned at once (candidates are not trusted input).
 const SCAN_MAX_IPS: usize = 2;
 /// Source addresses of undecodable datagrams probed per attempt (see `FrameIo::take_rejected`).
@@ -157,6 +144,10 @@ pub enum ConnectError {
     Symmetric,
     /// The host answered but has no free client slot.
     HostFull,
+    /// The host answered and refused this invite (revoked, expired, or named guests only).
+    Refused,
+    /// The host refused the join because this device's clock is far off.
+    Clock,
     /// The requested UDP port is already bound by another socket or process.
     PortInUse(u16),
     /// The invite lists rendezvous methods but none is usable here (all disabled or unknown).
@@ -179,6 +170,8 @@ impl std::fmt::Display for ConnectError {
                 f.write_str("Direct path unavailable - both networks are symmetric.")
             }
             Self::HostFull => f.write_str("Host is full - it has no free client slot."),
+            Self::Clock => f.write_str("The host refused the connection because this device's clock is more than 10 minutes off. Set the date and time automatically and try again."),
+            Self::Refused => f.write_str("The host did not accept this invite: it was withdrawn, has expired, or the host only takes personal invites."),
             Self::PortInUse(p) => write!(f, "UDP port {p} is already in use by another process."),
             Self::NoRendezvous => f.write_str(
                 "None of the ways listed in the invite to find the host are available on this device.",
@@ -275,7 +268,35 @@ pub struct ConnectOpts<'a> {
     pub hosts: Vec<SocketAddr>,
     /// Join a [`MuxHost`] (TUN modes) instead of a legacy 1:1 peer.
     pub mux: bool,
+    /// What the invite says about the host's identity and this guest (mux joins only).
+    pub auth: JoinAuth,
 }
+
+/// The security fields of an invite, as the join handshake uses them.
+#[derive(Debug, Clone, Default)]
+pub struct JoinAuth {
+    /// The host's public key. `None`: derived from the invite key (no protection beyond the invite).
+    pub host_key: Option<[u8; 32]>,
+    /// This guest's personal token, sent encrypted to the host.
+    pub token: Option<[u8; handshake::TOKEN_LEN]>,
+    /// Host side only: the host's private key (forward mode; a full-tunnel host has it in
+    /// [`MuxConfig::host_key`]). Never part of an invite.
+    pub host_secret: Option<[u8; 32]>,
+    /// Host side only (forward mode): which personal invites are admitted.
+    pub guests: GuestPolicy,
+}
+
+impl JoinAuth {
+    /// Both halves of one fixed test key, for tests and labs. Never use it for a real host.
+    #[doc(hidden)]
+    pub fn test() -> Self {
+        Self { host_key: Some(handshake::public_of(&TEST_HOST_KEY)), host_secret: Some(TEST_HOST_KEY), ..Default::default() }
+    }
+}
+
+/// The key behind [`JoinAuth::test`].
+#[doc(hidden)]
+pub const TEST_HOST_KEY: [u8; 32] = [0x42; 32];
 
 /// Guest-side rendezvous inputs for [`Tunnel::connect_rv`]. `sig` is not run here: the legacy
 /// inline signal path (`ConnectOpts::signal`) carries it.
@@ -424,6 +445,8 @@ async fn fan_recv(fan: &[Arc<dyn FrameIo>], buf: &mut [u8]) -> (usize, io::Resul
 /// One peer endpoint being fired at: first seen, last sent.
 struct Target {
     addr: SocketAddr,
+    /// Reported by a signed host record (see `Candidate::verified`): only these are scanned.
+    verified: bool,
     first: Instant,
     last: Option<Instant>,
 }
@@ -470,19 +493,44 @@ fn candidate_allowed(addr: SocketAddr, local: bool) -> bool {
     }
 }
 
-fn add_target(targets: &mut Vec<Target>, addr: SocketAddr) {
+/// True when the answer `m` may be trusted: two servers report its IP, or only one is configured.
+fn stun_agreed(votes: &HashMap<SocketAddr, SocketAddr>, m: SocketAddr, servers: usize) -> bool {
+    servers <= 1 || votes.values().filter(|v| v.ip() == m.ip()).count() >= 2
+}
+
+/// Most targets only an unsigned source reported, kept at once.
+const RV_MAX_UNVERIFIED: usize = 8;
+
+fn add_target(targets: &mut Vec<Target>, addr: SocketAddr, verified: bool) {
     if !candidate_ok(addr) {
         log::debug!("rendezvous: candidate {addr} is not a public address; ignored");
         return;
     }
-    if targets.iter().any(|t| t.addr == addr) {
+    if let Some(t) = targets.iter_mut().find(|t| t.addr == addr) {
+        t.verified |= verified; // a signed record confirms what an unsigned source said first
         return;
     }
-    // Full: the oldest gives way, so whoever announced first cannot keep a later peer out.
-    if targets.len() >= RV_MAX_TARGETS {
-        targets.remove(0);
+    // Unsigned entries (tracker peers, a bare punch byte) are few and rotate among themselves:
+    // spoofed ones cannot make the guest send JOINs to many addresses.
+    if !verified && targets.iter().filter(|t| !t.verified).count() >= RV_MAX_UNVERIFIED {
+        if let Some(i) = targets.iter().position(|t| !t.verified) {
+            targets.remove(i);
+        }
     }
-    targets.push(Target { addr, first: Instant::now(), last: None });
+    // Full: the oldest unverified entry gives way; a flood of unsigned records never pushes out a
+    // signed one, and an unsigned newcomer does not get in at all once only signed ones are left.
+    if targets.len() >= RV_MAX_TARGETS {
+        match targets.iter().position(|t| !t.verified) {
+            Some(i) => {
+                targets.remove(i);
+            }
+            None if !verified => return,
+            None => {
+                targets.remove(0);
+            }
+        }
+    }
+    targets.push(Target { addr, verified, first: Instant::now(), last: None });
 }
 
 #[derive(Debug)]
@@ -505,6 +553,8 @@ pub struct Tunnel {
     /// peer-to-peer case: no third server participates.
     signal: Option<SocketAddr>,
     room: u32,
+    /// The invite key when `room` derives from it: the room changes with the UTC day.
+    room_key: Option<String>,
     role: u8,
     peer: Option<SocketAddr>,
     punched: bool,
@@ -526,8 +576,117 @@ pub struct Tunnel {
     /// signaling server is involved.
     stun: Option<SocketAddr>,
     last_stun_poke: Instant,
-    /// Set when this tunnel is a client of a [`MuxHost`].
+    /// The client's side of the join handshake (full-tunnel and forward mode alike).
     mux: Option<MuxClient>,
+    /// Forward-mode host: the host's side of the join handshake.
+    fwd_host: Option<FwdHost>,
+    /// Forward-mode host: a handshake answer waiting to be sent.
+    reply: Option<Vec<u8>>,
+    /// Forward-mode host: a new session replaced the previous guest's (see `take_replaced`).
+    replaced: bool,
+}
+
+/// A guest's invite must name a usable host key: without one the host cannot be authenticated.
+pub fn check_host_key(auth: &JoinAuth) -> Result<(), &'static str> {
+    match auth.host_key {
+        None => Err(NO_HOST_KEY),
+        Some(hk) if !handshake::valid_public(&hk) => Err(BAD_HOST_KEY),
+        Some(_) => Ok(()),
+    }
+}
+
+pub(crate) const BAD_HOST_KEY: &str = "this invite's host key (hk=) is not a valid key: the invite is damaged. Ask the host for a new invite";
+pub(crate) const NO_HOST_KEY: &str =
+    "this invite has no host key (hk=): it cannot prove who the host is. Ask the host for a new invite";
+/// A client renews its JOIN (new clock, new nonce) after this long.
+const JOIN_RENEW: Duration = Duration::from_secs(240);
+
+/// Forward mode (one guest): the host's side of the join handshake.
+struct FwdHost {
+    base: [u8; 32],
+    key: [u8; 32],
+    token_key: [u8; 32],
+    joined: bool,
+    /// The JOIN of the current session and the answer it got (repeated for a retried JOIN).
+    cur: Option<([u8; 16], Vec<u8>)>,
+    /// Where the current session's guest is, and when it was last heard from.
+    guest: Option<(SocketAddr, Instant)>,
+    seen: HashSet<[u8; 16]>,
+    guests: GuestPolicy,
+    limit: JoinLimit,
+}
+
+/// Forward mode serves one guest: while its session is live (heard from within this time), a
+/// JOIN from another address is refused as full instead of taking the session over.
+const FWD_TAKEOVER_AFTER: Duration = Duration::from_secs(30);
+
+impl FwdHost {
+    fn new(invite_key: &str, key: Option<[u8; 32]>, guests: GuestPolicy) -> Self {
+        let key = key.unwrap_or([0; 32]); // checked by the caller: a host always has one
+        Self {
+            base: mux_base(invite_key),
+            token_key: handshake::token_key(&key),
+            key,
+            joined: false,
+            cur: None,
+            guest: None,
+            seen: HashSet::new(),
+            guests,
+            limit: JoinLimit::default(),
+        }
+    }
+
+    /// An authenticated packet of the current session arrived from `from`.
+    fn heard(&mut self, from: SocketAddr) {
+        self.guest = Some((from, Instant::now()));
+    }
+
+    /// Answer a JOIN from `from`: `(datagram to send back, session key when a new session starts)`.
+    fn join(&mut self, d: &[u8], from: SocketAddr) -> Option<(Vec<u8>, Option<[u8; 32]>)> {
+        let (cn, msg1) = split_join(&self.base, d)?;
+        if let Some((c, accept)) = &self.cur {
+            if *c == cn {
+                return Some((accept.clone(), None)); // a retry: the same answer
+            }
+        }
+        if self.seen.contains(&cn) || !self.limit.allow(from) {
+            return None;
+        }
+        let (hs, payload) = handshake::HostHs::read(&self.base, &self.key, &msg1).ok()?;
+        // Remembered before any verdict: a recorded JOIN, fresh or stale, costs one key exchange.
+        if self.seen.len() >= SEEN_CN_CAP {
+            self.seen.clear();
+        }
+        self.seen.insert(cn);
+        let (ts, token) = handshake::parse_join_payload(&payload)?;
+        let now = handshake::now_secs();
+        let live = self.guest.is_some_and(|(at, when)| at.ip() != from.ip() && when.elapsed() < FWD_TAKEOVER_AFTER);
+        let verdict = if !handshake::fresh(ts, now) {
+            VERDICT_CLOCK
+        } else if token.is_empty() {
+            if self.guests.require_token.load(Ordering::Relaxed) { VERDICT_REFUSED } else { VERDICT_OK }
+        } else {
+            match handshake::verify(&self.token_key, token, now) {
+                Ok(t) if !self.guests.revoked.lock().unwrap().contains(&t.id) => VERDICT_OK,
+                _ => VERDICT_REFUSED,
+            }
+        };
+        let verdict = if verdict == VERDICT_OK && live { VERDICT_FULL } else { verdict };
+        let (msg2, key) = hs.write(&verdict_payload(0, &cn, verdict)).ok()?;
+        let dgram = accept_dgram(&self.base, &cn, &msg2);
+        if verdict != VERDICT_OK {
+            log::info!("refused a forward-mode join from {from} ({})", match verdict {
+                VERDICT_CLOCK => "clock off by more than 10 minutes",
+                VERDICT_FULL => "another guest's session is live",
+                _ => "this invite is not admitted",
+            });
+            return Some((dgram, None));
+        }
+        self.cur = Some((cn, dgram.clone()));
+        self.guest = Some((from, Instant::now()));
+        self.joined = true;
+        Some((dgram, Some(key)))
+    }
 }
 
 impl Tunnel {
@@ -626,6 +785,15 @@ impl Tunnel {
         rv: Option<RvJoin>,
         io: Option<Arc<dyn FrameIo>>,
     ) -> Result<Self, ConnectError> {
+        // An invite without the host's key cannot authenticate the host: refuse it outright.
+        let host_secret = match (opts.host, opts.auth.host_key, opts.auth.host_secret) {
+            (false, _, _) => {
+                check_host_key(&opts.auth).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                None
+            }
+            (true, _, Some(k)) => Some(k),
+            (true, _, None) => return Err(io::Error::new(io::ErrorKind::InvalidInput, "the host needs its host key").into()),
+        };
         let mut peers = order_endpoints(hosts);
         let had_v6 = peers.iter().any(|a| a.is_ipv6());
         // Never wait out a punch window on a family that cannot route.
@@ -671,7 +839,8 @@ impl Tunnel {
             io,
             dual,
             oversize: DropCount::default(),
-            crypto: AeadSession::new(opts.key, opts.host),
+            // Replaced by the handshake's key; nothing is ever sealed or opened under this one.
+            crypto: AeadSession::from_key(&handshake::new_host_key(), opts.host),
             reliable: Reliable::new(),
             signal,
             room: if opts.room.is_empty() {
@@ -681,6 +850,7 @@ impl Tunnel {
             } else {
                 relay::room_id(opts.room)
             },
+            room_key: opts.room.is_empty().then(|| opts.key.to_string()),
             role: if opts.host { 0 } else { 1 },
             peer: None,
             punched: false,
@@ -692,7 +862,11 @@ impl Tunnel {
             received_bytes: 0,
             stun: None,
             last_stun_poke: Instant::now(),
-            mux: (opts.mux && !opts.host).then(|| MuxClient::new(opts.key)),
+            // Every guest joins through the Noise handshake; forward mode just skips the slot header.
+            mux: (!opts.host).then(|| MuxClient::new(opts.key, opts.auth.clone(), !opts.mux)),
+            fwd_host: opts.host.then(|| FwdHost::new(opts.key, host_secret, opts.auth.guests.clone())),
+            reply: None,
+            replaced: false,
         };
 
         // A host with a public endpoint keeps its own NAT mapping open by
@@ -723,8 +897,8 @@ impl Tunnel {
             if tunnel.punch_direct(*peer, window).await.is_ok() {
                 return Ok(tunnel);
             }
-            if tunnel.rejected() {
-                return Err(ConnectError::HostFull);
+            if let Some(e) = tunnel.reject_error() {
+                return Err(e);
             }
             log::debug!("endpoint {peer} did not answer");
         }
@@ -747,8 +921,8 @@ impl Tunnel {
         if tunnel.signal.is_some() {
             tunnel.discover_peer().await?;
             if let Err(e) = tunnel.punch().await {
-                if tunnel.rejected() {
-                    return Err(ConnectError::HostFull);
+                if let Some(e) = tunnel.reject_error() {
+                    return Err(e);
                 }
                 return Err(if symmetric_hint {
                     ConnectError::Symmetric
@@ -816,7 +990,8 @@ impl Tunnel {
             return Err(ConnectError::RendezvousFailed("stun: no answer (UDP or STUN appears blocked on this network; try a TCP carrier such as ws if the invite lists one)".into()));
         }
         let own_ips: Vec<IpAddr> = local.iter().map(|a| norm_addr(*a).ip()).collect();
-        let mut handle = Runner::new(backends).start(RvCtx::new(key, Role::Client, local));
+        let hk = self.mux.as_ref().and_then(|m| m.auth.host_key);
+        let mut handle = Runner::new(backends).start(RvCtx::new(key, Role::Client, local).with_keys(None, hk));
         let publisher = spawn_publisher("guest", &handle);
         let mut stats = WaitStats::default();
         // An explicit budget is a hard limit; only the default one stretches to let a scan finish.
@@ -889,8 +1064,8 @@ impl Tunnel {
             let _ = self.register().await;
         }
         loop {
-            if self.rejected() {
-                return Err(ConnectError::HostFull);
+            if let Some(e) = self.reject_error() {
+                return Err(e);
             }
             stats.tried = targets.len();
             stats.punched = t0.elapsed();
@@ -912,14 +1087,14 @@ impl Tunnel {
                     }
                     Some(c) => {
                         log::debug!("rendezvous: host candidate {} via {}", c.addr, c.via);
-                        add_target(&mut targets, c.addr);
+                        add_target(&mut targets, c.addr, c.verified);
                         first_target.get_or_insert_with(Instant::now);
                     }
                     None => done = true,
                 },
                 (i, r) = fan_recv(&fan, &mut fan_buf), if !fan.is_empty() => {
                     if let Ok((len, from)) = r {
-                        if let Ok((plain, restarted)) = self.open_dgram(&fan_buf[..len]) {
+                        if let Ok((plain, restarted)) = self.open_dgram(&fan_buf[..len], from) {
                             let from = norm_addr(from);
                             if restarted {
                                 self.reset_stream();
@@ -935,19 +1110,19 @@ impl Tunnel {
                 }
                 r = self.recv_from(&mut buf) => match r {
                     Ok((len, from)) if Some(from) == self.signal => {
-                        if let Some(relay::Incoming::Peer { addr, .. }) = relay::decode(&buf[..len]) {
-                            add_target(&mut targets, addr);
+                        if let Some(relay::Incoming::Peer { addr, .. }) = relay::decode_for(self.room, &buf[..len]) {
+                            add_target(&mut targets, addr, false);
                         }
                     }
                     // A host behind a symmetric NAT fires its 1-byte punch from a port nobody announced.
                     // That source is only a place to send our (authenticated) JOIN to; the path is
                     // adopted when a sealed ACCEPT comes back from there, never on this hint.
                     Ok((1, from)) if self.mux.is_some() && buf[0] == T_PUNCH => {
-                        add_target(&mut targets, norm_addr(from));
+                        add_target(&mut targets, norm_addr(from), false);
                     }
                     Ok((len, from)) => {
                         // The AEAD tag authenticates the sender, wherever the NAT says it is.
-                        match self.open_dgram(&buf[..len]) {
+                        match self.open_dgram(&buf[..len], from) {
                             Ok((plain, restarted)) => {
                                 if restarted {
                                     self.reset_stream();
@@ -1004,12 +1179,12 @@ impl Tunnel {
                     let now = Instant::now();
                     for a in self.io.take_rejected() {
                         let a = norm_addr(a);
-                        let from_candidate = targets.iter().any(|t| norm_addr(t.addr).ip() == a.ip());
+                        let from_candidate = targets.iter().any(|t| t.verified && norm_addr(t.addr).ip() == a.ip());
                         if from_candidate && hints.len() < HINT_MAX && !hints.contains(&a) && !is_own_announce(a, own_ips) && !targets.iter().any(|t| t.addr == a) {
                             log::info!("direct path hint: host punch seen from {a} (undecodable by the {} codec), probing it", self.io.caps().id);
                             hints.push(a);
                             // only a JOIN goes there; the path opens when a valid ACCEPT comes back
-                            add_target(&mut targets, a);
+                            add_target(&mut targets, a, false);
                         }
                     }
                     for i in 0..targets.len() {
@@ -1029,7 +1204,9 @@ impl Tunnel {
                         log::info!("no answer on the main socket; fanning out over {} sockets", fan.len());
                     }
                     if scan_on && first_target.is_some_and(|t| t.elapsed() >= bd.scan_delay) {
-                        for t in &targets {
+                        // Only addresses the host itself signed: an unsigned record must never
+                        // turn this guest into a port scanner of someone else's address.
+                        for t in targets.iter().filter(|t| t.verified) {
                             if let IpAddr::V4(ip) = norm_addr(t.addr).ip() {
                                 if scans.len() < SCAN_MAX_IPS && !scans.iter().any(|s| s.ip == ip) {
                                     let sc = Scanner::new(ip, t.addr.port(), bd.scan_passes);
@@ -1045,19 +1222,20 @@ impl Tunnel {
                             }
                         }
                     }
-                    if !fan.is_empty() && !targets.is_empty() {
+                    let signed: Vec<SocketAddr> = targets.iter().filter(|t| t.verified).map(|t| t.addr).collect();
+                    if !fan.is_empty() && !signed.is_empty() {
                         if let Some(frame) = self.punch_frame() {
                             // A fixed packet budget per tick, however many candidates there are.
                             let mut budget = FAN_TICK_PACKETS;
-                            let nt = targets.len().min(FAN_MAX_TARGETS);
+                            let nt = signed.len().min(FAN_MAX_TARGETS);
                             for _ in 0..FAN_BATCH.min(fan.len()) {
                                 for k in 0..nt {
                                     if budget == 0 {
                                         break;
                                     }
                                     budget -= 1;
-                                    let t = &targets[(fan_cursor + k) % nt];
-                                    let _ = fan[fan_cursor].send_probe(&frame, self.wire(t.addr)).await;
+                                    let t = signed[(fan_cursor + k) % nt];
+                                    let _ = fan[fan_cursor].send_probe(&frame, self.wire(t)).await;
                                 }
                                 fan_cursor = (fan_cursor + 1) % fan.len();
                             }
@@ -1174,14 +1352,23 @@ impl Tunnel {
     }
 
     fn rejected(&self) -> bool {
-        self.mux.as_ref().is_some_and(|m| m.rejected)
+        self.mux.as_ref().is_some_and(|m| m.rejected.is_some())
+    }
+
+    /// The host's refusal as an error, once it sent one.
+    fn reject_error(&self) -> Option<ConnectError> {
+        self.mux.as_ref()?.rejected.map(|why| match why {
+            VERDICT_FULL => ConnectError::HostFull,
+            VERDICT_CLOCK => ConnectError::Clock,
+            _ => ConnectError::Refused,
+        })
     }
 
     /// Frame a sealed datagram; mux clients prefix the slot header once joined.
     fn seal_dgram(&mut self, plain: &[u8]) -> Vec<u8> {
         let d = self.crypto.seal(plain);
         match &self.mux {
-            Some(m) if m.joined => {
+            Some(m) if m.joined && !m.forward => {
                 let mut out = Vec::with_capacity(3 + d.len());
                 out.push(T_DATA);
                 out.extend_from_slice(&m.slot.to_be_bytes());
@@ -1194,35 +1381,61 @@ impl Tunnel {
 
     /// Verify one received datagram. Mux clients complete the handshake here
     /// (an ACCEPT counts as an authenticated datagram, like a legacy Hello).
-    fn open_dgram(&mut self, d: &[u8]) -> Result<(Vec<u8>, bool), CryptoError> {
+    fn open_dgram(&mut self, d: &[u8], from: SocketAddr) -> Result<(Vec<u8>, bool), CryptoError> {
+        if let Some(h) = self.fwd_host.as_mut() {
+            if d.first() == Some(&T_JOIN) {
+                let was_joined = h.joined;
+                return match h.join(d, from) {
+                    Some((reply, key)) => {
+                        self.reply = Some(reply);
+                        match key {
+                            Some(k) => {
+                                self.replaced |= was_joined;
+                                self.crypto = AeadSession::from_key(&k, true);
+                                Ok((reliable::encode(&Frame::Hello), true))
+                            }
+                            None => Err(CryptoError::BadTag), // a refusal or a retried JOIN: just answer it
+                        }
+                    }
+                    None => Err(CryptoError::BadTag),
+                };
+            }
+            if !h.joined {
+                return Err(CryptoError::BadTag);
+            }
+            let r = self.crypto.open(d);
+            if r.is_ok() {
+                h.heard(from);
+            }
+            return r;
+        }
         let Some(m) = self.mux.as_mut() else {
-            return self.crypto.open(d);
+            return Err(CryptoError::BadTag);
         };
         match d.first() {
-            Some(&T_ACCEPT) if !m.joined && d.len() == 83 => {
-                let (cn, hn, hpub) = (&d[3..19], &d[19..35], &d[35..67]);
-                let mac = tag(&m.base, b"accept", &[&d[1..3], cn, &m.cpub, hn, hpub]);
-                if cn != m.cn || !ct_eq(&mac, &d[67..83]) {
+            Some(&T_ACCEPT) if !m.joined && d.len() == ACCEPT_LEN => {
+                // Only the holder of the host key the invite names can produce a readable message 2.
+                let done = m.hs.as_mut().and_then(|hs| open_accept(&m.base, hs, &m.cn, d));
+                let Some((slot, verdict, key)) = done else {
+                    if d[1..17] == m.cn {
+                        // The pending handshake stays: a forged answer cannot end the join.
+                        log::warn!("a host answered the join but could not prove the host key of this invite; ignored");
+                    }
+                    return Err(CryptoError::BadTag);
+                };
+                if verdict != VERDICT_OK {
+                    m.rejected = Some(verdict);
+                    m.restart();
                     return Err(CryptoError::BadTag);
                 }
-                let hp: [u8; 32] = hpub.try_into().unwrap();
-                let Some(secret) = m.secret.take() else { return Err(CryptoError::BadTag) };
-                let dh = secret.diffie_hellman(&PublicKey::from(hp));
-                if !dh.was_contributory() {
-                    return Err(CryptoError::BadTag);
-                }
-                self.crypto = session_for(&m.base, dh.as_bytes(), &m.cn, hn, &m.cpub, &hp, false);
-                m.slot = u16::from_be_bytes([d[1], d[2]]);
+                self.crypto = AeadSession::from_key(&key, false);
+                m.slot = slot;
                 m.joined = true;
+                m.hs = None;
                 m.last_rx = Instant::now();
                 Ok((reliable::encode(&Frame::Hello), true))
             }
-            Some(&T_REJECT) if d.len() == 33 => {
-                if d[1..17] == m.cn && ct_eq(&tag(&m.base, b"reject", &[&m.cn]), &d[17..33]) {
-                    m.rejected = true;
-                }
-                Err(CryptoError::BadTag)
-            }
+            _ if m.joined && m.forward => self.crypto.open(d),
             Some(&T_DATA) if m.joined && d.len() > 3 => {
                 let r = self.crypto.open(&d[3..]);
                 if r.is_ok() {
@@ -1231,6 +1444,13 @@ impl Tunnel {
                 r
             }
             _ => Err(CryptoError::BadTag),
+        }
+    }
+
+    /// Forward-mode host: send the handshake answer `open_dgram` prepared, if any.
+    async fn flush_reply(&mut self, to: SocketAddr) {
+        if let Some(r) = self.reply.take() {
+            let _ = self.send_to(&r, to).await;
         }
     }
 
@@ -1254,14 +1474,13 @@ impl Tunnel {
         }
     }
 
-    fn join_frame(&self) -> Option<Vec<u8>> {
-        let m = self.mux.as_ref()?;
-        let mut d = Vec::with_capacity(65);
-        d.push(T_JOIN);
-        d.extend_from_slice(&m.cn);
-        d.extend_from_slice(&m.cpub);
-        d.extend_from_slice(&tag(&m.base, b"join", &[&m.cn, &m.cpub]));
-        Some(d)
+    fn join_frame(&mut self) -> Option<Vec<u8>> {
+        let m = self.mux.as_mut()?;
+        // The JOIN carries the client's clock: renew it well before the host would call it stale.
+        if !m.joined && m.made.elapsed() >= JOIN_RENEW {
+            m.restart();
+        }
+        Some(m.join.clone()).filter(|j| !j.is_empty())
     }
 
     async fn send_join(&mut self) {
@@ -1271,12 +1490,12 @@ impl Tunnel {
         }
     }
 
-    /// The frame a punch sends: the JOIN of a mux client (until joined), else a sealed Hello.
+    /// The frame a punch sends: the client's JOIN (until joined); a host only opens its NAT.
     fn punch_frame(&mut self) -> Option<Vec<u8>> {
         match self.mux.as_ref() {
             Some(m) if m.joined => None,
             Some(_) => self.join_frame(),
-            None => Some(self.crypto.seal(&reliable::encode(&Frame::Hello))),
+            None => Some(vec![T_PUNCH]),
         }
     }
 
@@ -1312,17 +1531,17 @@ impl Tunnel {
         let deadline = Instant::now() + Duration::from_secs(8);
         let mut buf = [0u8; 2048];
         while self.assigned().is_none() {
-            if self.rejected() {
-                return Err(ConnectError::HostFull);
+            if let Some(e) = self.reject_error() {
+                return Err(e);
             }
             if Instant::now() >= deadline {
                 return Err(ConnectError::HostUnreachable);
             }
             self.send_join().await;
-            if let Ok(Ok((len, _))) =
+            if let Ok(Ok((len, from))) =
                 tokio::time::timeout(Duration::from_millis(300), self.recv_from(&mut buf)).await
             {
-                if let Ok((plain, _)) = self.open_dgram(&buf[..len]) {
+                if let Ok((plain, _)) = self.open_dgram(&buf[..len], from) {
                     self.control(&plain);
                 }
             }
@@ -1410,7 +1629,7 @@ impl Tunnel {
             };
 
             let plain = if Some(from) == self.signal {
-                match relay::decode(&buf[..len]) {
+                match relay::decode_for(self.room, &buf[..len]) {
                     Some(relay::Incoming::Peer { addr, .. }) => {
                         self.peer = Some(addr);
                         continue;
@@ -1421,20 +1640,27 @@ impl Tunnel {
                 // The AEAD tag authenticates the sender, so a datagram that
                 // decrypts proves the direct path works even if a NAT between
                 // the peers rewrites the source address in one direction.
-                match self.open_dgram(&buf[..len]) {
+                match self.open_dgram(&buf[..len], from) {
                     Ok((p, restarted)) => {
                         self.received_bytes += len as u64;
                         if restarted {
                             self.reset_stream();
+                            self.flush_reply(from).await; // forward-mode host: the handshake answer
                         }
                         self.learn_direct(from);
+                        if self.replaced {
+                            return Ok(None); // the caller starts over for the new session (`take_replaced`)
+                        }
                         Some(p)
                     }
                     Err(CryptoError::Replay) if Some(from) == self.peer => {
                         self.punched = true;
                         None
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        self.flush_reply(from).await;
+                        None
+                    }
                 }
             };
 
@@ -1445,6 +1671,13 @@ impl Tunnel {
         }
     }
 
+
+    /// Forward-mode host: true once after a new guest session replaced the previous one. The
+    /// caller must not hand the new session anything that belonged to the old one (such as its
+    /// connection to the forwarded service).
+    pub fn take_replaced(&mut self) -> bool {
+        std::mem::take(&mut self.replaced)
+    }
 
     /// A restarted peer starts its sequence numbers from zero again.
     fn reset_stream(&mut self) {
@@ -1472,7 +1705,7 @@ impl Tunnel {
             };
 
             if Some(from) == self.signal {
-                match relay::decode(&buf[..len]) {
+                match relay::decode_for(self.room, &buf[..len]) {
                     Some(relay::Incoming::Peer { addr, .. }) => {
                         self.peer = Some(addr);
                         continue;
@@ -1482,7 +1715,7 @@ impl Tunnel {
                 continue;
             }
 
-            if let Some(packet) = self.accept_packet(&buf[..len]) {
+            if let Some(packet) = self.accept_packet(&buf[..len], from) {
                 self.learn_direct(from);
                 return Ok(Some(Event::Data(packet)));
             }
@@ -1495,8 +1728,8 @@ impl Tunnel {
         }
     }
 
-    fn accept_packet(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
-        match self.open_dgram(datagram) {
+    fn accept_packet(&mut self, datagram: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
+        match self.open_dgram(datagram, from) {
             Ok((plain, restarted)) => {
                 self.received_bytes += datagram.len() as u64;
                 if restarted {
@@ -1533,6 +1766,7 @@ impl Tunnel {
 
     /// Periodic work: keep the signal registration fresh, retransmit if due.
     pub async fn tick(&mut self) -> io::Result<()> {
+        self.crypto.age(); // an idle direction drops its old key too
         if self.signal.is_some() && self.last_register.elapsed() >= REGISTER_INTERVAL {
             self.register().await?;
         }
@@ -1565,7 +1799,7 @@ impl Tunnel {
     /// copy could close the new session.
     pub async fn close(&mut self) -> io::Result<()> {
         for _ in 0..3 {
-            let bye = if self.mux.is_some() {
+            let bye = if self.mux.as_ref().is_some_and(|m| !m.forward) {
                 self.seal_dgram(&[C_BYE])
             } else {
                 self.crypto.seal(&reliable::encode(&Frame::Bye))
@@ -1593,6 +1827,10 @@ impl Tunnel {
             return Ok(());
         };
         self.last_register = Instant::now();
+        if let Some(room) = self.room_key.as_deref().map(relay::room_for_key).filter(|r| *r != self.room) {
+            let _ = self.send_to(&relay::encode_deregister(self.room, self.role), signal).await;
+            self.room = room; // a new UTC day: guests starting now look in the new room
+        }
         self.send_to(&relay::encode_register(self.room, self.role), signal)
             .await?;
         Ok(())
@@ -1620,7 +1858,7 @@ impl Tunnel {
                 tokio::time::timeout(wait, self.recv_from(&mut buf)).await
             {
                 if Some(from) == self.signal {
-                    if let Some(relay::Incoming::Peer { addr, .. }) = relay::decode(&buf[..len]) {
+                    if let Some(relay::Incoming::Peer { addr, .. }) = relay::decode_for(self.room, &buf[..len]) {
                         log::info!("peer at {} (via signal {})", addr, signal);
                         self.peer = Some(addr);
                         return Ok(());
@@ -1655,7 +1893,7 @@ impl Tunnel {
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1));
             match tokio::time::timeout(wait, self.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) if Some(from) == self.signal => match relay::decode(&buf[..len]) {
+                Ok(Ok((len, from))) if Some(from) == self.signal => match relay::decode_for(self.room, &buf[..len]) {
                     Some(relay::Incoming::Peer { addr, .. }) => {
                         if self.peer != Some(addr) {
                             log::debug!("peer address updated to {}", addr);
@@ -1665,17 +1903,16 @@ impl Tunnel {
                     _ => {}
                 },
                 Ok(Ok((len, from))) => {
-                    // The same sealed datagram also travels via the relay, so
-                    // this copy may be rejected as a replay. A decryptable copy
-                    // proves the punch worked even when a NAT rewrites the
+                    // A decryptable datagram proves the punch worked even when a NAT rewrites the
                     // source address between the peers.
-                    match self.open_dgram(&buf[..len]) {
+                    match self.open_dgram(&buf[..len], from) {
                         Ok((plain, restarted)) => {
                             if restarted {
                                 self.reset_stream();
                             }
                             self.pending.push_back(plain);
                             self.learn_direct(from);
+                            self.flush_reply(from).await; // forward-mode host: the handshake answer
                             log::info!("direct hole punch open to {}", from);
                             return Ok(());
                         }
@@ -1686,7 +1923,7 @@ impl Tunnel {
                             log::info!("direct hole punch open to {}", from);
                             return Ok(());
                         }
-                        Err(_) => log::debug!("punch ignoring datagram from {}", from),
+                        Err(_) => self.flush_reply(from).await,
                     }
                 }
                 _ => {}
@@ -1704,7 +1941,8 @@ impl Tunnel {
     /// the guest sends first, the host answers, and no third server ever sees
     /// a packet.
     async fn punch_direct(&mut self, peer: SocketAddr, window: Duration) -> io::Result<()> {
-        let window = if self.mux.is_some() { window.max(MUX_JOIN_WINDOW) } else { window };
+        let full_tunnel = self.mux.as_ref().is_some_and(|m| !m.forward);
+        let window = if full_tunnel { window.max(MUX_JOIN_WINDOW) } else { window };
         let deadline = Instant::now() + window;
         let mut buf = [0u8; 2048];
         let mut next_send = Instant::now();
@@ -1716,7 +1954,7 @@ impl Tunnel {
                 self.send_punch(peer).await;
                 // Mux JOINs back off (100ms .. 800ms) so a burst of clients
                 // does not keep re-flooding a host that is already behind.
-                let backoff = if self.mux.is_some() { 1 << sent.min(3) } else { 1 };
+                let backoff = if full_tunnel { 1 << sent.min(3) } else { 1 };
                 sent += 1;
                 next_send = Instant::now() + PUNCH_INTERVAL * backoff;
             }
@@ -1726,7 +1964,7 @@ impl Tunnel {
             if let Ok(Ok((len, from))) =
                 tokio::time::timeout(wait, self.recv_from(&mut buf)).await
             {
-                match self.open_dgram(&buf[..len]) {
+                match self.open_dgram(&buf[..len], from) {
                     Ok((plain, restarted)) => {
                         if restarted {
                             self.reset_stream();
@@ -1761,7 +1999,7 @@ impl Tunnel {
             }
             let wait = (deadline - Instant::now()).min(Duration::from_millis(500));
             match tokio::time::timeout(wait, self.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) => match self.open_dgram(&buf[..len]) {
+                Ok(Ok((len, from))) => match self.open_dgram(&buf[..len], from) {
                     Ok((plain, restarted)) => {
                         if restarted {
                             self.reset_stream();
@@ -1773,10 +2011,9 @@ impl Tunnel {
                         log::info!("direct guest at {}", from);
                         return Ok(());
                     }
-                    // Datagrams from the guest may be replays of the Hello the
-                    // app retries; a failed decrypt from a new address is not
-                    // fatal, keep listening.
-                    Err(_) => {}
+                    // A retried JOIN or a refusal still gets its answer; anything else is
+                    // ignored and the host keeps listening.
+                    Err(_) => self.flush_reply(from).await,
                 },
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {}
@@ -1786,7 +2023,7 @@ impl Tunnel {
 
     /// Remember where authenticated direct datagrams actually arrive from.
     ///
-    /// Source-address rewriting by a NAT or relay makes the address advertised
+    /// Source-address rewriting by a NAT makes the address advertised
     /// through the rendezvous server wrong in one direction; the AEAD tag, not
     /// the source address, is what authenticates the peer.
     fn learn_direct(&mut self, from: SocketAddr) {
@@ -1805,15 +2042,22 @@ impl Tunnel {
             }
             return;
         }
-        let sealed = self.crypto.seal(&reliable::encode(&Frame::Hello));
-        let _ = self.send_to(&sealed, peer).await;
+        // Forward-mode host: the handshake answer when one is due, else a sealed Hello once the
+        // session exists, else a bare punch byte (nothing to say before the guest's JOIN).
+        if self.reply.is_some() {
+            return self.flush_reply(peer).await;
+        }
+        let d = if self.fwd_host.as_ref().is_some_and(|h| h.joined) {
+            self.crypto.seal(&reliable::encode(&Frame::Hello))
+        } else {
+            vec![T_PUNCH]
+        };
+        let _ = self.send_to(&d, peer).await;
     }
 
     /// Send frames.
     ///
-    /// On a confirmed direct path, new data goes direct only; the relay copy is
-    /// kept for retransmissions as insurance. Sending both copies for every
-    /// frame halves the usable bandwidth.
+    /// Frames go to the peer's direct address only; nothing is ever sent through a third party.
     async fn transmit(&mut self, frames: Vec<Frame>, _retransmit: bool) -> io::Result<()> {
         for frame in frames {
             let sealed = self.seal_dgram(&reliable::encode(&frame));
@@ -1839,9 +2083,20 @@ impl Tunnel {
 
 const T_PUNCH: u8 = 0xF0;
 // Handshake v2 tags (v1 used 0xF1-0xF3, without DH).
-const T_JOIN: u8 = 0xF5;
-const T_ACCEPT: u8 = 0xF6;
-const T_REJECT: u8 = 0xF7;
+// v3 handshake (Noise NKpsk0, `tunnel::handshake`). 0xF5..0xF7 were v2 and are ignored.
+const T_JOIN: u8 = 0xF8;
+const T_ACCEPT: u8 = 0xF9;
+// 0xFA was a separate REJECT; refusals are ACCEPTs with a verdict now.
+/// JOIN = type | cn (16) | Noise message 1 (payload: clock (4) | optional guest token) | tag (16).
+const JOIN_MIN: usize = 1 + 16 + 4 + handshake::OVERHEAD + 16;
+const JOIN_MAX: usize = JOIN_MIN + handshake::TOKEN_LEN;
+/// ACCEPT = type | cn (16) | Noise message 2 (payload: slot (2) | cn (16) | verdict (1)) | tag (16).
+/// A refusal travels the same way, so only the host can send one.
+const ACCEPT_LEN: usize = 1 + 16 + 19 + handshake::OVERHEAD + 16;
+const VERDICT_OK: u8 = 0;
+const VERDICT_FULL: u8 = 1;
+const VERDICT_REFUSED: u8 = 2;
+const VERDICT_CLOCK: u8 = 3;
 const T_DATA: u8 = 0xF4;
 const C_ASSIGN: u8 = 0xC0;
 const C_KEEPALIVE: u8 = 0xC1;
@@ -1862,11 +2117,84 @@ fn routine_leave(why: &str) -> bool {
 pub const MUX_HOST_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
 /// Prefix length of the tunnel network (10.7.0.0/16).
 pub const MUX_PREFIX: u8 = 16;
-/// How many past `cn`s the host remembers to refuse replayed JOINs.
-const SEEN_CN_CAP: usize = 8192;
+/// How many past `cn`s the host remembers to refuse replayed JOINs. A JOIN older than
+/// `handshake::JOIN_MAX_SKEW` is refused anyway, so the cache only has to span that time.
+const SEEN_CN_CAP: usize = 65536;
 /// Fewest slots one source address may hold (three quarters of the pool, at least this many):
 /// a household behind one NAT fits, yet one address never takes every slot.
 const MUX_MIN_PER_SOURCE: usize = 4;
+/// Unconfirmed joins one invite (each personal one, or the shared one) may hold at a time.
+const MUX_UNCONFIRMED_PER_INVITE: usize = 4;
+
+/// A join that came through a local sidecar (the loopback address, or the synthetic 240.0.0.0/8
+/// addresses a header-demuxed loopback carrier gives its clients): the real source is unknown.
+fn via_sidecar(a: SocketAddr) -> bool {
+    match a.ip().to_canonical() {
+        IpAddr::V4(v) => v.is_loopback() || v.octets()[0] == 240,
+        IpAddr::V6(v) => v.is_loopback(),
+    }
+}
+
+/// An unconfirmed join younger than this is never pushed out by another source's join: the
+/// round trip to confirm it fits well within it.
+const UNCONFIRMED_GRACE: Duration = Duration::from_secs(3);
+/// New join handshakes (key exchanges) one network may start per `JOIN_LIMIT_WINDOW`. Retries of
+/// a JOIN the host already answered cost nothing and are not counted.
+const JOIN_LIMIT: u32 = 20;
+const JOIN_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Per-network budget of new join handshakes, so a flood of JOINs cannot tie up the host.
+#[derive(Default)]
+struct JoinLimit {
+    at: HashMap<(IpAddr, u8), (Instant, u32)>,
+    /// Budget of everything that comes through a sidecar (at least `JOIN_LIMIT * 8`): every
+    /// client of a full host may rejoin at once, twice over.
+    sidecar: u32,
+}
+
+impl JoinLimit {
+    fn allow(&mut self, from: SocketAddr) -> bool {
+        let now = Instant::now();
+        if self.at.len() >= 4096 {
+            self.at.retain(|_, (t, _)| now.duration_since(*t) < JOIN_LIMIT_WINDOW);
+            if self.at.len() >= 4096 {
+                return false; // more networks at once than a host serves: wait for the window
+            }
+        }
+        // Everything through a sidecar shares one budget, a larger one.
+        let (key, limit) = if via_sidecar(from) {
+            ((IpAddr::V4(Ipv4Addr::LOCALHOST), 0), self.sidecar.max(JOIN_LIMIT * 8))
+        } else {
+            (source_net(from), JOIN_LIMIT)
+        };
+        let e = self.at.entry(key).or_insert((now, 0));
+        if now.duration_since(e.0) >= JOIN_LIMIT_WINDOW {
+            *e = (now, 0);
+        }
+        e.1 += 1;
+        e.1 <= limit
+    }
+}
+
+/// A refusal kept to answer retries of the same JOIN without a new key exchange.
+struct Refusal {
+    cn: [u8; 16],
+    to: SocketAddr,
+    dgram: Vec<u8>,
+    sent: Instant,
+}
+const REFUSALS_KEPT: usize = 64;
+
+/// The network a source counts against: its IPv4 address, or its IPv6 /64.
+fn source_net(a: SocketAddr) -> (IpAddr, u8) {
+    match a.ip().to_canonical() {
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            (IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)), 64)
+        }
+        v4 => (v4, 32),
+    }
+}
 /// How long a join may stay unconfirmed (no packet under the new session key yet). Longer than
 /// `MUX_KEEPALIVE`, so on a lossy path the client's regular keepalive still confirms it.
 const MUX_UNCONFIRMED_TTL: Duration = Duration::from_secs(20);
@@ -1891,7 +2219,7 @@ fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
 
 fn mux_base(psk: &str) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"strait-mux-v2");
+    h.update(b"strait-mux-v3");
     h.update(psk.as_bytes());
     h.finalize().into()
 }
@@ -1906,84 +2234,100 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Per-peer AEAD session. `host` selects the nonce direction bit.
-fn session_for(
-    base: &[u8; 32],
-    dh: &[u8; 32],
-    cn: &[u8],
-    hn: &[u8],
-    cpub: &[u8],
-    hpub: &[u8],
-    host: bool,
-) -> AeadSession {
-    let k = Zeroizing::new(hmac(base, &[b"strait-session-v2", dh, cn, hn, cpub, hpub]));
-    AeadSession::from_key(&k, host)
+fn join_dgram(base: &[u8; 32], cn: &[u8; 16], msg1: &[u8]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(JOIN_MAX);
+    d.push(T_JOIN);
+    d.extend_from_slice(cn);
+    d.extend_from_slice(msg1);
+    d.extend_from_slice(&tag(base, b"join", &[cn, msg1]));
+    d
 }
 
-/// Build a v2 JOIN datagram. Exposed for the handshake security tests.
+fn accept_dgram(base: &[u8; 32], cn: &[u8; 16], msg2: &[u8]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(ACCEPT_LEN);
+    d.push(T_ACCEPT);
+    d.extend_from_slice(cn);
+    d.extend_from_slice(msg2);
+    d.extend_from_slice(&tag(base, b"accept", &[cn, msg2]));
+    d
+}
+
+/// Message 2's payload.
+fn verdict_payload(slot: u16, cn: &[u8; 16], verdict: u8) -> Vec<u8> {
+    let mut p = slot.to_be_bytes().to_vec();
+    p.extend_from_slice(cn);
+    p.push(verdict);
+    p
+}
+
+/// A JOIN that passed the invite tag: (cn, Noise message 1).
+fn split_join(base: &[u8; 32], d: &[u8]) -> Option<([u8; 16], Vec<u8>)> {
+    if d.len() < JOIN_MIN || d.len() > JOIN_MAX || d[0] != T_JOIN {
+        return None;
+    }
+    let cn: [u8; 16] = d[1..17].try_into().unwrap();
+    let msg1 = &d[17..d.len() - 16];
+    ct_eq(&tag(base, b"join", &[&cn, msg1]), &d[d.len() - 16..]).then(|| (cn, msg1.to_vec()))
+}
+
+/// Client side: open an ACCEPT for handshake `hs` / nonce `cn`: (slot, verdict, session key).
+fn open_accept(base: &[u8; 32], hs: &mut handshake::ClientHs, cn: &[u8; 16], d: &[u8]) -> Option<(u16, u8, [u8; 32])> {
+    if d.len() != ACCEPT_LEN || d[0] != T_ACCEPT || d[1..17] != cn[..] {
+        return None;
+    }
+    let msg2 = &d[17..ACCEPT_LEN - 16];
+    if !ct_eq(&tag(base, b"accept", &[cn, msg2]), &d[ACCEPT_LEN - 16..]) {
+        return None;
+    }
+    let (p, key) = hs.finish(msg2).ok()?;
+    (p.len() == 19 && p[2..18] == cn[..]).then(|| (u16::from_be_bytes([p[0], p[1]]), p[18], key))
+}
+
+/// The handshake's pre-shared key for an invite key. Test helper.
 #[doc(hidden)]
-pub fn hs_join(invite_key: &str, cn: &[u8; 16], cpub: &[u8; 32]) -> Vec<u8> {
+pub fn hs_base(invite_key: &str) -> [u8; 32] {
+    mux_base(invite_key)
+}
+
+/// A JOIN datagram around an arbitrary handshake message (valid outer tag). Test helper.
+#[doc(hidden)]
+pub fn hs_join_raw(base: &[u8; 32], cn: &[u8; 16], msg1: &[u8]) -> Vec<u8> {
+    join_dgram(base, cn, msg1)
+}
+
+/// A client's JOIN and its handshake state, as a real client builds them (clock = now unless
+/// `at` is given). For the handshake security tests.
+#[doc(hidden)]
+pub fn hs_join_at(invite_key: &str, cn: &[u8; 16], auth: JoinAuth, at: Option<u32>) -> (handshake::ClientHs, Vec<u8>) {
     let base = mux_base(invite_key);
-    let mut d = vec![T_JOIN];
-    d.extend_from_slice(cn);
-    d.extend_from_slice(cpub);
-    d.extend_from_slice(&tag(&base, b"join", &[cn, cpub]));
-    d
+    let payload = handshake::join_payload(at.unwrap_or_else(handshake::now_secs), auth.token.as_ref());
+    let hs = handshake::ClientHs::new(&base, &auth.host_key.expect("test auth names a host key"), &payload).expect("handshake");
+    let d = join_dgram(&base, cn, &hs.msg1);
+    (hs, d)
 }
 
-/// Build a v2 ACCEPT datagram (what an honest host sends). Test helper.
 #[doc(hidden)]
-pub fn hs_accept(
-    invite_key: &str,
-    slot: u16,
-    (cn, hn): (&[u8; 16], &[u8; 16]),
-    (cpub, hpub): (&[u8; 32], &[u8; 32]),
-) -> Vec<u8> {
+pub fn hs_join(invite_key: &str, cn: &[u8; 16], auth: JoinAuth) -> (handshake::ClientHs, Vec<u8>) {
+    hs_join_at(invite_key, cn, auth, None)
+}
+
+/// Finish a client handshake from the host's ACCEPT: the slot and the session, if accepted.
+/// Test helper.
+#[doc(hidden)]
+pub fn hs_finish(invite_key: &str, hs: &mut handshake::ClientHs, cn: &[u8; 16], accept: &[u8]) -> Option<(u16, AeadSession)> {
+    let (slot, verdict, key) = open_accept(&mux_base(invite_key), hs, cn, accept)?;
+    (verdict == VERDICT_OK).then(|| (slot, AeadSession::from_key(&key, false)))
+}
+
+/// What a host holding `host_key` answers to `join`: the ACCEPT for `slot` and the host-side
+/// session. Test helper (a hand-made host).
+#[doc(hidden)]
+pub fn hs_accept(invite_key: &str, host_key: [u8; 32], slot: u16, join: &[u8]) -> Option<(Vec<u8>, AeadSession)> {
     let base = mux_base(invite_key);
-    let s = slot.to_be_bytes();
-    let mut d = vec![T_ACCEPT];
-    d.extend_from_slice(&s);
-    d.extend_from_slice(cn);
-    d.extend_from_slice(hn);
-    d.extend_from_slice(hpub);
-    d.extend_from_slice(&tag(&base, b"accept", &[&s, cn, cpub, hn, hpub]));
-    d
-}
-
-/// The v1 (no DH) JOIN datagram, for the old-version rejection test.
-#[doc(hidden)]
-pub fn hs_join_v1(invite_key: &str, cn: &[u8; 16]) -> Vec<u8> {
-    let mut h = Sha256::new();
-    h.update(b"strait-mux-v1");
-    h.update(invite_key.as_bytes());
-    let base: [u8; 32] = h.finalize().into();
-    let mut d = vec![0xF1];
-    d.extend_from_slice(cn);
-    d.extend_from_slice(&tag(&base, b"join", &[cn]));
-    d
-}
-
-/// Client side of the key derivation, from the values a participant holds.
-/// `dh` is the X25519 shared secret. Exposed for the handshake security tests.
-#[doc(hidden)]
-pub fn hs_session(
-    invite_key: &str,
-    dh: &[u8; 32],
-    cn: &[u8; 16],
-    hn: &[u8; 16],
-    cpub: &[u8; 32],
-    hpub: &[u8; 32],
-    host: bool,
-) -> AeadSession {
-    session_for(&mux_base(invite_key), dh, cn, hn, cpub, hpub, host)
-}
-
-/// A fresh ephemeral keypair, as a joining client generates. Test helper.
-#[doc(hidden)]
-pub fn hs_keypair() -> (EphemeralSecret, [u8; 32]) {
-    let s = EphemeralSecret::random();
-    let p = PublicKey::from(&s).to_bytes();
-    (s, p)
+    let (cn, msg1) = split_join(&base, join)?;
+    let (hs, _) = handshake::HostHs::read(&base, &host_key, &msg1).ok()?;
+    let (msg2, k) = hs.write(&verdict_payload(slot, &cn, VERDICT_OK)).ok()?;
+    Some((accept_dgram(&base, &cn, &msg2), AeadSession::from_key(&k, true)))
 }
 
 fn rand16() -> [u8; 16] {
@@ -2035,14 +2379,21 @@ pub fn tun_mtu() -> usize {
 /// Client-side handshake and liveness state of a [`Tunnel`] in mux mode.
 struct MuxClient {
     base: [u8; 32],
+    auth: JoinAuth,
+    /// Forward mode: one guest, no slot header, no ASSIGN.
+    forward: bool,
+    /// When `join` was made (its clock is renewed before it goes stale).
+    made: Instant,
     cn: [u8; 16],
-    /// Ephemeral X25519 secret, consumed by the (single) valid ACCEPT.
-    secret: Option<EphemeralSecret>,
-    cpub: [u8; 32],
+    /// Handshake state until the host's ACCEPT is read.
+    hs: Option<handshake::ClientHs>,
+    /// The JOIN datagram, identical on every retry.
+    join: Vec<u8>,
     slot: u16,
     joined: bool,
     assigned: Option<(Ipv4Addr, u8, Ipv4Addr)>,
-    rejected: bool,
+    /// The host's refusal (`REJECT_*`), once it sent one.
+    rejected: Option<u8>,
     bye: bool,
     last_rx: Instant,
     last_tx: Instant,
@@ -2051,24 +2402,37 @@ struct MuxClient {
 }
 
 impl MuxClient {
-    fn new(key: &str) -> Self {
-        let secret = EphemeralSecret::random();
-        let cpub = PublicKey::from(&secret).to_bytes();
-        Self {
+    fn new(key: &str, auth: JoinAuth, forward: bool) -> Self {
+        let mut m = Self {
             base: mux_base(key),
-            cn: rand16(),
-            secret: Some(secret),
-            cpub,
+            auth,
+            forward,
+            made: Instant::now(),
+            cn: [0; 16],
+            hs: None,
+            join: Vec::new(),
             slot: 0,
             joined: false,
             assigned: None,
-            rejected: false,
+            rejected: None,
             bye: false,
             last_rx: Instant::now(),
             last_tx: Instant::now(),
             keepalive: MUX_KEEPALIVE,
             idle: MUX_TIMEOUT,
-        }
+        };
+        m.restart();
+        m
+    }
+
+    /// A fresh handshake under a new nonce.
+    fn restart(&mut self) {
+        self.cn = rand16();
+        self.made = Instant::now();
+        let payload = handshake::join_payload(handshake::now_secs(), self.auth.token.as_ref());
+        // No host key (refused before this runs) or an invalid one: no JOIN at all.
+        self.hs = self.auth.host_key.and_then(|hk| handshake::ClientHs::new(&self.base, &hk, &payload).ok());
+        self.join = self.hs.as_ref().map(|hs| join_dgram(&self.base, &self.cn, &hs.msg1)).unwrap_or_default();
     }
 }
 
@@ -2152,9 +2516,12 @@ struct Peer {
     via: usize,
     ip: Ipv4Addr,
     cn: [u8; 16],
-    hn: [u8; 16],
+    /// The client's ephemeral key (start of its Noise message): tells a retry from a replay.
     cpub: [u8; 32],
-    hpub: [u8; 32],
+    /// The ACCEPT this join got, repeated for a retried JOIN.
+    accept: Vec<u8>,
+    /// The personal invite this peer joined with, if any.
+    guest: Option<u32>,
     crypto: AeadSession,
     last_rx: Instant,
     last_tx: Instant,
@@ -2192,6 +2559,19 @@ pub struct MuxConfig {
     pub shared: Vec<CarrierId>,
     /// Port spraying at client candidates (cone host <- symmetric client).
     pub birthday: Birthday,
+    /// The host's private key. `None`: derived from the invite key (an invite without a host key).
+    pub host_key: Option<[u8; 32]>,
+    /// Who may join beyond holding the invite.
+    pub guests: GuestPolicy,
+}
+
+/// Admission rules for personal invites. The default admits every invite holder.
+#[derive(Clone, Debug, Default)]
+pub struct GuestPolicy {
+    /// Refuse joins without a valid personal token (shared, so it can change while hosting).
+    pub require_token: Arc<AtomicBool>,
+    /// Ids of withdrawn personal invites (shared, so it can change while hosting).
+    pub revoked: Arc<std::sync::Mutex<HashSet<u32>>>,
 }
 
 /// Carriers handed to a [`MuxHost`].
@@ -2219,6 +2599,8 @@ impl Default for MuxConfig {
             carriers: IoList::default(),
             shared: Vec::new(),
             birthday: Birthday::default(),
+            host_key: None,
+            guests: GuestPolicy::default(),
         }
     }
 }
@@ -2227,6 +2609,10 @@ impl Default for MuxConfig {
 struct RvState {
     backends: Vec<Arc<dyn Rendezvous>>,
     key: [u8; 16],
+    /// Signs this host's records.
+    host_key: [u8; 32],
+    /// The identifier period the runner publishes under; a new day restarts it.
+    epoch: u32,
     v6: Option<std::net::Ipv6Addr>,
     /// Whether client candidates in IPv6 are worth firing at (this host routes IPv6).
     v6_route: bool,
@@ -2242,7 +2628,9 @@ impl RvState {
             p.abort();
         }
         log::info!("rendezvous: announcing {:?}", local);
-        let h = Runner::new(self.backends.clone()).start(RvCtx::new(self.key, Role::Host, local.clone()));
+        let ctx = RvCtx::new(self.key, Role::Host, local.clone()).with_keys(Some(self.host_key), None);
+        self.epoch = ctx.epoch;
+        let h = Runner::new(self.backends.clone()).start(ctx);
         self.publisher = Some(spawn_publisher("host", &h));
         self.handle = Some(h);
         self.local = local;
@@ -2254,7 +2642,8 @@ type PunchTarget = Target;
 
 #[derive(Clone, Debug)]
 pub enum MuxEvent {
-    Joined { id: usize, ip: Ipv4Addr, from: SocketAddr },
+    /// `guest`: the personal invite the client used, if any.
+    Joined { id: usize, ip: Ipv4Addr, from: SocketAddr, guest: Option<u32> },
     /// A validated IPv4 packet whose source is the peer's assigned address.
     Packet { id: usize, data: Vec<u8> },
     Left { id: usize, ip: Ipv4Addr, reason: &'static str },
@@ -2281,24 +2670,35 @@ pub struct MuxHost {
     dual: bool,
     oversize: DropCount,
     base: [u8; 32],
+    /// Private half of the host key; `token_key` derives from it.
+    host_key: [u8; 32],
+    token_key: [u8; 32],
     cfg: MuxConfig,
     pool: AddrPool,
     peers: Vec<Option<Peer>>,
     seen: HashSet<[u8; 16]>,
     seen_order: VecDeque<[u8; 16]>,
+    limit: JoinLimit,
+    refusals: VecDeque<Refusal>,
     events: VecDeque<MuxEvent>,
     signal: Option<SocketAddr>,
     room: u32,
+    /// The invite key when `room` derives from it: the room changes with the UTC day.
+    room_key: Option<String>,
     last_register: Instant,
     /// STUN servers poked to keep the mapping alive (and, with rendezvous, to learn it).
     stun: Vec<SocketAddr>,
-    /// The server whose answers are trusted for `mapped` once one has answered.
+    /// The server whose answers are trusted for `mapped` once two servers agreed.
     stun_pin: Option<SocketAddr>,
+    /// Answers so far, per server, until two servers agree on this host's public address.
+    stun_votes: HashMap<SocketAddr, SocketAddr>,
     mapped: Option<SocketAddr>,
     last_stun_poke: Instant,
     rv: Option<RvState>,
     punch: Vec<PunchTarget>,
     spray: Sprayer,
+    /// Addresses port-sprayed in the last hour (bounded, see `SPRAY_IPS_PER_HOUR`).
+    sprayed: std::collections::HashMap<IpAddr, Instant>,
     sent_bytes: u64,
     received_bytes: u64,
 }
@@ -2346,6 +2746,7 @@ impl MuxHost {
             log::warn!("signal server, STUN and rendezvous need the plain UDP carrier; skipped");
         }
         let pool = AddrPool::new(cfg.max_clients);
+        let sidecar_joins = pool.capacity() as u32 * 2;
         let mut host = Self {
             dead: ios.iter().map(|_| AtomicBool::new(false)).collect(),
             muted: ios.iter().map(|_| std::sync::Mutex::new(None)).collect(),
@@ -2358,25 +2759,33 @@ impl MuxHost {
             ios,
             dual,
             base: mux_base(key),
+            host_key: cfg.host_key.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the host needs its host key"))?,
+            token_key: [0; 32],
             peers: (0..pool.capacity()).map(|_| None).collect(),
             pool,
             signal: cfg.signal.filter(|_| udp_io.is_some()),
             room: relay::room_for_key(key),
+            room_key: Some(key.to_string()),
             last_register: Instant::now(),
             stun: Vec::new(),
             stun_pin: None,
+            stun_votes: HashMap::new(),
             mapped: None,
             last_stun_poke: Instant::now(),
             rv: None,
             punch: Vec::new(),
             spray: Sprayer::new(cfg.birthday.clone()),
+            sprayed: Default::default(),
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
+            limit: JoinLimit { sidecar: sidecar_joins, ..Default::default() },
+            refusals: VecDeque::new(),
             events: VecDeque::new(),
             sent_bytes: 0,
             received_bytes: 0,
             cfg,
         };
+        host.token_key = handshake::token_key(&host.host_key);
         if let Some(rv) = host.cfg.rv.clone().filter(|_| udp_io.is_some()) {
             let backends = match &rv.backends {
                 Some(b) => b.iter().filter(|b| b.id() != "sig").cloned().collect(),
@@ -2390,6 +2799,8 @@ impl MuxHost {
                     host.rv = Some(RvState {
                         backends,
                         key: kb,
+                        host_key: host.host_key,
+                        epoch: 0,
                         v6: if rv.no_v6 || !host.dual { None } else { global_v6() },
                         v6_route: host.dual && has_v6_route(),
                         local: Vec::new(),
@@ -2406,7 +2817,7 @@ impl MuxHost {
         }
         // Without a signal server the host keeps its mapping open with STUN; rendezvous also
         // needs the mapping itself, which the answers carry.
-        if udp_io.is_some() && ((host.signal.is_none() && host.cfg.stun) || host.rv.is_some()) {
+        if udp_io.is_some() && (host.cfg.stun || host.rv.is_some()) {
             host.stun = stun_servers().await;
             host.poke_stun().await;
         }
@@ -2432,9 +2843,15 @@ impl MuxHost {
 
     /// Fire at a client endpoint learned through a rendezvous method, so its JOIN passes this
     /// host's NAT filter. Repeats for a bounded time; a known peer address is ignored.
-    pub fn add_punch_target(&mut self, addr: SocketAddr) {
+    /// `verified`: the record came sealed with the invite key (an unsigned source such as a
+    /// tracker or a signal server could name any address, so it gets nothing).
+    pub fn add_punch_target(&mut self, addr: SocketAddr, verified: bool) {
         if !candidate_ok(addr) {
             log::debug!("rendezvous: client candidate {addr} is not a public address; ignored");
+            return;
+        }
+        if !verified {
+            log::debug!("rendezvous: client candidate {addr} came from an unsigned source; not punched");
             return;
         }
         if self.peers.iter().flatten().any(|p| p.addr == addr) {
@@ -2451,10 +2868,20 @@ impl MuxHost {
                 if self.punch.len() >= RV_MAX_TARGETS {
                     self.punch.remove(0);
                 }
-                self.punch.push(Target { addr, first: Instant::now(), last: None });
+                self.punch.push(Target { addr, verified, first: Instant::now(), last: None });
             }
         }
-        self.spray.add(addr, RV_HOST_PUNCH_TOTAL);
+        // Even sealed records can come from any invite holder: spray (thousands of packets per
+        // address) at a bounded number of distinct addresses per hour.
+        let now = Instant::now();
+        self.sprayed.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3600));
+        let ip = addr.ip().to_canonical();
+        if self.sprayed.contains_key(&ip) || self.sprayed.len() < SPRAY_IPS_PER_HOUR {
+            self.sprayed.entry(ip).or_insert(now);
+            self.spray.add(addr, RV_HOST_PUNCH_TOTAL);
+        } else {
+            log::info!("rendezvous: no port spray at {ip}: {SPRAY_IPS_PER_HOUR} addresses sprayed in the last hour");
+        }
     }
 
     /// Restart the runner when the mapping changed and turn new client candidates into punch targets.
@@ -2472,19 +2899,22 @@ impl MuxHost {
                     want.push(a);
                 }
             }
-            if rv.handle.is_none() || want != rv.local {
+            // shortcut: a guest whose clock is on the other side of midnight (UTC) than the host's
+            // misses this host until both agree; its connect loop retries. Publish under both days
+            // around midnight if that ever matters.
+            if rv.handle.is_none() || want != rv.local || rv.epoch != rendezvous::derive::epoch_now() {
                 rv.restart(want);
             }
         }
         if let Some(h) = self.rv.as_mut().and_then(|r| r.handle.as_mut()) {
             while let Some(c) = h.try_next() {
-                found.push(c.addr);
+                found.push((c.addr, c.verified));
             }
         }
         let v6_route = self.rv.as_ref().is_some_and(|r| r.v6_route);
-        for a in found {
+        for (a, verified) in found {
             if usable_family(a, v6_route) {
-                self.add_punch_target(a);
+                self.add_punch_target(a, verified);
             } else {
                 log::debug!("rendezvous: client candidate {a} skipped (no IPv6 route)");
             }
@@ -2590,6 +3020,10 @@ impl MuxHost {
     async fn register(&mut self) {
         if let (Some(signal), Some(u)) = (self.signal, self.udp_io) {
             self.last_register = Instant::now();
+            if let Some(room) = self.room_key.as_deref().map(relay::room_for_key).filter(|r| *r != self.room) {
+                let _ = self.ios[u].send_to(&relay::encode_deregister(self.room, 0), signal).await;
+                self.room = room; // a new UTC day: guests starting now look in the new room
+            }
             let _ = self.ios[u].send_to(&relay::encode_register(self.room, 0), signal).await;
         }
     }
@@ -2675,40 +3109,27 @@ impl MuxHost {
         self.send_sealed(slot, &plain).await;
     }
 
-    async fn send_accept(
-        &mut self,
-        slot: usize,
-        (cn, hn): (&[u8; 16], &[u8; 16]),
-        (cpub, hpub): (&[u8; 32], &[u8; 32]),
-        to: SocketAddr,
-        via: usize,
-    ) {
-        let s = (slot as u16).to_be_bytes();
-        let mut d = Vec::with_capacity(83);
-        d.push(T_ACCEPT);
-        d.extend_from_slice(&s);
-        d.extend_from_slice(cn);
-        d.extend_from_slice(hn);
-        d.extend_from_slice(hpub);
-        d.extend_from_slice(&tag(&self.base, b"accept", &[&s, cn, cpub, hn, hpub]));
-        self.raw_send(&d, to, via).await;
-    }
-
     /// True when `d` is a JOIN authenticated with the invite key (whatever came of it).
     async fn handle_join(&mut self, d: &[u8], from: SocketAddr, via: usize) -> bool {
-        if d.len() != 65 {
-            return false;
-        }
-        let cn: [u8; 16] = d[1..17].try_into().unwrap();
-        let cpub: [u8; 32] = d[17..49].try_into().unwrap();
-        if !ct_eq(&tag(&self.base, b"join", &[&cn, &cpub]), &d[49..65]) {
-            return false;
-        }
-        self.join_authenticated(cn, cpub, from, via).await;
+        let Some((cn, msg1)) = split_join(&self.base, d) else { return false };
+        self.join_authenticated(cn, &msg1, from, via).await;
         true
     }
 
-    async fn join_authenticated(&mut self, cn: [u8; 16], cpub: [u8; 32], from: SocketAddr, via: usize) {
+    /// Answer a refused join. The refusal is Noise message 2, so only this host can send it.
+    async fn refuse(&mut self, hs: handshake::HostHs, cn: &[u8; 16], verdict: u8, to: SocketAddr, via: usize) {
+        if let Ok((msg2, _)) = hs.write(&verdict_payload(0, cn, verdict)) {
+            let d = accept_dgram(&self.base, cn, &msg2);
+            self.raw_send(&d, to, via).await;
+            if self.refusals.len() >= REFUSALS_KEPT {
+                self.refusals.pop_front();
+            }
+            self.refusals.push_back(Refusal { cn: *cn, to, dgram: d, sent: Instant::now() });
+        }
+    }
+
+    async fn join_authenticated(&mut self, cn: [u8; 16], msg1: &[u8], from: SocketAddr, via: usize) {
+        let cpub: [u8; 32] = msg1[..32].try_into().unwrap();
         // Duplicate JOIN from the peer's own address: repeat ACCEPT + ASSIGN.
         // A JOIN for a known cn from elsewhere is a replay; ignore it.
         if let Some(slot) = (0..self.peers.len())
@@ -2716,63 +3137,115 @@ impl MuxHost {
         {
             let p = self.peers[slot].as_ref().unwrap();
             if p.addr == from && p.via == via && p.cpub == cpub {
-                let (hn, hpub) = (p.hn, p.hpub);
-                self.send_accept(slot, (&cn, &hn), (&cpub, &hpub), from, via).await;
+                let accept = p.accept.clone();
+                self.raw_send(&accept, from, via).await;
                 self.send_assign(slot).await;
             }
             return;
         }
         if self.seen.contains(&cn) {
+            // A retry of a refused JOIN gets the same refusal (at most once a second, only to
+            // where the first went); any other known JOIN is a replay and gets nothing.
+            if let Some(r) = self.refusals.iter_mut().find(|r| r.cn == cn && r.to == from) {
+                if r.sent.elapsed() >= Duration::from_secs(1) {
+                    r.sent = Instant::now();
+                    let d = r.dgram.clone();
+                    self.raw_send(&d, from, via).await;
+                }
+            }
             return;
         }
-        // One source may hold a bounded share of the slots (loopback, i.e. tests and labs, exempt).
-        let src = from.ip().to_canonical();
+        if !self.limit.allow(from) {
+            log::debug!("join from {from} ignored: too many new joins from its network");
+            return;
+        }
+        let Ok((hs, payload)) = handshake::HostHs::read(&self.base, &self.host_key, msg1) else {
+            log::debug!("join from {from}: the handshake message does not open (another host key, or damaged)");
+            return;
+        };
+        // Remembered before any verdict: a recorded JOIN, fresh or stale, costs one key exchange.
+        self.remember_cn(cn);
+        let Some((ts, token)) = handshake::parse_join_payload(&payload) else { return };
+        let now = handshake::now_secs();
+        if !handshake::fresh(ts, now) {
+            // A replay, or a client with a wrong clock.
+            log::info!("refused {from}: its clock is off by more than {} s", handshake::JOIN_MAX_SKEW);
+            return self.refuse(hs, &cn, VERDICT_CLOCK, from, via).await;
+        }
+        // Personal invite: who is this, and may they still come in?
+        let guest = if token.is_empty() {
+            None
+        } else {
+            match handshake::verify(&self.token_key, token, now) {
+                Ok(t) if !self.cfg.guests.revoked.lock().unwrap().contains(&t.id) => Some(t.id),
+                r => {
+                    log::info!("refused {from}: personal invite {}", match r {
+                        Ok(_) => "was withdrawn",
+                        Err(handshake::TokenError::Expired) => "has expired",
+                        Err(_) => "is not one of this host's",
+                    });
+                    return self.refuse(hs, &cn, VERDICT_REFUSED, from, via).await;
+                }
+            }
+        };
+        if guest.is_none() && self.cfg.guests.require_token.load(Ordering::Relaxed) {
+            log::info!("refused {from}: this host only takes personal invites");
+            return self.refuse(hs, &cn, VERDICT_REFUSED, from, via).await;
+        }
+        // One network (an IPv4 address, an IPv6 /64) may hold a bounded share of the slots
+        // (sidecar joins have no known network and are not capped here).
+        let src = source_net(from);
+        let sidecar = via_sidecar(from);
+        let same = move |a: SocketAddr| if sidecar { a == from } else { source_net(a) == src };
         let cap = (self.pool.capacity() * 3 / 4).max(MUX_MIN_PER_SOURCE);
-        let held = |s: &Self| s.peers.iter().flatten().filter(|p| p.addr.ip().to_canonical() == src).count();
-        while !src.is_loopback() && held(self) >= cap {
-            if !self.drop_unconfirmed(Some(src)) {
-                log::info!("rejected {from}: too many slots for one address");
-                return;
+        let held = |s: &Self| s.peers.iter().flatten().filter(|p| source_net(p.addr) == src).count();
+        while !sidecar && held(self) >= cap {
+            if !self.drop_unconfirmed(|p| source_net(p.addr) == src) {
+                log::info!("rejected {from}: too many slots for one network");
+                return self.refuse(hs, &cn, VERDICT_FULL, from, via).await;
             }
         }
-        // Unconfirmed joins never keep a real client out: a full host frees the oldest first.
-        // A restarted client on the same address replaces its old slot once its first packet
+        // Each source holds a few unconfirmed joins per invite; its own oldest makes room.
+        let mine = move |p: &Peer| !p.confirmed && p.guest == guest && same(p.addr);
+        while self.peers.iter().flatten().filter(|p| mine(p)).count() >= MUX_UNCONFIRMED_PER_INVITE && self.drop_unconfirmed(mine) {}
+        // A full host frees an unconfirmed slot: this source's own, or one past its grace time,
+        // so nobody can push out another source's join before it had the time to confirm. A
+        // restarted client on the same address replaces its old slot once its first packet
         // confirms (see `confirm`), so a replayed JOIN cannot evict a bystander.
         let mut alloc = self.pool.alloc();
-        if alloc.is_none() && self.drop_unconfirmed(None) {
+        if alloc.is_none() && self.drop_unconfirmed(|p| same(p.addr) || p.since.elapsed() >= UNCONFIRMED_GRACE) {
             alloc = self.pool.alloc();
         }
         let Some((slot, ip)) = alloc else {
-            let mut r = Vec::with_capacity(33);
-            r.push(T_REJECT);
-            r.extend_from_slice(&cn);
-            r.extend_from_slice(&tag(&self.base, b"reject", &[&cn]));
-            self.raw_send(&r, from, via).await;
+            if self.peers.iter().flatten().any(|p| !p.confirmed) {
+                // Busy with other sources' fresh joins: no answer and no memory of this one, so
+                // the client's next retry is taken once a slot confirms or passes its grace time.
+                self.seen.remove(&cn);
+                self.seen_order.retain(|c| *c != cn);
+                log::debug!("join from {from} deferred: every free slot holds a fresh unconfirmed join");
+                return;
+            }
             log::info!("rejected {from}: host is full");
-            return;
+            return self.refuse(hs, &cn, VERDICT_FULL, from, via).await;
         };
-        let hsecret = EphemeralSecret::random();
-        let hpub = PublicKey::from(&hsecret).to_bytes();
-        let dh = hsecret.diffie_hellman(&PublicKey::from(cpub));
-        if !dh.was_contributory() {
+        let Ok((msg2, key)) = hs.write(&verdict_payload(slot as u16, &cn, VERDICT_OK)) else {
             self.pool.free(slot);
             return;
-        }
-        self.remember_cn(cn);
+        };
         log::info!(
             "join request from {from}{}",
             if self.punch.iter().any(|t| t.addr == from) { "" } else { " (not an announced candidate: the client's NAT maps this destination to another port)" }
         );
-        let hn = rand16();
+        let accept = accept_dgram(&self.base, &cn, &msg2);
         self.peers[slot] = Some(Peer {
             addr: from,
             via,
             ip,
             cn,
-            hn,
             cpub,
-            hpub,
-            crypto: session_for(&self.base, dh.as_bytes(), &cn, &hn, &cpub, &hpub, true),
+            accept: accept.clone(),
+            guest,
+            crypto: AeadSession::from_key(&key, true),
             last_rx: Instant::now(),
             last_tx: Instant::now(),
             rx: Bucket::new(self.cfg.rate_bytes),
@@ -2780,8 +3253,26 @@ impl MuxHost {
             since: Instant::now(),
             confirmed: false,
         });
-        self.send_accept(slot, (&cn, &hn), (&cpub, &hpub), from, via).await;
+        self.raw_send(&accept, from, via).await;
         self.send_assign(slot).await;
+    }
+
+    /// Disconnect a client now (the host's "remove" button). It may join again unless its
+    /// personal invite is also withdrawn.
+    pub async fn kick(&mut self, slot: usize) {
+        if self.peers.get(slot).is_some_and(|p| p.is_some()) {
+            self.send_sealed(slot, &[C_BYE]).await;
+            self.evict(slot, "removed by the host");
+        }
+    }
+
+    /// Disconnect every client that joined with personal invite `id`.
+    pub async fn kick_guest(&mut self, id: u32) {
+        for slot in 0..self.peers.len() {
+            if self.peers[slot].as_ref().is_some_and(|p| p.guest == Some(id)) {
+                self.kick(slot).await;
+            }
+        }
     }
 
     /// First packet under the new session key: the join is real. Announce it, and let it replace
@@ -2789,22 +3280,20 @@ impl MuxHost {
     fn confirm(&mut self, slot: usize) {
         let Some(p) = self.peers[slot].as_mut() else { return };
         p.confirmed = true;
-        let (ip, from, via) = (p.ip, p.addr, p.via);
+        let (ip, from, via, guest) = (p.ip, p.addr, p.via, p.guest);
         if let Some(old) = (0..self.peers.len()).find(|&i| {
             i != slot && self.peers[i].as_ref().is_some_and(|q| q.confirmed && q.addr == from && q.via == via)
         }) {
             self.evict(old, "replaced by a new join");
         }
         log::info!("client {from} joined as {ip} via {}", self.ios[via].caps().id);
-        self.events.push_back(MuxEvent::Joined { id: slot, ip, from });
+        self.events.push_back(MuxEvent::Joined { id: slot, ip, from, guest });
     }
 
     /// Free the oldest unconfirmed slot (of source `ip` when given). True when one was freed.
-    fn drop_unconfirmed(&mut self, ip: Option<std::net::IpAddr>) -> bool {
+    fn drop_unconfirmed(&mut self, which: impl Fn(&Peer) -> bool) -> bool {
         let oldest = (0..self.peers.len())
-            .filter(|&i| {
-                self.peers[i].as_ref().is_some_and(|p| !p.confirmed && ip.is_none_or(|a| p.addr.ip().to_canonical() == a))
-            })
+            .filter(|&i| self.peers[i].as_ref().is_some_and(|p| !p.confirmed && which(p)))
             .min_by_key(|&i| self.peers[i].as_ref().map(|p| p.since));
         oldest.is_some_and(|i| {
             self.evict(i, "unconfirmed");
@@ -2892,7 +3381,7 @@ impl MuxHost {
             }
             self.received_bytes += len as u64;
             if self.udp_io == Some(via) && Some(from) == self.signal {
-                if let Some(relay::Incoming::Peer { role: 1, addr }) = relay::decode(&buf[..len]) {
+                if let Some(relay::Incoming::Peer { role: 1, addr }) = relay::decode_for(self.room, &buf[..len]) {
                     let known = self.peers.iter().flatten().any(|p| p.addr == addr);
                     if !known && candidate_ok(addr) {
                         if let Some(v) = self.punch_io {
@@ -2911,11 +3400,21 @@ impl MuxHost {
                 {
                     let m = crate::tunnel::stun::mapped_from_response(&buf[..len]);
                     if let Some(m) = m {
-                        self.stun_pin = Some(from);
-                        if self.mapped != Some(m) {
-                            log::info!("STUN mapping of the host socket: {m}");
+                        if self.stun_pin.is_none() {
+                            self.stun_votes.insert(from, m);
                         }
-                        self.mapped = Some(m);
+                        // The address this host signs and every guest scans: one server's word
+                        // is not enough unless it is the only one configured.
+                        if self.stun_pin.is_some() || stun_agreed(&self.stun_votes, m, self.stun.len()) {
+                            self.stun_pin = Some(from);
+                            self.stun_votes.clear();
+                            if self.mapped != Some(m) {
+                                log::info!("STUN mapping of the host socket: {m}");
+                            }
+                            self.mapped = Some(m);
+                            // A guest must not reach the router's own services or its port forwards.
+                            crate::userspace::note_public_addr(m.ip());
+                        }
                     }
                     m.is_some()
                 }
@@ -2990,6 +3489,9 @@ impl MuxHost {
             self.was_down[i] = down;
         }
         let (keepalive, timeout) = (self.cfg.keepalive, self.cfg.timeout);
+        for p in self.peers.iter_mut().flatten() {
+            p.crypto.age();
+        }
         for slot in 0..self.peers.len() {
             let Some(p) = self.peers[slot].as_ref() else { continue };
             if !p.confirmed {
@@ -3165,6 +3667,89 @@ fn dual_socket(port: u16) -> io::Result<(socket2::Socket, bool)> {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
+    /// Unsigned targets are capped and never push out a signed one; a signed record upgrades an
+    /// address an unsigned source reported first.
+    #[test]
+    fn unsigned_targets_are_capped_and_signed_ones_stay() {
+        let mut t = Vec::new();
+        add_target(&mut t, "198.51.100.1:5000".parse().unwrap(), true);
+        for i in 0..100u16 {
+            add_target(&mut t, format!("203.0.113.9:{}", 1000 + i).parse().unwrap(), false);
+        }
+        assert_eq!(t.iter().filter(|x| !x.verified).count(), RV_MAX_UNVERIFIED);
+        assert!(t.iter().any(|x| x.verified && x.addr.port() == 5000));
+        add_target(&mut t, "203.0.113.9:1099".parse().unwrap(), true);
+        assert!(t.iter().any(|x| x.verified && x.addr.port() == 1099), "upgraded in place");
+    }
+
+    /// Forward mode serves one guest: another address cannot take a live session over, and the
+    /// host's personal-invite rules apply there too.
+    #[test]
+    fn forward_host_keeps_a_live_session_and_applies_guest_rules() {
+        let key = "fwd-takeover-test-key";
+        let mut h = FwdHost::new(key, Some(TEST_HOST_KEY), GuestPolicy::default());
+        let (a, b): (SocketAddr, SocketAddr) = ("203.0.113.1:1000".parse().unwrap(), "198.51.100.2:2000".parse().unwrap());
+        let verdict = |hs: &mut handshake::ClientHs, cn: &[u8; 16], reply: &[u8]| open_accept(&mux_base(key), hs, cn, reply).unwrap().1;
+        let (_, ja) = hs_join(key, &rand16(), JoinAuth::test());
+        assert!(h.join(&ja, a).unwrap().1.is_some());
+        h.heard(a);
+        let cn = rand16();
+        let (mut hb, jb) = hs_join(key, &cn, JoinAuth::test());
+        let (reply, k) = h.join(&jb, b).unwrap();
+        assert!(k.is_none());
+        assert_eq!(verdict(&mut hb, &cn, &reply), VERDICT_FULL, "another address while the session is live");
+        let (_, ja2) = hs_join(key, &rand16(), JoinAuth::test());
+        assert!(h.join(&ja2, "203.0.113.1:1001".parse().unwrap()).unwrap().1.is_some(), "the same guest restarting");
+        h.guest = Some((a, Instant::now() - FWD_TAKEOVER_AFTER));
+        let (_, jc) = hs_join(key, &rand16(), JoinAuth::test());
+        assert!(h.join(&jc, b).unwrap().1.is_some(), "after the guest went quiet");
+        // Personal invites only: the shared invite is refused.
+        let mut strict = FwdHost::new(key, Some(TEST_HOST_KEY), GuestPolicy { require_token: Arc::new(true.into()), ..Default::default() });
+        let cn = rand16();
+        let (mut hs, j) = hs_join(key, &cn, JoinAuth::test());
+        let (reply, k) = strict.join(&j, a).unwrap();
+        assert!(k.is_none());
+        assert_eq!(verdict(&mut hs, &cn, &reply), VERDICT_REFUSED);
+    }
+
+    /// A recorded JOIN, however old, costs the host one key exchange: its nonce is remembered
+    /// before the verdict, and a replay from elsewhere gets nothing.
+    #[tokio::test]
+    async fn a_stale_join_is_answered_once() {
+        let key = "stale-join-test-key";
+        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), host_key: Some(TEST_HOST_KEY), ..Default::default() }).await.unwrap();
+        let cn = rand16();
+        let (hs, _) = hs_join_at(key, &cn, JoinAuth::test(), Some(handshake::now_secs() - 3600));
+        let from: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        h.join_authenticated(cn, &hs.msg1, from, 0).await;
+        assert!(h.seen.contains(&cn) && h.refusals.len() == 1);
+        h.join_authenticated(cn, &hs.msg1, "198.51.100.1:9".parse().unwrap(), 0).await;
+        h.join_authenticated(cn, &hs.msg1, from, 0).await;
+        assert_eq!(h.refusals.len(), 1, "no second key exchange");
+        assert_eq!(h.peer_count(), 0);
+    }
+
+    #[test]
+    fn a_guest_needs_a_usable_host_key() {
+        assert_eq!(check_host_key(&JoinAuth::default()), Err(NO_HOST_KEY));
+        let bad = JoinAuth { host_key: Some([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), ..Default::default() };
+        assert_eq!(check_host_key(&bad), Err(BAD_HOST_KEY), "a low-order point");
+        assert_eq!(check_host_key(&JoinAuth::test()), Ok(()));
+    }
+
+    #[test]
+    fn a_stun_mapping_needs_two_servers_unless_one_is_configured() {
+        let s = |a: &str| -> SocketAddr { a.parse().unwrap() };
+        let mut v = HashMap::new();
+        v.insert(s("192.0.2.1:3478"), s("203.0.113.5:4000"));
+        assert!(!stun_agreed(&v, s("203.0.113.5:4000"), 3), "one server's word");
+        assert!(stun_agreed(&v, s("203.0.113.5:4000"), 1), "the only configured server");
+        v.insert(s("192.0.2.2:3478"), s("198.51.100.9:4000"));
+        assert!(!stun_agreed(&v, s("198.51.100.9:4000"), 3), "two servers disagree");
+        v.insert(s("192.0.2.3:3478"), s("203.0.113.5:4001"));
+        assert!(stun_agreed(&v, s("203.0.113.5:4001"), 3), "same IP from two servers (port may differ)");
+    }
+
     #[test]
     fn own_public_announce_is_ignored_but_lan_and_others_are_not() {
         let own: Vec<IpAddr> = vec!["203.0.113.7".parse().unwrap()];
@@ -3181,12 +3766,13 @@ mod tests {
     #[tokio::test]
     async fn slots_per_source_address_are_capped() {
         let key = "per-source-cap-test-key";
-        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), max_clients: 8, ..Default::default() })
+        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), max_clients: 8, host_key: Some(TEST_HOST_KEY), ..Default::default() })
             .await
             .unwrap();
         async fn join(h: &mut MuxHost, from: &str) -> Option<usize> {
-            let (cn, (_, cpub)) = (rand16(), hs_keypair());
-            h.join_authenticated(cn, cpub, from.parse().unwrap(), 0).await;
+            let cn = rand16();
+            let (hs, _) = hs_join("per-source-cap-test-key", &cn, JoinAuth::test());
+            h.join_authenticated(cn, &hs.msg1, from.parse().unwrap(), 0).await;
             h.peers.iter().position(|p| p.as_ref().is_some_and(|p| p.cn == cn))
         }
         let mut slots = vec![];
@@ -3202,8 +3788,15 @@ mod tests {
         let a = join(&mut h, "203.0.113.7:3000").await.expect("freed slot");
         let b = join(&mut h, "203.0.113.7:3001").await.expect("replaces the unconfirmed one");
         assert!(h.peers[a].is_none() || a == b, "oldest unconfirmed was dropped");
-        // Loopback (tests, labs) is exempt.
-        for i in 0..3 {
+        // Loopback (a sidecar) is exempt from the per-network cap. The pool is now full, and a
+        // fresh unconfirmed join of another source is not pushed out within its grace time...
+        assert!(join(&mut h, "127.0.0.1:4000").await.is_some(), "the last free slot");
+        assert!(join(&mut h, "127.0.0.1:4001").await.is_none(), "others' fresh joins stay");
+        // ...but once past it, it gives way.
+        for p in h.peers.iter_mut().flatten() {
+            p.since -= UNCONFIRMED_GRACE;
+        }
+        for i in 2..4 {
             assert!(join(&mut h, &format!("127.0.0.1:{}", 4000 + i)).await.is_some());
         }
     }
@@ -3325,16 +3918,14 @@ mod tests {
         assert_eq!(AddrPool::slot_of(Ipv4Addr::new(192, 168, 0, 5)), None);
     }
 
-    /// One simulated join: returns (client session, host session, wire values).
-    fn join(base: &[u8; 32]) -> (AeadSession, AeadSession, [u8; 16], [u8; 16], [u8; 32], [u8; 32]) {
-        let (cn, hn) = (rand16(), rand16());
-        let (cs, hs) = (EphemeralSecret::random(), EphemeralSecret::random());
-        let (cpub, hpub) = (PublicKey::from(&cs).to_bytes(), PublicKey::from(&hs).to_bytes());
-        let dh_c = cs.diffie_hellman(&PublicKey::from(hpub));
-        let dh_h = hs.diffie_hellman(&PublicKey::from(cpub));
-        let c = session_for(base, dh_c.as_bytes(), &cn, &hn, &cpub, &hpub, false);
-        let h = session_for(base, dh_h.as_bytes(), &cn, &hn, &cpub, &hpub, true);
-        (c, h, cn, hn, cpub, hpub)
+    /// One simulated join through the real handshake: (client session, host session, JOIN, ACCEPT).
+    fn join(key: &str) -> (AeadSession, AeadSession, Vec<u8>, Vec<u8>) {
+        let cn = rand16();
+        let (mut hs, j) = hs_join(key, &cn, JoinAuth::test());
+        let (accept, h) = hs_accept(key, TEST_HOST_KEY, 3, &j).expect("host answers");
+        let (slot, c) = hs_finish(key, &mut hs, &cn, &accept).expect("client finishes");
+        assert_eq!(slot, 3);
+        (c, h, j, accept)
     }
 
     #[test]
@@ -3356,9 +3947,8 @@ mod tests {
 
     #[test]
     fn peer_sessions_are_isolated() {
-        let base = mux_base("invite-key");
-        let (mut client_a, mut host_a, ..) = join(&base);
-        let (mut client_b, mut host_b, ..) = join(&base);
+        let (mut client_a, mut host_a, ..) = join("invite-key");
+        let (mut client_b, mut host_b, ..) = join("invite-key");
 
         let from_a = client_a.seal(b"secret of A");
         assert_eq!(host_b.open(&from_a), Err(CryptoError::BadTag), "B cannot read A");
@@ -3370,29 +3960,36 @@ mod tests {
         assert_eq!(client_b.open(&to_b).unwrap().0, b"for B");
     }
 
+    /// Mallory has the invite and a full capture of A's handshake, but not the host key: she
+    /// cannot even read A's JOIN, let alone answer it.
     #[test]
     fn invite_holder_with_full_capture_cannot_derive_peer_key() {
-        let base = mux_base("invite-key");
-        let (mut client_a, mut host_a, cn, hn, cpub, hpub) = join(&base);
+        let (mut client_a, mut host_a, join_a, _accept_a) = join("invite-key");
         let sealed = client_a.seal(b"secret of A");
-        // Mallory has the invite key and every public handshake value; the best
-        // she can do is her own DH secret or a guessed one.
-        let mal = EphemeralSecret::random();
-        let dh_guess = mal.diffie_hellman(&PublicKey::from(hpub));
-        for dh in [dh_guess.as_bytes(), &[0u8; 32], &cpub, &hpub] {
-            for host in [true, false] {
-                let mut m = session_for(&base, dh, &cn, &hn, &cpub, &hpub, host);
-                assert_eq!(m.open(&sealed), Err(CryptoError::BadTag));
-            }
-        }
+        assert!(hs_accept("invite-key", handshake::new_host_key(), 3, &join_a).is_none());
         assert_eq!(host_a.open(&sealed).unwrap().0, b"secret of A");
     }
 
     #[test]
     fn different_invite_key_derives_unrelated_session() {
-        let (mut c, ..) = join(&mux_base("invite-key"));
+        let (mut c, ..) = join("invite-key");
         let sealed = c.seal(b"x");
-        let (_, mut other_host, ..) = join(&mux_base("other-key"));
+        let (_, mut other_host, ..) = join("other-key");
         assert_eq!(other_host.open(&sealed), Err(CryptoError::BadTag));
+    }
+
+    /// An invite that names a host key: the invite alone no longer lets anyone answer as the host.
+    #[test]
+    fn an_invite_with_a_host_key_binds_the_host() {
+        let host = handshake::new_host_key();
+        let auth = JoinAuth { host_key: Some(handshake::public_of(&host)), ..Default::default() };
+        let cn = rand16();
+        let (mut hs, j) = hs_join("invite-key", &cn, auth);
+        // Another key (all an invite holder could have) cannot read the JOIN.
+        assert!(hs_accept("invite-key", TEST_HOST_KEY, 0, &j).is_none());
+        let (accept, mut h) = hs_accept("invite-key", host, 9, &j).expect("the real host answers");
+        let (slot, mut c) = hs_finish("invite-key", &mut hs, &cn, &accept).unwrap();
+        assert_eq!(slot, 9);
+        assert_eq!(h.open(&c.seal(b"hi")).unwrap().0, b"hi");
     }
 }

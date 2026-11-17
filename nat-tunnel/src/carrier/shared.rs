@@ -7,10 +7,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tokio::io::ReadBuf;
 use tokio::sync::Notify;
@@ -26,8 +26,9 @@ struct Q {
     waker: Option<Waker>,
 }
 
-/// Pre-authentication budget per source address: the carrier on top pays for cipher setup on
-/// every datagram, so addresses that never authenticated get a small token bucket.
+/// Pre-authentication budget per source IP (IPv6 per /64, what one subscriber usually gets): the
+/// carrier on top pays for cipher setup on every datagram, so sources that never authenticated
+/// get a small token bucket. Keyed by IP so one machine cannot take many slots with many ports.
 const GATE_BURST: f64 = 32.0;
 const GATE_PER_SEC: f64 = 8.0;
 const GATE_MAX_SOURCES: usize = 4096;
@@ -35,7 +36,14 @@ const GATE_MAX_SOURCES: usize = 4096;
 #[derive(Default)]
 struct Gate {
     known: HashSet<SocketAddr>,
-    buckets: HashMap<SocketAddr, (f64, Instant)>,
+    buckets: HashMap<IpAddr, (f64, Instant)>,
+}
+
+fn gate_key(a: SocketAddr) -> IpAddr {
+    match a.ip().to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (!0u128 << 64))),
+        v4 => v4,
+    }
 }
 
 impl Gate {
@@ -43,14 +51,16 @@ impl Gate {
         if self.known.contains(&from) {
             return true;
         }
-        if self.buckets.len() >= GATE_MAX_SOURCES && !self.buckets.contains_key(&from) {
-            // Idle buckets are full again: forgetting them loses nothing.
-            self.buckets.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(5));
-            if self.buckets.len() >= GATE_MAX_SOURCES {
-                return false;
-            }
+        let k = gate_key(from);
+        if self.buckets.len() >= GATE_MAX_SOURCES && !self.buckets.contains_key(&k) {
+            // Full: forget the least recently used half at once, so a flood of new sources costs
+            // O(1) amortized and never locks a new source out. A forgotten bucket comes back full,
+            // the same budget any new source gets.
+            let mut ts: Vec<Instant> = self.buckets.values().map(|b| b.1).collect();
+            let cut = *ts.select_nth_unstable(GATE_MAX_SOURCES / 2).1;
+            self.buckets.retain(|_, b| b.1 > cut);
         }
-        let b = self.buckets.entry(from).or_insert((GATE_BURST, now));
+        let b = self.buckets.entry(k).or_insert((GATE_BURST, now));
         b.0 = (b.0 + now.duration_since(b.1).as_secs_f64() * GATE_PER_SEC).min(GATE_BURST);
         b.1 = now;
         if b.0 < 1.0 {
@@ -64,7 +74,6 @@ impl Gate {
         if self.known.len() >= GATE_MAX_SOURCES {
             self.known.clear(); // shortcut: authenticated peers re-mark on their next valid packet
         }
-        self.buckets.remove(&a);
         self.known.insert(a);
     }
 }
@@ -189,18 +198,45 @@ impl FrameIo for Port {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn unauth_source_is_limited_known_is_not() {
         let mut g = Gate::default();
-        let (a, b): (SocketAddr, SocketAddr) = ("1.2.3.4:5".parse().unwrap(), "1.2.3.4:6".parse().unwrap());
+        let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = ("1.2.3.4:5".parse().unwrap(), "1.2.3.4:6".parse().unwrap(), "1.2.3.5:5".parse().unwrap());
         let t = Instant::now();
         let passed = (0..100).filter(|_| g.allow(a, t)).count();
         assert_eq!(passed, GATE_BURST as usize);
-        assert!(g.allow(b, t), "another port behind the same NAT is independent");
+        assert!(!g.allow(b, t), "another port of the same IP shares the budget");
+        assert!(g.allow(c, t), "another IP is independent");
         g.mark(a);
         assert!((0..100).all(|_| g.allow(a, t)), "an authenticated source is unaffected");
         assert!(g.allow(b, t + Duration::from_secs(10)), "bucket refills");
+    }
+
+    #[test]
+    fn ipv6_sources_share_a_bucket_per_64() {
+        let mut g = Gate::default();
+        let t = Instant::now();
+        let n = (0..100u16).filter(|i| g.allow(SocketAddr::from(([0x2001, 0xdb8, 0, 1, 0, 0, 0, *i], 9)), t)).count();
+        assert_eq!(n, GATE_BURST as usize);
+        assert!(g.allow("[2001:db8:0:2::1]:9".parse().unwrap(), t));
+        assert_eq!(gate_key("[::ffff:1.2.3.4]:5".parse().unwrap()), gate_key("1.2.3.4:6".parse().unwrap()));
+    }
+
+    #[test]
+    fn full_gate_evicts_least_recently_used_instead_of_refusing() {
+        let mut g = Gate::default();
+        let t = Instant::now();
+        for i in 0..(GATE_MAX_SOURCES as u32 - 1) {
+            g.allow(SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 1)), t);
+        }
+        // The busiest (most recent) source keeps its drained bucket across the eviction.
+        let (busy, t1) = ("192.0.2.1:1".parse().unwrap(), t + Duration::from_millis(1));
+        while g.allow(busy, t1) {}
+        assert!(g.allow("192.0.2.2:1".parse().unwrap(), t1), "a new source is admitted at the cap");
+        assert!(g.buckets.len() <= GATE_MAX_SOURCES);
+        assert!(!g.allow(busy, t1), "the recent bucket was not reset");
     }
 
     #[test]

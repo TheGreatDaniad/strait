@@ -27,7 +27,7 @@ async fn live_rendezvous_with_real_dht() {
     let cancel = CancellationToken::new();
     let c2 = cancel.clone();
     let t0 = Instant::now();
-    let h = tokio::spawn(async move { b.run(RvCtx::new(key, role, vec![mine.parse().unwrap()]), tx, c2).await });
+    let h = tokio::spawn(async move { b.run(RvCtx::new_test(key, role, vec![mine.parse().unwrap()]), tx, c2).await });
     let got = tokio::time::timeout(Duration::from_secs(75), rx.recv()).await;
     println!("LIVE role={role:?} found_after_ms={} got={:?}", t0.elapsed().as_millis(), got);
     cancel.cancel();

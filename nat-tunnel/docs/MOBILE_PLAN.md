@@ -103,7 +103,7 @@ roadmap are the same work grouped with the app shell.
 - Desktop host: WG -> kernel TUN + forwarding/NAT; restore guard as today.
 - Relay/hole-punch carries WG datagrams (direct or opaque relay).
 - Acceptance: Linux/macOS/Windows client + host transfer data with WG
-  end-to-end; relay fallback works; keys rotate; no plaintext leaks.
+  end-to-end; keys rotate; no plaintext leaks.
 
 ### M2 - Native stream layer + stream exit
 - `OPEN/DATA/CLOSE` framing inside the encrypted tunnel; multiple streams;

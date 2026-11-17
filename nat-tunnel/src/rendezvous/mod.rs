@@ -53,6 +53,9 @@ impl Role {
 pub struct Candidate {
     pub addr: SocketAddr,
     pub via: &'static str,
+    /// The record was sealed and, for a host, signed by the invite's host key. Unverified
+    /// candidates (trackers, a signal server) get JOINs but never a port scan or a fan-out.
+    pub verified: bool,
 }
 
 /// Reports live progress from a backend to the runner's status channel. Cloning is cheap; a
@@ -91,18 +94,46 @@ pub struct RvCtx {
     /// other method. A backend with a periodic publish should announce again right away (one
     /// permit, so at most one extra announce); ignoring it is always safe.
     pub nudge: Arc<tokio::sync::Notify>,
+    /// Host side: the host key (signs host records).
+    pub host_key: Option<[u8; 32]>,
+    /// Client side: the invite's `hk` (checks host records).
+    pub hk: Option<[u8; 32]>,
+    /// The identifier period this run publishes and polls under (fixed for one run).
+    pub epoch: u32,
 }
 
 impl RvCtx {
     pub fn new(key: [u8; 16], role: Role, local: Vec<SocketAddr>) -> Self {
-        Self { key, role, local, sock: None, status: StatusSink::default(), nudge: Arc::new(tokio::sync::Notify::new()) }
+        Self {
+            key,
+            role,
+            local,
+            sock: None,
+            status: StatusSink::default(),
+            nudge: Arc::new(tokio::sync::Notify::new()),
+            host_key: None,
+            hk: None,
+            epoch: derive::epoch_now(),
+        }
+    }
+    /// [`RvCtx::new`] with both halves of the fixed test host key, for tests and labs.
+    #[doc(hidden)]
+    pub fn new_test(key: [u8; 16], role: Role, local: Vec<SocketAddr>) -> Self {
+        let k = crate::transport::TEST_HOST_KEY;
+        Self::new(key, role, local).with_keys(Some(k), Some(crate::tunnel::handshake::public_of(&k)))
+    }
+    /// The host key (host side) or the invite's `hk` (client side).
+    pub fn with_keys(mut self, host_key: Option<[u8; 32]>, hk: Option<[u8; 32]>) -> Self {
+        self.host_key = host_key;
+        self.hk = hk;
+        self
     }
     pub fn with_sock(mut self, sock: Arc<UdpSocket>) -> Self {
         self.sock = Some(sock);
         self
     }
     pub fn derived(&self) -> derive::Derived {
-        derive::Derived::new(&self.key)
+        derive::Derived::for_epoch(&self.key, self.epoch).with_host(self.host_key, self.hk)
     }
 }
 

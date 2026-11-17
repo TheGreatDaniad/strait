@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -100,6 +100,27 @@ struct Http {
     port: u16,
     prefix: String,
     t: Timing,
+}
+
+/// Longest status, header or chunk-size line accepted, so a hostile server cannot grow one forever.
+const MAX_LINE: u64 = 8 << 10;
+/// Longest JSON message line kept while waiting for its newline (ntfy caps a message at 4 KB).
+const MAX_BODY_LINE: usize = 64 << 10;
+
+/// `read_line` that fails on a line longer than [`MAX_LINE`] instead of buffering it.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(r: &mut R, line: &mut String) -> io::Result<()> {
+    let mut v = Vec::new();
+    (&mut *r).take(MAX_LINE).read_until(b'\n', &mut v).await?;
+    if v.len() as u64 >= MAX_LINE && !v.ends_with(b"\n") {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "line too long"));
+    }
+    line.push_str(&String::from_utf8_lossy(&v));
+    Ok(())
+}
+
+/// ntfy message ids are short alphanumeric strings; anything else must not reach a request line.
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 fn blocked(e: impl std::fmt::Display) -> RvError {
@@ -180,12 +201,12 @@ impl Http {
         let mut r = BufReader::new(io);
         let head = async {
             let mut line = String::new();
-            r.read_line(&mut line).await?;
+            read_line_capped(&mut r, &mut line).await?;
             let status: u16 = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad status line"))?;
             let (mut retry_after, mut chunked, mut len) = (None, false, None);
             for _ in 0..64 {
                 line.clear();
-                r.read_line(&mut line).await?;
+                read_line_capped(&mut r, &mut line).await?;
                 let l = line.trim();
                 if l.is_empty() {
                     return Ok::<_, io::Error>((status, retry_after, chunked, len));
@@ -236,7 +257,7 @@ impl Body {
             Mode::Done => Ok(None),
             Mode::Chunked => {
                 let mut l = String::new();
-                self.r.read_line(&mut l).await?;
+                read_line_capped(&mut self.r, &mut l).await?;
                 let n = usize::from_str_radix(l.trim().split(';').next().unwrap_or(""), 16)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk size"))?;
                 if n == 0 {
@@ -409,7 +430,7 @@ async fn subscriber(h: &Http, ctx: &RvCtx, topic: &str, tx: &mpsc::Sender<Candid
                         if v["event"] != "message" {
                             continue;
                         }
-                        if let Some(id) = v["id"].as_str() {
+                        if let Some(id) = v["id"].as_str().filter(|id| valid_id(id)) {
                             since = id.to_string();
                         }
                         let Some(blob) = v["message"].as_str().and_then(b64_dec) else { continue };
@@ -417,13 +438,13 @@ async fn subscriber(h: &Http, ctx: &RvCtx, topic: &str, tx: &mpsc::Sender<Candid
                         for addr in addrs {
                             if seen.insert(addr) {
                                 sh.got_peer.store(true, Ordering::Relaxed);
-                                if tx.send(Candidate { addr, via: "ntfy" }).await.is_err() {
+                                if tx.send(Candidate { addr, via: "ntfy", verified: true }).await.is_err() {
                                     return Ok(());
                                 }
                             }
                         }
                     }
-                    if buf.len() > 1 << 20 {
+                    if buf.len() > MAX_BODY_LINE {
                         buf.clear();
                     }
                 }
@@ -524,6 +545,24 @@ mod tests {
         assert_eq!(b64_enc(b"Man"), "TWFu");
         assert_eq!(b64_enc(b"Ma"), "TWE=");
         assert!(b64_dec("a!b").is_none());
+    }
+    #[tokio::test]
+    async fn lines_are_capped() {
+        let mut line = String::new();
+        let mut ok: &[u8] = b"HTTP/1.1 200 OK\r\nrest";
+        read_line_capped(&mut ok, &mut line).await.unwrap();
+        assert_eq!(line, "HTTP/1.1 200 OK\r\n");
+        let long = [vec![b'a'; MAX_LINE as usize], b"\r\n".to_vec()].concat();
+        assert!(read_line_capped(&mut long.as_slice(), &mut String::new()).await.is_err());
+        let fits = [vec![b'a'; MAX_LINE as usize - 1], b"\n".to_vec()].concat();
+        assert!(read_line_capped(&mut fits.as_slice(), &mut String::new()).await.is_ok());
+    }
+    #[test]
+    fn only_plain_ids_reach_since() {
+        assert!(valid_id("Hq2iGZRMqR5d"));
+        for bad in ["", "a b", "x\r\nHost: evil", "a-b", "a/../b", &"a".repeat(33)] {
+            assert!(!valid_id(bad), "{bad:?}");
+        }
     }
     #[test]
     fn base_parse() {

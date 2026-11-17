@@ -24,7 +24,7 @@ fn invite() -> (String, Vec<SocketAddr>) {
 }
 
 async fn join_with(key: &str, hosts: &[SocketAddr], v6: bool) -> Result<Tunnel, ConnectError> {
-    let o = ConnectOpts { signal: None, peer: None, room: "", key, host: false, bind_port: None, hosts: vec![], mux: true };
+    let o = ConnectOpts { signal: None, peer: None, room: "", key, host: false, bind_port: None, hosts: vec![], mux: true, auth: nat_tunnel::transport::JoinAuth::test() };
     let mut t = Tunnel::connect_ladder(o, hosts, v6, false).await?;
     t.enable_packet_mode();
     Ok(t)

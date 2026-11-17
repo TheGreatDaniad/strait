@@ -8,13 +8,8 @@ wireguard:
   endpoint: "198.51.100.7:51820"
 
 nat_traversal:
-  turn_server: "turn.example.com"
-  turn_port: 3478
-  turn_username: "turn-user"
-  turn_password: "turn-pass"
   stun_server: "stun.example.com"
   stun_port: 3478
-  use_turn: false
 
 remote_access:
   port: 9001

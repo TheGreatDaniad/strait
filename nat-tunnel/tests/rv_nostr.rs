@@ -186,7 +186,7 @@ fn start(role: Role, relays: &[String]) -> Side {
     let local: SocketAddr = if role == Role::Host { HOST } else { CLIENT }.parse().unwrap();
     let status = Arc::new(Mutex::new(Vec::new()));
     let s2 = status.clone();
-    let mut ctx = RvCtx::new(KEY, role, vec![local]);
+    let mut ctx = RvCtx::new_test(KEY, role, vec![local]);
     ctx.status = StatusSink::new(move |s: Status| s2.lock().unwrap().push(format!("{s:?}")));
     let nostr = Nostr::new(&RvConfig { relays: relays.to_vec(), ..Default::default() });
     let (tx, rx) = mpsc::channel(32);
@@ -341,14 +341,14 @@ async fn tampered_stale_foreign_blobs_are_ignored() {
     while f.st.lock().unwrap().reqs == 0 {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let d = Derived::new(&KEY);
+    let d = Derived::new_test(&KEY);
     let room = d.room_hex();
     let ok_addr: SocketAddr = "192.0.2.77:7777".parse().unwrap();
     let good = seal(&d, Role::Host, &[ok_addr]).unwrap();
     let mut tampered = good.clone();
     *tampered.last_mut().unwrap() ^= 1;
     let stale = seal_at(&d, Role::Host, &["192.0.2.66:1".parse().unwrap()], now() - 1000, [3; 12]).unwrap();
-    let foreign = seal(&Derived::new(&[9; 16]), Role::Host, &["192.0.2.55:1".parse().unwrap()]).unwrap();
+    let foreign = seal(&Derived::new_test(&[9; 16]), Role::Host, &["192.0.2.55:1".parse().unwrap()]).unwrap();
     let wrong_role = seal(&d, Role::Client, &["192.0.2.44:1".parse().unwrap()]).unwrap();
     f.inject(raw_event(&room, 20077, &tampered, "r"));
     f.inject(raw_event(&room, 20077, &stale, "r"));

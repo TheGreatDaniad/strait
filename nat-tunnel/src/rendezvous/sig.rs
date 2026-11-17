@@ -4,8 +4,9 @@
 //! methods `ctx.local` is not published. For that observed address to be the one the punch will
 //! use, pass the punch socket in `RvCtx::sock` (the adapter then sends and receives on it for
 //! the lifetime of `run`); otherwise it uses a private socket (fine for tests, wrong port behind
-//! a NAT). The room is `relay::room_for_key(lowercase hex of the 16-byte key)`, the same value
-//! the legacy transport derives from the invite's key string.
+//! a NAT). The room is `relay::room_for_key_at(lowercase hex of the 16-byte key, ctx.epoch)`, the
+//! same value the legacy transport derives from the invite's key string on that UTC day, so it
+//! rotates daily like the other rendezvous identifiers. PEER messages for another room are dropped.
 //!
 //! Publish frequency: REGISTER to each server every 2 s for the first 10 s, then every 15 s.
 
@@ -39,9 +40,9 @@ fn role_u8(r: Role) -> u8 {
     }
 }
 
-/// Room the legacy transport uses for this key.
-pub fn room_for(key: &[u8; 16]) -> u32 {
-    relay::room_for_key(&hex(key))
+/// Room the legacy transport uses for this key on UTC day `epoch`.
+pub fn room_for(key: &[u8; 16], epoch: u32) -> u32 {
+    relay::room_for_key_at(&hex(key), epoch)
 }
 
 async fn resolve(servers: &[Endpoint]) -> Result<Vec<SocketAddr>, String> {
@@ -105,7 +106,7 @@ impl Rendezvous for Sig {
             Some(s) => s.clone(),
             None => Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| RvError::Failed(e.to_string()))?),
         };
-        let (room, me) = (room_for(&ctx.key), role_u8(ctx.role));
+        let (room, me) = (room_for(&ctx.key, ctx.epoch), role_u8(ctx.role));
         let reg = relay::encode_register(room, me);
         let t0 = Instant::now();
         let mut next_reg = Instant::now();
@@ -131,8 +132,8 @@ impl Rendezvous for Sig {
                 r = sock.recv_from(&mut buf) => {
                     let Ok((n, from)) = r else { continue };
                     if !servers.contains(&from) { continue }
-                    if let Some(Incoming::Peer { role, addr }) = relay::decode(&buf[..n]) {
-                        if role != me && tx.send(Candidate { addr, via: "sig" }).await.is_err() {
+                    if let Some(Incoming::Peer { role, addr }) = relay::decode_for(room, &buf[..n]) {
+                        if role != me && tx.send(Candidate { addr, via: "sig", verified: false }).await.is_err() {
                             return Ok(());
                         }
                     }

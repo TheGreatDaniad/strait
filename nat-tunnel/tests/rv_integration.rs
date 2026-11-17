@@ -100,7 +100,7 @@ impl Host {
         stun_init();
         let mut mux = MuxHost::bind(
             KEY,
-            MuxConfig { bind_port: Some(bind_port), stun: true, rv: Some(rv), ..MuxConfig::default() },
+            MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), bind_port: Some(bind_port), stun: true, rv: Some(rv), ..MuxConfig::default() },
         )
         .await
         .unwrap();
@@ -168,6 +168,7 @@ async fn join(rv: RvJoin, bind_port: Option<u16>) -> Result<Tunnel, ConnectError
             bind_port,
             hosts: vec![],
             mux: true,
+            auth: nat_tunnel::transport::JoinAuth::test(),
         },
         rv,
     )
@@ -695,7 +696,7 @@ impl Rendezvous for Fixed {
     }
     async fn run(&self, _: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
         for &addr in &self.0 {
-            let _ = tx.send(Candidate { addr, via: "trk" }).await;
+            let _ = tx.send(Candidate { addr, via: "trk", verified: true }).await;
         }
         cancel.cancelled().await;
         Ok(())
@@ -708,7 +709,7 @@ async fn guest_without_ipv6_says_so_when_only_v6_addresses_exist() {
         stun_init();
         let mut rv = rv_join(&["trk"], vec![Arc::new(Fixed(vec!["[2001:db8::1]:5555".parse().unwrap()]))]);
         rv.budget = Some(Duration::from_secs(3));
-        let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true };
+        let opts = ConnectOpts { signal: None, peer: None, room: "", key: KEY, host: false, bind_port: None, hosts: vec![], mux: true, auth: nat_tunnel::transport::JoinAuth::test() };
         let Err(e) = Tunnel::connect_ladder_rv(opts, &[], false, false, Some(rv)).await else { panic!("must fail") };
         match &e {
             ConnectError::RendezvousFailed(s) => assert_eq!(
@@ -728,7 +729,7 @@ async fn host_only_fires_at_client_addresses_it_can_route() {
         let (v4, v6): (SocketAddr, SocketAddr) = ("127.0.0.1:9".parse().unwrap(), "[2001:db8::1]:5555".parse().unwrap());
         for (route, want) in [(false, vec![v4]), (true, vec![v4, v6])] {
             let rv = rv_host(vec![Arc::new(Fixed(vec![v6, v4]))]);
-            let mut mux = MuxHost::bind(KEY, MuxConfig { bind_port: Some(0), stun: true, rv: Some(rv), ..MuxConfig::default() })
+            let mut mux = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), bind_port: Some(0), stun: true, rv: Some(rv), ..MuxConfig::default() })
                 .await
                 .unwrap();
             mux.set_v6_route(route);

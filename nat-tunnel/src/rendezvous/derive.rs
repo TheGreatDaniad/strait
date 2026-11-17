@@ -3,6 +3,12 @@
 //! `prk = HKDF-SHA256(salt = "strait-rv-v1", ikm = invite key bytes)`; each purpose is its own
 //! `expand(info)`, so a service that sees one derived value learns nothing about the others or
 //! the key. Blobs are never logged.
+//!
+//! The identifiers a service sees (topics, the info-hash, DHT keys) also depend on the UTC day
+//! (`info = label || "@" || day`), so an operator cannot link the sessions of one invite across
+//! days. Host blobs carry an Ed25519 signature by the host key (the invite's `hk`) after the
+//! AEAD part: a guest accepts a host candidate only if the host signed it, so an invite holder
+//! cannot point guests at an address of their choosing.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -22,6 +28,14 @@ pub const WINDOW_PAST_SECS: u64 = 120;
 /// Tolerated clock skew into the future.
 pub const WINDOW_FUTURE_SECS: u64 = 30;
 pub const MAX_CANDIDATES: usize = 8;
+/// Length of one identifier period.
+pub const EPOCH_SECS: u64 = 86_400;
+const SIG_LEN: usize = 64;
+
+/// The current identifier period (UTC day number).
+pub fn epoch_now() -> u32 {
+    (now_secs() / EPOCH_SECS) as u32
+}
 
 /// Values derived from the 16-byte invite key.
 #[derive(Clone, PartialEq, Eq)]
@@ -34,6 +48,10 @@ pub struct Derived {
     pub room_nostr: [u8; 32],
     pub dht_host_seed: [u8; 32],
     pub dht_client_seed: [u8; 32],
+    /// Host side: the host key, to sign host blobs.
+    pub sign: Option<[u8; 32]>,
+    /// Client side: the invite's `hk`, to check host blobs.
+    pub verify: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for Derived {
@@ -79,22 +97,44 @@ fn base32_lower(b: &[u8]) -> String {
 }
 
 impl Derived {
+    /// Values for the current period.
     pub fn new(key: &[u8; 16]) -> Self {
+        Self::for_epoch(key, epoch_now())
+    }
+
+    pub fn for_epoch(key: &[u8; 16], epoch: u32) -> Self {
         let hk = Hkdf::<Sha256>::new(Some(SALT), key);
         let ex = |info: &[u8]| {
             let mut o = [0u8; 32];
             hk.expand(info, &mut o).expect("32 bytes is a valid HKDF length");
             o
         };
+        let id = |label: &[u8]| ex(&[label, b"@", &epoch.to_be_bytes()].concat());
         Self {
             seal_key: ex(b"seal"),
-            room_trk: ex(b"room-trk"),
-            room_mqtt: ex(b"room-mqtt"),
-            room_ntfy: ex(b"room-ntfy"),
-            room_nostr: ex(b"room-nostr"),
-            dht_host_seed: ex(b"dht-host"),
-            dht_client_seed: ex(b"dht-client"),
+            room_trk: id(b"room-trk"),
+            room_mqtt: id(b"room-mqtt"),
+            room_ntfy: id(b"room-ntfy"),
+            room_nostr: id(b"room-nostr"),
+            dht_host_seed: id(b"dht-host"),
+            dht_client_seed: id(b"dht-client"),
+            sign: None,
+            verify: None,
         }
+    }
+
+    /// [`Derived::new`] with both halves of the fixed test host key, for tests.
+    #[doc(hidden)]
+    pub fn new_test(key: &[u8; 16]) -> Self {
+        let k = crate::transport::TEST_HOST_KEY;
+        Self::new(key).with_host(Some(k), Some(crate::tunnel::handshake::public_of(&k)))
+    }
+
+    /// Add the host key (host side) or the invite's `hk` (client side).
+    pub fn with_host(mut self, sign: Option<[u8; 32]>, verify: Option<[u8; 32]>) -> Self {
+        self.sign = sign;
+        self.verify = verify;
+        self
     }
 
     /// From the invite's key string (32 hex chars).
@@ -134,6 +174,8 @@ pub enum BlobError {
     Future,
     NoCandidates,
     TooMany,
+    /// A host blob without a valid signature by the invite's host key (or no key to check with).
+    Unsigned,
 }
 
 impl fmt::Display for BlobError {
@@ -199,6 +241,10 @@ pub fn seal_at(d: &Derived, sender: Role, cands: &[SocketAddr], now: u64, nonce:
         .expect("encrypt");
     let mut out = nonce.to_vec();
     out.extend(ct);
+    if sender == Role::Host {
+        let key = d.sign.ok_or(BlobError::Unsigned)?;
+        out.extend_from_slice(&crate::tunnel::handshake::sign(&key, &out));
+    }
     Ok(out)
 }
 
@@ -211,6 +257,19 @@ pub fn open_at(d: &Derived, own: Role, blob: &[u8], now: u64) -> Result<Vec<Sock
     let sender = match own {
         Role::Host => Role::Client,
         Role::Client => Role::Host,
+    };
+    let blob = if sender == Role::Host {
+        if blob.len() < 12 + 16 + SIG_LEN {
+            return Err(BlobError::Malformed);
+        }
+        let (body, sig) = blob.split_at(blob.len() - SIG_LEN);
+        let hk = d.verify.ok_or(BlobError::Unsigned)?;
+        if !crate::tunnel::handshake::verify_sig(&hk, body, sig.try_into().unwrap()) {
+            return Err(BlobError::Unsigned);
+        }
+        body
+    } else {
+        blob
     };
     if blob.len() < 12 + 16 {
         return Err(BlobError::Malformed);
@@ -278,8 +337,11 @@ mod tests {
     const K: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     const NOW: u64 = 1_800_000_000;
 
+    const DAY: u32 = 20_000;
+    const HOST: [u8; 32] = [0x42; 32];
+
     fn d() -> Derived {
-        Derived::new(&K)
+        Derived::for_epoch(&K, DAY).with_host(Some(HOST), Some(crate::tunnel::handshake::public_of(&HOST)))
     }
     fn a4() -> SocketAddr {
         "203.0.113.7:4242".parse().unwrap()
@@ -296,7 +358,41 @@ mod tests {
         let ct = ChaCha20Poly1305::new((&d().seal_key).into())
             .encrypt(Nonce::from_slice(&[9; 12]), Payload { msg: pt, aad: &aad(sender) })
             .unwrap();
-        [&[9u8; 12][..], &ct].concat()
+        let mut b = [&[9u8; 12][..], &ct].concat();
+        if sender == Role::Host {
+            b.extend_from_slice(&crate::tunnel::handshake::sign(&HOST, &b));
+        }
+        b
+    }
+
+    /// Host blobs must carry the host key's signature; an invite holder (who has the AEAD key)
+    /// cannot make one, and a client without `hk` accepts none.
+    #[test]
+    fn host_blobs_are_signed_by_the_host_key() {
+        let b = sealed(Role::Host, &[a4()], NOW);
+        assert_eq!(open_at(&d(), Role::Client, &b, NOW).unwrap(), vec![a4()]);
+        let other = d().with_host(Some([7; 32]), Some(crate::tunnel::handshake::public_of(&[7; 32])));
+        let forged = seal_at(&other, Role::Host, &[a4()], NOW, [7; 12]).unwrap();
+        assert_eq!(open_at(&d(), Role::Client, &forged, NOW), Err(BlobError::Unsigned));
+        let mut cut = b.clone();
+        cut.truncate(b.len() - 64);
+        assert!(open_at(&d(), Role::Client, &cut, NOW).is_err());
+        assert_eq!(open_at(&d().with_host(None, None), Role::Client, &b, NOW), Err(BlobError::Unsigned));
+        assert_eq!(seal_at(&d().with_host(None, None), Role::Host, &[a4()], NOW, [7; 12]), Err(BlobError::Unsigned));
+        // client blobs stay unsigned (guests have no key)
+        let c = sealed(Role::Client, &[a4()], NOW);
+        assert_eq!(open_at(&d().with_host(None, None), Role::Host, &c, NOW).unwrap(), vec![a4()]);
+    }
+
+    /// Identifiers change from one day to the next; the sealing key does not.
+    #[test]
+    fn identifiers_rotate_daily() {
+        let (a, b) = (Derived::for_epoch(&K, DAY), Derived::for_epoch(&K, DAY + 1));
+        assert_ne!(a.mqtt_topic(), b.mqtt_topic());
+        assert_ne!(a.room_info_hash(), b.room_info_hash());
+        assert_ne!(a.room_hex(), b.room_hex());
+        assert_ne!(a.dht_host_seed, b.dht_host_seed);
+        assert_eq!(a.seal_key, b.seal_key);
     }
     fn pt(ver: u8, role: u8, ts: u32, n: u8, body: &[u8]) -> Vec<u8> {
         let mut v = vec![ver, role];
@@ -339,12 +435,12 @@ mod tests {
     #[test]
     fn wrong_key_and_wrong_role() {
         let b = sealed(Role::Host, &[a4()], NOW);
-        let other = Derived::new(&[9; 16]);
+        let other = Derived::for_epoch(&[9; 16], DAY).with_host(Some(HOST), Some(crate::tunnel::handshake::public_of(&HOST)));
         assert_eq!(open_at(&other, Role::Client, &b, NOW), Err(BlobError::BadTag));
         // a host must not accept its own blob (nor a reflected one)
         assert_eq!(open_at(&d(), Role::Host, &b, NOW), Err(BlobError::BadTag));
         let c = sealed(Role::Client, &[a4()], NOW);
-        assert_eq!(open_at(&d(), Role::Client, &c, NOW), Err(BlobError::BadTag));
+        assert!(open_at(&d(), Role::Client, &c, NOW).is_err(), "a client blob is not a host blob");
         // correct aad but inner role byte lying
         assert_eq!(open_at(&d(), Role::Client, &raw(Role::Host, &pt(1, 1, NOW as u32, 1, &V4BODY)), NOW), Err(BlobError::WrongRole));
     }
@@ -408,7 +504,7 @@ mod tests {
                 assert_ne!(v[i], v[j], "{i} vs {j}");
             }
         }
-        let y = Derived::new(&[K[0] ^ 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let y = Derived::for_epoch(&[K[0] ^ 1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], DAY);
         assert_ne!(x.seal_key, y.seal_key);
         assert_ne!(x.room_trk, y.room_trk);
         assert_eq!(&x.room_trk[..20], &x.room_info_hash());
@@ -437,20 +533,22 @@ mod tests {
         for bad in ["", "abc123", "000102030405060708090a0b0c0d0e0", "000102030405060708090a0b0c0d0e0f0", "000102030405060708090a0b0c0d0e0g", "0001020304050607 8090a0b0c0d0e0f", "ééééééééééééééééééééééééééééééé"] {
             assert!(parse_key(bad).is_none(), "{bad:?}");
         }
-        assert_eq!(Derived::from_invite_key("000102030405060708090a0b0c0d0e0f"), Some(d()));
+        assert_eq!(Derived::from_invite_key("000102030405060708090a0b0c0d0e0f"), Some(Derived::new(&K)));
     }
 
-    /// Pinned (cross-checked against an independent Python HKDF/ChaCha20-Poly1305): changing any of these breaks interop with every deployed invite and blob.
+    /// Pinned (cross-checked against an independent Python HKDF/ChaCha20-Poly1305, and Python
+    /// `cryptography` Ed25519 for the signature): changing any of these breaks interop with every
+    /// deployed invite and blob. Identifiers are for day 20000.
     #[test]
     fn pinned_vectors() {
         let x = d();
         assert_eq!(hex(&x.seal_key), "ba4b1c0d17e9877100c95a204557ea405205ec9dc79c8ba98db84db33fd9d127");
-        assert_eq!(hex(&x.room_trk), "170f5f26257afc16d5cef6bbebd157f8d585a46f7a5de937a4901029b25ceb04");
-        assert_eq!(hex(&x.dht_host_seed), "9a41f82e02a6707024f2577a5d640f4dafcecabbc2bd10f3518466c2c9615f94");
-        assert_eq!(hex(&x.dht_client_seed), "10c85213c33234e60ada5bf7f4f05bfba3a2fb2c84f28ab36f818db41e1d0258");
-        assert_eq!(x.mqtt_topic(), "5vqmlkj5pglygtsear73zedboy");
-        assert_eq!(x.ntfy_topic(), "b6on5ohf46furi6ic4mnwkv4ua");
-        assert_eq!(x.room_hex(), "0c406de7634f07f9ee2b5c533d26547a55521772591be5bf162dd612531909f6");
-        assert_eq!(hex(&sealed(Role::Host, &[a4(), a6()], NOW)), "07070707070707070707070717cdddc391b83f73b4606bb236ae79862794eddb4967b453d1c8634716c6d8921678719d8692286c7ee3835796f9d8cb79");
+        assert_eq!(hex(&x.room_trk), "71bfe147da109624d46f47596fb260d7fe34443897610a2c83c400ff90d12180");
+        assert_eq!(hex(&x.dht_host_seed), "a086484bd0dc731415b5346830844539544d43273854682354a4abc09c195f27");
+        assert_eq!(hex(&x.dht_client_seed), "902b2cb78d7a9115e5ab1b26fe1d4d70671328fef886f1a392f13d380ec8fee0");
+        assert_eq!(x.mqtt_topic(), "fejq2eyp5y3pfs7woxvqpoaewe");
+        assert_eq!(x.ntfy_topic(), "hbgrsajsytppsvkc252jwha7qu");
+        assert_eq!(x.room_hex(), "7fe25ed48250cc9cbad77de095bcc1501c7cb5aad05597e6701b4c5560676507");
+        assert_eq!(hex(&sealed(Role::Host, &[a4(), a6()], NOW)), "07070707070707070707070717cdddc391b83f73b4606bb236ae79862794eddb4967b453d1c8634716c6d8921678719d8692286c7ee3835796f9d8cb79d66657d6e2f4435907ac2daafb001c510981b94a62d3b6159d9de5ebcb880de13aa235ce4beda4c5fb53af483eb4d6d1a39fb5fe967a25319f87fb55b84b8008");
     }
 }

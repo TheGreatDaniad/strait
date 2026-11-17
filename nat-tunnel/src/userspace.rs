@@ -23,7 +23,8 @@ use tokio::sync::mpsc;
 /// smoltcp socket buffer per direction and flow. The TCP window is capped by this: 64 KiB gave
 /// about 7.5 Mbit/s at 66 ms RTT (window / RTT), 256 KiB about 21 Mbit/s at 92 ms, 1 MiB allows
 /// about 90 Mbit/s at 92 ms. Memory is at most 2 x this per open flow (2 MiB, and only the part a
-/// flow really fills is touched); `ExitConfig::max_tcp` = 256 flows keeps the worst case at 512 MiB.
+/// flow really fills is touched): 128 MiB per guest (`per_guest_tcp` = 64) and 1 GiB for all
+/// (`max_tcp` = 512); deploy/strait-host.service sizes MemoryMax for that.
 pub const TCP_BUF: u32 = 1024 * 1024;
 
 // ---- exit destination policy -------------------------------------------------------------
@@ -31,10 +32,17 @@ pub const TCP_BUF: u32 = 1024 * 1024;
 // A guest names the destination of every packet, so without a filter any invite holder could dial
 // the host's loopback services, its LAN/router or the cloud metadata endpoint. Default: public
 // internet only. `--allow-lan` / STRAIT_ALLOW_LAN=1 (or NAT_TUNNEL_ALLOW_LAN=1) additionally allows
-// RFC1918, CGNAT and IPv6 ULA. Loopback needs the separate STRAIT_EXIT_ALLOW_LOOPBACK=1 (tests, labs);
-// link-local (169.254/16 incl. metadata), multicast, broadcast, 240/4 and unspecified are never allowed.
-// shortcut: the host's own non-loopback interface addresses (public IP of the box) are not enumerated
-// and stay dialable; close that with a firewall rule or by listing interface addresses here.
+// RFC1918, CGNAT, 198.18/15 (benchmarking, also proxies' fake-IP pools), 192.0.0/24 (IETF
+// protocol assignments) and IPv6 ULA. Loopback needs the separate STRAIT_EXIT_ALLOW_LOOPBACK=1
+// (tests, labs). Link-local (169.254/16 incl. metadata), the other cloud
+// metadata / platform addresses (Azure 168.63.129.16, Alibaba 100.100.100.200), multicast,
+// broadcast, 240/4 and unspecified are never allowed.
+// The host's own interface addresses, its public address as STUN sees it (the router's WAN side:
+// a hairpin would reach the router's own services and every port forward) and the tunnel network
+// itself are refused; so is TCP port 25 (direct mail delivery from the host's address) unless
+// STRAIT_EXIT_ALLOW_SMTP=1. IPv6 is refused altogether: the tunnel carries IPv4, and the global
+// IPv6 addresses of a home's own devices cannot be told apart from the internet.
+// The same rules apply to the userspace exit and to the kernel TUN path (`packet_allowed`).
 
 /// The tunnel's own gateway address; the stack answers ICMP echo for it, nothing is ever dialled.
 const HOST_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
@@ -86,7 +94,14 @@ fn v4_allowed(a: Ipv4Addr, lan: bool, loopback: bool) -> bool {
     if a.is_unspecified() || o[0] == 0 || a.is_multicast() || a.is_broadcast() || a.is_link_local() || o[0] >= 240 {
         return false;
     }
-    let private = a.is_private() || (o[0] == 100 && (o[1] & 0xc0) == 64);
+    // Cloud platform endpoints (Azure WireServer/DNS, Alibaba metadata): never, even with LAN on.
+    if o == [168, 63, 129, 16] || o == [100, 100, 100, 200] {
+        return false;
+    }
+    let private = a.is_private()
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        || o[..3] == [192, 0, 0];
     !private || lan
 }
 
@@ -94,27 +109,8 @@ fn v4_allowed(a: Ipv4Addr, lan: bool, loopback: bool) -> bool {
 pub fn exit_dest_allowed_with(ip: IpAddr, lan: bool, loopback: bool) -> bool {
     match ip {
         IpAddr::V4(a) => v4_allowed(a, lan, loopback),
-        IpAddr::V6(a) => {
-            let s = a.segments();
-            // IPv4-mapped (::ffff:a.b.c.d), IPv4-compatible (::a.b.c.d) and NAT64 (64:ff9b::a.b.c.d)
-            // embed an IPv4 address: judge that.
-            let embedded = if s[..5] == [0; 5] && (s[5] == 0xffff || (s[5] == 0 && !a.is_unspecified() && !a.is_loopback())) {
-                true
-            } else {
-                s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
-            };
-            if embedded {
-                let o = a.octets();
-                return v4_allowed(Ipv4Addr::new(o[12], o[13], o[14], o[15]), lan, loopback);
-            }
-            if a.is_loopback() {
-                return loopback;
-            }
-            if a.is_unspecified() || a.is_multicast() || (s[0] & 0xffc0) == 0xfe80 {
-                return false;
-            }
-            !((s[0] & 0xfe00) == 0xfc00) || lan
-        }
+        // IPv4 only: see the policy text above.
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -131,12 +127,82 @@ fn note_refused(dst: IpAddr, what: &str) {
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 5000;
     let last = LAST_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) >= 5000 && LAST_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        log::warn!("exit refused {what} to {dst} (private/loopback/link-local destination; --allow-lan permits LAN ranges); further refusals are logged at most every 5 s");
+        log::warn!("exit refused {what} to {dst} (private, loopback, link-local or this host, or mail port 25; --allow-lan permits LAN ranges); further refusals are logged at most every 5 s");
     }
 }
 
+/// Is `ip` assigned to an interface of this machine? Binding to it succeeds only then.
+pub fn is_own_address(ip: IpAddr) -> bool {
+    !ip.is_unspecified() && std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// The host's public addresses as seen from outside (STUN): its router's WAN side.
+static PUBLIC: std::sync::Mutex<Vec<IpAddr>> = std::sync::Mutex::new(Vec::new());
+/// `is_own_address` answers, kept briefly (the kernel path asks per packet).
+static OWN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<IpAddr, (bool, std::time::Instant)>>> = std::sync::Mutex::new(None);
+
+/// Remember a public address of this host (its router's WAN address, from STUN).
+pub fn note_public_addr(ip: IpAddr) {
+    let mut p = PUBLIC.lock().unwrap();
+    if !p.contains(&ip) {
+        p.truncate(7);
+        p.push(ip);
+    }
+}
+
+/// This machine, or its router's public side?
+fn is_self(ip: IpAddr) -> bool {
+    if ip.is_loopback() {
+        return false; // its own opt-in decides
+    }
+    if PUBLIC.lock().unwrap().contains(&ip) {
+        return true;
+    }
+    let mut c = OWN_CACHE.lock().unwrap();
+    let c = c.get_or_insert_with(Default::default);
+    if let Some((own, at)) = c.get(&ip) {
+        if at.elapsed() < Duration::from_secs(30) {
+            return *own;
+        }
+    }
+    if c.len() >= 4096 {
+        c.clear();
+    }
+    let own = is_own_address(ip);
+    c.insert(ip, (own, std::time::Instant::now()));
+    own
+}
+
+/// May a guest's flow of kind `what` (`tcp` / `udp` / `icmp`) go to `remote`? The address policy,
+/// plus the per-flow rules: never the host itself or the tunnel network, no direct mail delivery.
+pub fn flow_allowed(remote: SocketAddr, what: &str, own: bool, smtp: bool) -> bool {
+    let tunnel_net = matches!(remote.ip(), IpAddr::V4(a) if a.octets()[..2] == HOST_TUNNEL_IP.octets()[..2]);
+    exit_dest_allowed(remote.ip()) && !own && !tunnel_net && (smtp || what != "tcp" || remote.port() != 25)
+}
+
+/// The kernel-TUN path's check of one IPv4 packet from a guest: the same rules as the userspace
+/// exit. The host's tunnel address answers ping only (`STRAIT_EXIT_ALLOW_HOST=1` opens it, labs).
+pub fn packet_allowed(p: &[u8]) -> bool {
+    if p.len() < 20 || p[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = ((p[0] & 15) as usize) * 4;
+    let dst = Ipv4Addr::new(p[16], p[17], p[18], p[19]);
+    let (what, port) = match p[9] {
+        1 => ("icmp", 0),
+        6 => ("tcp", p.get(ihl + 2..ihl + 4).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))),
+        17 => ("udp", p.get(ihl + 2..ihl + 4).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]))),
+        _ => ("other", 0),
+    };
+    if dst == HOST_TUNNEL_IP {
+        return what == "icmp" || env_on(&["STRAIT_EXIT_ALLOW_HOST"]);
+    }
+    let remote = SocketAddr::new(dst.into(), port);
+    flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"]))
+}
+
 fn check_dest(remote: SocketAddr, what: &str) -> io::Result<()> {
-    if exit_dest_allowed(remote.ip()) {
+    if flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"])) {
         Ok(())
     } else {
         note_refused(remote.ip(), what);
@@ -328,9 +394,9 @@ pub struct ExitConfig {
 impl Default for ExitConfig {
     fn default() -> Self {
         Self {
-            max_tcp: 256,
+            max_tcp: 512,
             max_udp: 1024,
-            per_guest_tcp: 128,
+            per_guest_tcp: 64,
             per_guest_udp: 256,
             tcp_idle: Duration::from_secs(60),
             udp_idle: Duration::from_secs(30),
@@ -591,17 +657,52 @@ mod policy_tests {
     use super::*;
 
     #[test]
+    fn per_flow_rules() {
+        let public: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        assert!(flow_allowed(public, "tcp", false, false));
+        assert!(!flow_allowed(public, "tcp", true, false), "the host itself is never a destination");
+        let mail: SocketAddr = "93.184.216.34:25".parse().unwrap();
+        assert!(!flow_allowed(mail, "tcp", false, false) && flow_allowed(mail, "tcp", false, true));
+        assert!(flow_allowed(mail, "udp", false, false), "the mail rule is TCP only");
+        assert!(is_own_address("127.0.0.1".parse().unwrap()) && !is_own_address("203.0.113.77".parse().unwrap()));
+        assert!(!flow_allowed("10.7.0.5:80".parse().unwrap(), "tcp", false, false), "the tunnel network");
+    }
+
+    /// The kernel path judges packets with the same rules (and by the router's public address).
+    #[test]
+    fn kernel_path_matches_the_exit() {
+        let pkt = |dst: [u8; 4], proto: u8, port: u16| {
+            let mut p = vec![0u8; 24];
+            p[0] = 0x45;
+            p[9] = proto;
+            p[16..20].copy_from_slice(&dst);
+            p[22..24].copy_from_slice(&port.to_be_bytes());
+            p
+        };
+        assert!(packet_allowed(&pkt([93, 184, 216, 34], 6, 443)));
+        assert!(!packet_allowed(&pkt([93, 184, 216, 34], 6, 25)), "mail");
+        assert!(packet_allowed(&pkt([10, 7, 0, 1], 1, 0)), "ping the host's tunnel address");
+        assert!(!packet_allowed(&pkt([10, 7, 0, 1], 6, 22)), "a service of the host");
+        assert!(!packet_allowed(&pkt([10, 7, 0, 9], 1, 0)), "another guest");
+        assert!(!packet_allowed(&pkt([192, 168, 1, 1], 6, 80)), "the host's LAN");
+        assert!(!packet_allowed(&pkt([127, 0, 0, 1], 6, 80)), "loopback");
+        note_public_addr("198.51.100.200".parse().unwrap());
+        assert!(!packet_allowed(&pkt([198, 51, 100, 200], 6, 443)), "the router's WAN side (hairpin)");
+        assert!(!packet_allowed(&[0x60; 40]), "IPv6");
+    }
+
+    #[test]
     fn exit_policy_table() {
         // (address, default, allow_lan, allow_loopback)
         let t: &[(&str, bool, bool, bool)] = &[
             ("8.8.8.8", true, true, true),
             ("1.1.1.1", true, true, true),
-            ("2606:4700::1111", true, true, true),
+            ("2606:4700::1111", false, false, false),
             ("100.63.255.255", true, true, true),
             ("100.128.0.1", true, true, true),
             ("172.15.0.1", true, true, true),
             ("172.32.0.1", true, true, true),
-            ("::ffff:8.8.8.8", true, true, true),
+            ("::ffff:8.8.8.8", false, false, false),
             ("10.1.2.3", false, true, false),
             ("10.7.0.1", false, true, false),
             ("172.16.0.1", false, true, false),
@@ -609,20 +710,29 @@ mod policy_tests {
             ("192.168.1.1", false, true, false),
             ("100.64.0.1", false, true, false),
             ("100.127.255.255", false, true, false),
-            ("fc00::1", false, true, false),
-            ("fd12::1", false, true, false),
-            ("::ffff:192.168.1.1", false, true, false),
-            ("::192.168.1.1", false, true, false),
-            ("64:ff9b::10.0.0.1", false, true, false),
+            ("fc00::1", false, false, false),
+            ("fd12::1", false, false, false),
+            ("::ffff:192.168.1.1", false, false, false),
+            ("::192.168.1.1", false, false, false),
+            ("64:ff9b::10.0.0.1", false, false, false),
             ("127.0.0.1", false, false, true),
             ("127.9.9.9", false, false, true),
-            ("::1", false, false, true),
-            ("::ffff:127.0.0.1", false, false, true),
-            ("::127.0.0.1", false, false, true),
+            ("::1", false, false, false),
+            ("::ffff:127.0.0.1", false, false, false),
+            ("::127.0.0.1", false, false, false),
             ("0.0.0.0", false, false, false),
             ("0.1.2.3", false, false, false),
             ("::", false, false, false),
             ("169.254.169.254", false, false, false),
+            ("168.63.129.16", false, false, false),
+            ("168.63.129.17", true, true, true),
+            ("100.100.100.200", false, false, false),
+            ("198.18.0.1", false, true, false),
+            ("198.19.255.255", false, true, false),
+            ("198.17.255.255", true, true, true),
+            ("198.20.0.0", true, true, true),
+            ("192.0.0.8", false, true, false),
+            ("192.0.1.1", true, true, true),
             ("169.254.0.1", false, false, false),
             ("fe80::1", false, false, false),
             ("::ffff:169.254.169.254", false, false, false),

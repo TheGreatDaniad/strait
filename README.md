@@ -35,10 +35,23 @@ for networks that block or inspect traffic:
 - WebSocket over TLS (TCP). When the host has no reachable TCP port, both sides open the connection to each other through their routers, the same way the UDP tunnel is hole-punched
 - Xray (VLESS + REALITY)
 
+## Security
+
+- Every packet is encrypted end to end with ChaCha20-Poly1305. The transports above only change how the packets look.
+- A guest joins through a Noise `NKpsk0` handshake. Every invite names the host's own key, so holding an invite is not
+  enough to pose as the host, and every session uses fresh keys that are replaced every two minutes.
+- A host can give each person a **personal invite**, see who is connected, and remove one person without stopping the others.
+  A removal stays in force after the app restarts.
+- A guest only reaches the internet through the host: not the host itself, its home network, its router or other guests.
+- The services that introduce the two devices only see sealed records; the host signs its own, and the names under which
+  records are stored change every day.
+
+The design is described in [docs/HANDSHAKE.md](nat-tunnel/docs/HANDSHAKE.md). It has not been audited.
+
 ## No server of your own
 
 Two devices behind home routers cannot normally find each other. When a signaling step is needed, Strait uses public services
-(BitTorrent trackers, Nostr relays, the BitTorrent DHT, ntfy, MQTT brokers), so you do not have to run a signaling server.
+(Nostr relays, the BitTorrent DHT, ntfy, MQTT brokers), so you do not have to run a signaling server.
 The host decides which ones to use, and they only ever see an encrypted blob. They are used just for the first meeting: once the tunnel is connected, your traffic does not pass through them at all, it goes straight between the two devices.
 
 ## In the end
@@ -92,8 +105,9 @@ cargo run --release -- gui     # desktop app; the full tunnel needs admin/root
 ## How peers find each other
 
 The host chooses the methods; nothing is on by default, and each one shows what it can see before you pick it: a UDP signal
-server (`sig`), BitTorrent trackers (`trk`), Nostr relays, the Mainline DHT, ntfy, and public MQTT. Rooms are derived from the
-invite key with HKDF, and only ChaCha20-Poly1305 sealed endpoints are published. See `nat-tunnel/docs/RENDEZVOUS_DESIGN.md`.
+server (`sig`), Nostr relays, the Mainline DHT, ntfy, and public MQTT. Rooms are derived from the invite key with HKDF
+and change every day, only ChaCha20-Poly1305 sealed endpoints are published, and the host signs its own. BitTorrent
+trackers (`trk`) still work from the command line, but they announce in cleartext, so the app does not offer them. See `nat-tunnel/docs/RENDEZVOUS_DESIGN.md`.
 
 ## Build and test
 

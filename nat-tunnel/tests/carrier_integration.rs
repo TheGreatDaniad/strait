@@ -87,7 +87,7 @@ impl Drop for Host {
 async fn start_host(udp: bool, ios: Vec<Arc<dyn FrameIo>>, setup: impl FnOnce(&mut MuxHost)) -> (Host, Option<u16>) {
     let mut mux = MuxHost::bind(
         KEY,
-        MuxConfig { max_clients: 8, bind_port: Some(0), udp, carriers: IoList(ios), ..MuxConfig::default() },
+        MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), max_clients: 8, bind_port: Some(0), udp, carriers: IoList(ios), ..MuxConfig::default() },
     )
     .await
     .unwrap();
@@ -144,7 +144,7 @@ async fn recv_data(t: &mut Tunnel, within: Duration) -> Option<Vec<u8>> {
 }
 
 fn guest(carriers: Vec<CarrierEntry>, tmp: &Tmp) -> GuestOpts {
-    GuestOpts {
+    GuestOpts { auth: nat_tunnel::transport::JoinAuth::test(),
         key: KEY.into(),
         carriers,
         last_working_file: Some(tmp.file("last_carrier")),
@@ -367,7 +367,7 @@ async fn awg_punch_and_hello_are_obfuscated() {
     let px = proxy(format!("127.0.0.1:{port}").parse().unwrap()).await;
     // The host also fires its PUNCH frame at the proxy (what it does for a rendezvous candidate).
     let target = px.addr;
-    let (_host, _) = start_host(false, ios, move |m| m.add_punch_target(target)).await;
+    let (_host, _) = start_host(false, ios, move |m| m.add_punch_target(target, true)).await;
 
     let opts = guest(vec![CarrierEntry::new(CarrierId::Awg).at(px.addr.to_string())], &tmp);
     let mut t = join(&opts).await.expect("connect through the proxy");
@@ -395,6 +395,7 @@ async fn awg_punch_and_hello_are_obfuscated() {
         bind_port: None,
         hosts: vec![],
         mux: true,
+        auth: nat_tunnel::transport::JoinAuth::test(),
     })
     .await
     .unwrap();
@@ -601,6 +602,7 @@ async fn one_host_serves_udp_and_ss_together() {
         bind_port: None,
         hosts: vec![],
         mux: true,
+        auth: nat_tunnel::transport::JoinAuth::test(),
     })
     .await
     .unwrap();
@@ -662,7 +664,7 @@ async fn mtu_limited_link_refuses_oversize_loudly() {
     let peer = a.peer_addr();
     let mut mux = MuxHost::bind(
         KEY,
-        MuxConfig { udp: false, carriers: IoList(vec![Arc::new(b)]), ..MuxConfig::default() },
+        MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), udp: false, carriers: IoList(vec![Arc::new(b)]), ..MuxConfig::default() },
     )
     .await
     .unwrap();
@@ -695,7 +697,7 @@ async fn mtu_limited_link_refuses_oversize_loudly() {
         (got, refused, mux.oversize_drops(), sent_oversize_to)
     });
 
-    let o = ConnectOpts { signal: None, peer: Some(peer), room: "", key: KEY, host: false, bind_port: None, hosts: vec![peer], mux: true };
+    let o = ConnectOpts { signal: None, peer: Some(peer), room: "", key: KEY, host: false, bind_port: None, hosts: vec![peer], mux: true, auth: nat_tunnel::transport::JoinAuth::test() };
     let mut t = Tunnel::connect_with_io(o, &[peer], false, false, None, Arc::new(a)).await.expect("join over the mem link");
     t.enable_packet_mode();
     assert_eq!(t.tun_mtu(), mtu);
@@ -715,7 +717,7 @@ async fn mtu_limited_link_refuses_oversize_loudly() {
 async fn forward_mode_refuses_a_small_carrier() {
     let (a, _b) = mem::pair(mem_cfg(1300));
     let peer = a.peer_addr();
-    let o = ConnectOpts { signal: None, peer: Some(peer), room: "", key: KEY, host: false, bind_port: None, hosts: vec![peer], mux: false };
+    let o = ConnectOpts { signal: None, peer: Some(peer), room: "", key: KEY, host: false, bind_port: None, hosts: vec![peer], mux: false, auth: nat_tunnel::transport::JoinAuth::test() };
     let e = match Tunnel::connect_with_io(o, &[peer], false, false, None, Arc::new(a)).await {
         Err(e) => e,
         Ok(_) => panic!("connected"),
@@ -841,7 +843,7 @@ async fn host_full_is_not_hidden_by_the_ladder() {
     let tmp = Tmp::new();
     let sc = ss_scenario();
     let (ios, _) = app::start_carriers(&[sc.host.clone()], KEY, &sc.cfg).await;
-    let mut mux = MuxHost::bind(KEY, MuxConfig { max_clients: 1, udp: false, carriers: IoList(ios), ..MuxConfig::default() })
+    let mut mux = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), max_clients: 1, udp: false, carriers: IoList(ios), ..MuxConfig::default() })
         .await
         .unwrap();
     let task = tokio::spawn(async move {

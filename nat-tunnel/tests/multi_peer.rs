@@ -58,7 +58,7 @@ impl Host {
 /// A router: packets for the host are echoed back, packets for another
 /// client are forwarded to that client only.
 async fn start_host(cfg: MuxConfig) -> Host {
-    let mut mux = MuxHost::bind(KEY, MuxConfig { bind_port: Some(0), ..cfg }).await.unwrap();
+    let mut mux = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), bind_port: Some(0), ..cfg }).await.unwrap();
     let port = mux.local_port().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let (tx, events) = mpsc::unbounded_channel();
@@ -92,7 +92,7 @@ async fn start_host(cfg: MuxConfig) -> Host {
 }
 
 fn fast(max: usize) -> MuxConfig {
-    MuxConfig { max_clients: max, ..MuxConfig::default() }
+    MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), max_clients: max, ..MuxConfig::default() }
 }
 
 async fn join_with(host: Option<SocketAddr>, signal: Option<SocketAddr>) -> io::Result<Tunnel> {
@@ -105,6 +105,7 @@ async fn join_with(host: Option<SocketAddr>, signal: Option<SocketAddr>) -> io::
         bind_port: None,
         hosts: vec![],
         mux: true,
+        auth: nat_tunnel::transport::JoinAuth::test(),
     })
     .await?;
     t.enable_packet_mode();
@@ -243,7 +244,7 @@ async fn max_clients_rejects_extra_peer_and_keeps_existing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_client_frees_slot_and_host_accepts_new_and_returning_guests() {
-    let mut host = start_host(MuxConfig {
+    let mut host = start_host(MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY),
         max_clients: 1,
         keepalive: Duration::from_millis(300),
         timeout: Duration::from_millis(1200),
@@ -282,7 +283,7 @@ async fn host_stays_findable_through_signaling_across_guests() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let signal: SocketAddr = format!("127.0.0.1:{sig_port}").parse().unwrap();
 
-    let mut host = start_host(MuxConfig { signal: Some(signal), ..fast(4) }).await;
+    let mut host = start_host(MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), signal: Some(signal), ..fast(4) }).await;
     let mut g1 = join_with(None, Some(signal)).await.expect("first guest via signal");
     assert!(echo(&mut g1, b"first").await);
     g1.close().await.unwrap();
@@ -298,7 +299,7 @@ async fn host_stays_findable_through_signaling_across_guests() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn silent_client_is_evicted_while_keepalive_client_survives() {
-    let mut host = start_host(MuxConfig {
+    let mut host = start_host(MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY),
         keepalive: Duration::from_millis(300),
         timeout: Duration::from_millis(1200),
         ..fast(2)
@@ -336,7 +337,7 @@ async fn spoofed_source_address_is_dropped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_peer_rate_limit_drops_excess() {
-    let host = start_host(MuxConfig { rate_bytes: 3000, ..fast(2) }).await;
+    let host = start_host(MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), rate_bytes: 3000, ..fast(2) }).await;
     let mut a = join(&host).await;
     let me = ip_of(&a);
     for i in 0..40u8 {

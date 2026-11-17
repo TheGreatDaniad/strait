@@ -36,7 +36,7 @@ async fn live_punch_through_trackers() {
         .expect("stun");
     println!("LIVE {role:?} local={} mapped={mapped}", sock.local_addr().unwrap());
 
-    let ctx = RvCtx::new(key, role, vec![mapped]).with_sock(sock.clone());
+    let ctx = RvCtx::new_test(key, role, vec![mapped]).with_sock(sock.clone());
     let (tx, mut rx) = mpsc::channel(16);
     let cancel = CancellationToken::new();
     let (c2, t0) = (cancel.clone(), Instant::now());

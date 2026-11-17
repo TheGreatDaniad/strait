@@ -48,6 +48,7 @@ async fn run_pair(invite: &str, host_port: Option<u16>) {
             bind_port: host_port,
             hosts: vec![],
             mux: false,
+            auth: nat_tunnel::transport::JoinAuth::test(),
         })
         .await
         .expect("host ready");
@@ -66,6 +67,7 @@ async fn run_pair(invite: &str, host_port: Option<u16>) {
             bind_port: None,
             hosts: vec![],
             mux: false,
+            auth: nat_tunnel::transport::JoinAuth::test(),
         })
         .await
         .expect("guest ready");

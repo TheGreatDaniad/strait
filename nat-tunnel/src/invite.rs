@@ -7,7 +7,7 @@
 //! Current format:
 //!
 //! ```text
-//! STRAIT2|<key>|<host>[,<host>...]|<signal>[,<signal>...]|<room>|<rv>[,<rv>...]|<cr>[,<cr>...]
+//! STRAIT2|<key>|<host>[,<host>...]|<signal>[,<signal>...]|<room>|<rv>[,<rv>...]|<cr>[,<cr>...]|<sec>
 //! ```
 //!
 //! * `key`       — pre-shared AEAD key. The signaling room is derived from it,
@@ -32,6 +32,11 @@
 //!                 `sni`/`mode`/`port`, ss and awg none), never secrets: every secret derives
 //!                 from `key`. `udp` is implicit and need not be listed.
 //!                 e.g. `STRAIT2|key|1.2.3.4:7100||||ss@1.2.3.4:8388,ws@h.example:443;sni=h.example`.
+//!
+//! * `sec`      — optional `hk=<64 hex>` (the host's public key: the client then accepts only
+//!                 the holder of the matching private key, so the invite alone cannot pose as
+//!                 the host) and `gt=<48 hex>` (this guest's personal token: the host knows who
+//!                 joined and can withdraw that one invite), separated by `;`.
 //!
 //! Empty trailing fields may be omitted, so a public-IP host produces
 //! `STRAIT2|<key>|<host>`. The previous `signal:port|room|key` form is still
@@ -171,6 +176,10 @@ pub struct Invite {
     /// Entries with an id this version does not know: `(position in the original list, text)`.
     /// Kept so the invite re-encodes unchanged; ignored at run time.
     pub cr_unknown: Vec<(usize, String)>,
+    /// The host's public key (`hk`).
+    pub host_key: Option<[u8; 32]>,
+    /// This guest's personal token (`gt`).
+    pub token: Option<[u8; 24]>,
 }
 
 pub const MAX_RV: usize = 8;
@@ -205,7 +214,24 @@ impl Invite {
             rv: Vec::new(),
             cr: Vec::new(),
             cr_unknown: Vec::new(),
+            host_key: None,
+            token: None,
         }
+    }
+
+    pub fn with_host_key(mut self, public: [u8; 32]) -> Self {
+        self.host_key = Some(public);
+        self
+    }
+
+    pub fn with_token(mut self, token: Option<[u8; 24]>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// The security fields as the join handshake takes them.
+    pub fn auth(&self) -> crate::transport::JoinAuth {
+        crate::transport::JoinAuth { host_key: self.host_key, token: self.token, ..Default::default() }
     }
 
     /// Add a carrier entry. Parameters outside its allow-list are dropped; anything past
@@ -276,7 +302,13 @@ impl Invite {
         // The room is derived from the key, so it is not emitted. Trailing fields are kept only as
         // far as needed, so invites without `cr` stay byte-identical to the older format.
         let cr = self.encode_cr();
-        let n = if !cr.is_empty() {
+        let hex = crate::tunnel::handshake::hex;
+        let sec: Vec<String> =
+            self.host_key.iter().map(|k| format!("hk={}", hex(k))).chain(self.token.iter().map(|t| format!("gt={}", hex(t)))).collect();
+        let sec = sec.join(";");
+        let n = if !sec.is_empty() {
+            7
+        } else if !cr.is_empty() {
             6
         } else if !self.rv.is_empty() || rv_shaped(&self.room) {
             5 // a legacy room that looks like rv ids must not be read as rv
@@ -288,7 +320,7 @@ impl Invite {
             2
         };
         let rv = self.rv.join(",");
-        let fields = [self.key.as_str(), &hosts, &signals, &self.room, &rv, &cr];
+        let fields = [self.key.as_str(), &hosts, &signals, &self.room, &rv, &cr, &sec];
         format!("STRAIT2|{}", fields[..n].join("|"))
     }
 
@@ -346,6 +378,8 @@ impl Invite {
                 rv: Vec::new(),
                 cr: Vec::new(),
                 cr_unknown: Vec::new(),
+                host_key: None,
+                token: None,
             });
         }
         // Bare `STRAIT2|<key>|<host>` without the prefix is also accepted.
@@ -372,6 +406,16 @@ impl Invite {
             Some(f) => parse_cr(f)?,
             None => (Vec::new(), Vec::new()),
         };
+        // A malformed security field fails the whole invite: dropping it silently would join a
+        // host the invite did not vouch for.
+        let (mut host_key, mut token) = (None, None);
+        for kv in fields.get(6).copied().unwrap_or("").split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            match kv.split_once('=')? {
+                ("hk", v) => host_key = Some(crate::tunnel::handshake::unhex::<32>(v)?),
+                ("gt", v) => token = Some(crate::tunnel::handshake::unhex::<24>(v)?),
+                _ => {} // a later version's field
+            }
+        }
         // An invite with no host, signal server, rendezvous method or carrier endpoint cannot
         // connect to anything, so a bare word is not an invite.
         if hosts.is_empty() && signals.is_empty() && rv.is_empty() && cr.iter().all(|c| c.endpoint.is_none()) {
@@ -385,6 +429,8 @@ impl Invite {
             rv,
             cr,
             cr_unknown,
+            host_key,
+            token,
         })
     }
 }
@@ -431,6 +477,25 @@ fn parse_addrs(value: &str) -> Option<Vec<Endpoint>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_fields_round_trip_and_bad_ones_fail_the_invite() {
+        let base = "STRAIT2|00112233445566778899aabbccddeeff|203.0.113.10:7100";
+        let plain = Invite::parse(base).unwrap();
+        assert!(plain.host_key.is_none() && plain.token.is_none());
+        assert_eq!(plain.encode(), base, "an invite without them is unchanged");
+        let full = plain.clone().with_host_key([0xAB; 32]).with_token(Some([0xCD; 24]));
+        let text = full.encode();
+        assert_eq!(text, format!("{base}|||||hk={};gt={}", "ab".repeat(32), "cd".repeat(24)));
+        assert_eq!(Invite::parse(&text).unwrap(), full);
+        assert_eq!(full.auth().host_key, Some([0xAB; 32]));
+        // only one of the two, and an unknown future field
+        let hk_only = Invite::parse(&format!("{base}|||||hk={};zz=1", "ab".repeat(32))).unwrap();
+        assert!(hk_only.host_key.is_some() && hk_only.token.is_none());
+        // a damaged key or token is not silently dropped
+        assert!(Invite::parse(&format!("{base}|||||hk={}", "ab".repeat(31))).is_none());
+        assert!(Invite::parse(&format!("{base}|||||gt=xyz")).is_none());
+    }
 
     #[test]
     fn weak_keys_are_rejected() {

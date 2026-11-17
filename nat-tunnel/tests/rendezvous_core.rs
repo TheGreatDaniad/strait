@@ -20,7 +20,7 @@ const CLIENT: &str = "198.51.100.2:5000";
 
 fn ctx(role: Role) -> RvCtx {
     let a: SocketAddr = if role == Role::Host { HOST } else { CLIENT }.parse().unwrap();
-    RvCtx::new(KEY, role, vec![a])
+    RvCtx::new_test(KEY, role, vec![a])
 }
 fn fast(r: Vec<Arc<dyn Rendezvous>>) -> Runner {
     Runner::new(r).with_backoff(Duration::from_millis(10))
@@ -220,13 +220,15 @@ fn sig_for(a: SocketAddr) -> Arc<dyn Rendezvous> {
 async fn sock_ctx(role: Role) -> (RvCtx, SocketAddr) {
     let s = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let a = s.local_addr().unwrap();
-    (RvCtx::new(KEY, role, vec![]).with_sock(s), a)
+    (RvCtx::new_test(KEY, role, vec![]).with_sock(s), a)
 }
 
 #[test]
 fn sig_room_matches_legacy_derivation() {
     let hexkey = "a5".repeat(16);
-    assert_eq!(sig::room_for(&KEY), relay::room_for_key(&hexkey));
+    assert_eq!(sig::room_for(&KEY, 20000), relay::room_for_key_at(&hexkey, 20000));
+    let today = nat_tunnel::rendezvous::derive::epoch_now();
+    assert_eq!(sig::room_for(&KEY, today), relay::room_for_key(&hexkey));
 }
 
 #[tokio::test]
@@ -245,10 +247,10 @@ async fn sig_exchanges_observed_addresses_both_ways() {
 #[tokio::test]
 async fn sig_private_socket_and_wrong_key_isolation() {
     let srv = server().await;
-    let mut host = fast(vec![sig_for(srv)]).start(RvCtx::new(KEY, Role::Host, vec![]));
-    let mut other = fast(vec![sig_for(srv)]).start(RvCtx::new([3; 16], Role::Client, vec![]));
+    let mut host = fast(vec![sig_for(srv)]).start(RvCtx::new_test(KEY, Role::Host, vec![]));
+    let mut other = fast(vec![sig_for(srv)]).start(RvCtx::new_test([3; 16], Role::Client, vec![]));
     assert!(timeout(Duration::from_millis(500), other.next()).await.is_err());
-    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new(KEY, Role::Client, vec![]));
+    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new_test(KEY, Role::Client, vec![]));
     let c = timeout(Duration::from_secs(3), client.next()).await.unwrap().unwrap();
     assert!(c.addr.ip().is_loopback());
     assert!(timeout(Duration::from_secs(3), host.next()).await.unwrap().is_some());
@@ -257,10 +259,10 @@ async fn sig_private_socket_and_wrong_key_isolation() {
 #[tokio::test]
 async fn sig_deregisters_on_cancel() {
     let srv = server().await;
-    let host = fast(vec![sig_for(srv)]).start(RvCtx::new(KEY, Role::Host, vec![]));
+    let host = fast(vec![sig_for(srv)]).start(RvCtx::new_test(KEY, Role::Host, vec![]));
     tokio::time::sleep(Duration::from_millis(200)).await;
     host.stop().await;
-    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new(KEY, Role::Client, vec![]));
+    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new_test(KEY, Role::Client, vec![]));
     assert!(timeout(Duration::from_millis(600), client.next()).await.is_err(), "stale host still registered");
 }
 
@@ -278,13 +280,13 @@ async fn sig_probe() {
     assert!(t0.elapsed() < Duration::from_millis(800));
     assert!(matches!(Sig::new(vec![]).probe(Duration::from_millis(100)).await, ProbeStatus::Error(_)));
     // probe publishes nothing: a client registering afterwards sees no host
-    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new(KEY, Role::Client, vec![]));
+    let mut client = fast(vec![sig_for(srv)]).start(RvCtx::new_test(KEY, Role::Client, vec![]));
     assert!(timeout(Duration::from_millis(400), client.next()).await.is_err());
 }
 
 #[tokio::test]
 async fn sig_without_servers_fails_visibly() {
-    let h = Runner::new(vec![Arc::new(Sig::new(vec![]))]).with_backoff(Duration::from_millis(5)).start(RvCtx::new(KEY, Role::Host, vec![]));
+    let h = Runner::new(vec![Arc::new(Sig::new(vec![]))]).with_backoff(Duration::from_millis(5)).start(RvCtx::new_test(KEY, Role::Host, vec![]));
     assert!(status_is(&h, "sig", |s| matches!(s, Status::Failed(m) if m.contains("no signal server"))).await);
 }
 
