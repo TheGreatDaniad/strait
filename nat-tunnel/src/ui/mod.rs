@@ -382,14 +382,14 @@ pub fn spawn_session(
                 Some(opts) => app::run_host(opts).await,
                 None => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "host mode needs --invite or --room/--key, plus --forward/--tun",
+                    "host mode needs an invite (STRAIT_INVITE or --invite -) or --room/--key, plus --forward/--tun",
                 )),
             },
             Role::Guest => match guest {
                 Some(opts) => app::run_guest(opts).await,
                 None => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "guest mode needs --invite or --room/--key, plus --listen/--tun",
+                    "guest mode needs an invite (STRAIT_INVITE or --invite -) or --room/--key, plus --listen/--tun",
                 )),
             },
         };

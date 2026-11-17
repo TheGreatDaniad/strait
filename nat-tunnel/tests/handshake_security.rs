@@ -266,7 +266,7 @@ async fn host_key_end_to_end() {
 #[tokio::test]
 async fn personal_invites_admit_expire_and_can_be_withdrawn() {
     let key = handshake::new_host_key();
-    let tk = handshake::token_key(&key);
+    let tk = handshake::token_key(&key, KEY);
     let policy = GuestPolicy::default();
     let (mut h, addr) = host_with(MuxConfig { host_key: Some(key), guests: policy.clone(), ..Default::default() }).await;
     let hk = Some(handshake::public_of(&key));
@@ -280,7 +280,7 @@ async fn personal_invites_admit_expire_and_can_be_withdrawn() {
     let refused = |r: Result<Tunnel, std::io::Error>| matches!(r.as_ref().err().and_then(ConnectError::from_io), Some(ConnectError::Refused));
     let r = with_host(&mut h, Tunnel::connect(opts(addr, KEY, with(Token { id: 8, expires: now - 1 })))).await;
     assert!(refused(r), "expired");
-    let foreign = handshake::mint(&handshake::token_key(&handshake::new_host_key()), Token { id: 9, expires: 0 });
+    let foreign = handshake::mint(&handshake::token_key(&handshake::new_host_key(), KEY), Token { id: 9, expires: 0 });
     let r = with_host(&mut h, Tunnel::connect(opts(addr, KEY, JoinAuth { host_key: hk, token: Some(foreign), ..Default::default() }))).await;
     assert!(refused(r), "not this host's token");
     policy.revoked.lock().unwrap().insert(7);
@@ -299,6 +299,31 @@ async fn personal_invites_admit_expire_and_can_be_withdrawn() {
     assert!(refused(r), "personal invites only");
     let t = with_host(&mut strict, Tunnel::connect(opts(saddr, KEY, with(Token { id: 1, expires: 0 })))).await;
     assert!(t.is_ok());
+}
+
+/// A copied personal invite cannot be used next to its owner: while one device's session is live,
+/// another device with the same personal invite is told the host is full. Other invites still work.
+#[tokio::test]
+async fn a_personal_invite_works_on_one_device_at_a_time() {
+    let key = handshake::new_host_key();
+    let tk = handshake::token_key(&key, KEY);
+    let (mut h, addr) = host_with(MuxConfig { host_key: Some(key), max_clients: 4, ..Default::default() }).await;
+    let hk = Some(handshake::public_of(&key));
+    let with = |id: u32| JoinAuth { host_key: hk, token: Some(handshake::mint(&tk, Token { id, expires: 0 })), ..Default::default() };
+    let owner = sock().await;
+    let mut a = do_join_as(&mut h, &owner, addr, KEY, with(3)).await.expect("owner joins");
+    let mut d = vec![0xF4];
+    d.extend_from_slice(&a.slot.to_be_bytes());
+    d.extend_from_slice(&a.session.seal(&[0xC1]));
+    owner.send_to(&d, addr).await.unwrap();
+    for _ in 0..20 {
+        while h.try_recv().await.unwrap().is_some() {}
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let r = with_host(&mut h, Tunnel::connect(opts(addr, KEY, with(3)))).await;
+    assert!(matches!(r.as_ref().err().and_then(ConnectError::from_io), Some(ConnectError::HostFull)), "second device refused");
+    assert!(with_host(&mut h, Tunnel::connect(opts(addr, KEY, with(4)))).await.is_ok(), "another person's invite works");
+    assert!(with_host(&mut h, Tunnel::connect(opts(addr, KEY, named(&key, None)))).await.is_ok(), "the shared invite works");
 }
 
 #[tokio::test]

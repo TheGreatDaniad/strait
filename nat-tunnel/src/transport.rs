@@ -619,13 +619,15 @@ struct FwdHost {
 /// Forward mode serves one guest: while its session is live (heard from within this time), a
 /// JOIN from another address is refused as full instead of taking the session over.
 const FWD_TAKEOVER_AFTER: Duration = Duration::from_secs(30);
+/// A forward-mode guest's keepalive while its stream is idle (well inside `FWD_TAKEOVER_AFTER`).
+const FWD_KEEPALIVE: Duration = Duration::from_secs(10);
 
 impl FwdHost {
     fn new(invite_key: &str, key: Option<[u8; 32]>, guests: GuestPolicy) -> Self {
         let key = key.unwrap_or([0; 32]); // checked by the caller: a host always has one
         Self {
             base: mux_base(invite_key),
-            token_key: handshake::token_key(&key),
+            token_key: handshake::token_key(&key, invite_key),
             key,
             joined: false,
             cur: None,
@@ -1208,7 +1210,10 @@ impl Tunnel {
                         // turn this guest into a port scanner of someone else's address.
                         for t in targets.iter().filter(|t| t.verified) {
                             if let IpAddr::V4(ip) = norm_addr(t.addr).ip() {
-                                if scans.len() < SCAN_MAX_IPS && !scans.iter().any(|s| s.ip == ip) {
+                                if scans.len() < SCAN_MAX_IPS
+                                    && !scans.iter().any(|s| s.ip == ip)
+                                    && crate::birthday::SCAN_BUDGET.lock().unwrap().try_start(ip, Instant::now())
+                                {
                                     let sc = Scanner::new(ip, t.addr.port(), bd.scan_passes);
                                     log::info!(
                                         "birthday scan: host {ip} (announced port {}): probing its ports from the main socket at {} packets/s (at most ~{} NAT entries alive), repeated sweeps of {} ports, for up to {} s",
@@ -1789,6 +1794,17 @@ impl Tunnel {
             return Ok(());
         }
         let frames = self.reliable.poll(Instant::now());
+        // Forward mode: an idle guest still says it is there, so the host keeps its session (and
+        // refuses another guest) while a connection is merely quiet.
+        if frames.is_empty() && self.punched && self.mux.as_ref().is_some_and(|m| m.joined && m.last_tx.elapsed() >= FWD_KEEPALIVE) {
+            let d = self.seal_dgram(&[C_KEEPALIVE]);
+            if let Some(peer) = self.peer {
+                let _ = self.send_to(&d, peer).await;
+            }
+            if let Some(m) = self.mux.as_mut() {
+                m.last_tx = Instant::now();
+            }
+        }
         self.transmit(frames, true).await
     }
 
@@ -2059,6 +2075,9 @@ impl Tunnel {
     ///
     /// Frames go to the peer's direct address only; nothing is ever sent through a third party.
     async fn transmit(&mut self, frames: Vec<Frame>, _retransmit: bool) -> io::Result<()> {
+        if let Some(m) = self.mux.as_mut().filter(|_| !frames.is_empty()) {
+            m.last_tx = Instant::now();
+        }
         for frame in frames {
             let sealed = self.seal_dgram(&reliable::encode(&frame));
             self.sent_bytes += sealed.len() as u64;
@@ -2104,6 +2123,8 @@ const C_BYE: u8 = 0xC2;
 
 /// Idle time before a sealed keepalive is sent.
 pub const MUX_KEEPALIVE: Duration = Duration::from_secs(15);
+/// A personal invite's session counts as live (blocking a second device) while heard from this recently.
+const PERSONAL_LIVE: Duration = Duration::from_secs(40);
 /// Silence after which a peer is evicted (or the host declared dead).
 pub const MUX_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard ceiling on clients per host.
@@ -2785,7 +2806,7 @@ impl MuxHost {
             received_bytes: 0,
             cfg,
         };
-        host.token_key = handshake::token_key(&host.host_key);
+        host.token_key = handshake::token_key(&host.host_key, key);
         if let Some(rv) = host.cfg.rv.clone().filter(|_| udp_io.is_some()) {
             let backends = match &rv.backends {
                 Some(b) => b.iter().filter(|b| b.id() != "sig").cloned().collect(),
@@ -3192,6 +3213,15 @@ impl MuxHost {
             log::info!("refused {from}: this host only takes personal invites");
             return self.refuse(hs, &cn, VERDICT_REFUSED, from, via).await;
         }
+        // A personal invite works on one device at a time, so a copy cannot hide behind its owner:
+        // while the session is live, a join from another address is refused; a silent one is
+        // replaced once the new join confirms (see `confirm`).
+        if let Some(id) = guest {
+            if self.peers.iter().flatten().any(|p| p.confirmed && p.guest == Some(id) && p.addr != from && p.last_rx.elapsed() < PERSONAL_LIVE) {
+                log::info!("refused {from}: personal invite {id} is in use on another device");
+                return self.refuse(hs, &cn, VERDICT_FULL, from, via).await;
+            }
+        }
         // One network (an IPv4 address, an IPv6 /64) may hold a bounded share of the slots
         // (sidecar joins have no known network and are not capped here).
         let src = source_net(from);
@@ -3282,7 +3312,8 @@ impl MuxHost {
         p.confirmed = true;
         let (ip, from, via, guest) = (p.ip, p.addr, p.via, p.guest);
         if let Some(old) = (0..self.peers.len()).find(|&i| {
-            i != slot && self.peers[i].as_ref().is_some_and(|q| q.confirmed && q.addr == from && q.via == via)
+            i != slot
+                && self.peers[i].as_ref().is_some_and(|q| q.confirmed && ((q.addr == from && q.via == via) || (guest.is_some() && q.guest == guest)))
         }) {
             self.evict(old, "replaced by a new join");
         }

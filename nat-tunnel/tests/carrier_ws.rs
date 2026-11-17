@@ -164,6 +164,24 @@ async fn identity_is_a_pure_function_of_the_key() {
     assert_eq!(a.pin_hex().len(), 64);
 }
 
+/// With the host key: only the holder of the key the invite names completes TLS. A host that has
+/// the invite key but not the host key (anyone holding the invite) is refused, as is a wrong `hk`.
+#[tokio::test]
+async fn tls_is_bound_to_the_host_key() {
+    let sk = nat_tunnel::tunnel::handshake::new_host_key();
+    let hk = nat_tunnel::tunnel::handshake::hex(&nat_tunnel::tunnel::handshake::public_of(&sk));
+    let sk_hex = nat_tunnel::tunnel::handshake::hex(&sk);
+    let (h, addr) = host(true, &[("tls_sk", &sk_hex)]).await;
+    let c = client(addr, true, &[("tls_hk", &hk)]).await.expect("the real host is accepted");
+    c.send_to(b"hello", addr).await.unwrap();
+    assert_eq!(recv(&h).await.unwrap().0, b"hello");
+    // Same invite key, other host key: an invite holder posing as the host.
+    let (_fake, fake_addr) = host(true, &[]).await;
+    assert!(matches!(client(fake_addr, true, &[("tls_hk", &hk)]).await, Err(CarrierError::Blocked(m)) if m.starts_with("tls")));
+    let other = nat_tunnel::tunnel::handshake::hex(&nat_tunnel::tunnel::handshake::public_of(&nat_tunnel::tunnel::handshake::new_host_key()));
+    assert!(matches!(client(addr, true, &[("tls_hk", &other)]).await, Err(CarrierError::Blocked(m)) if m.starts_with("tls")));
+}
+
 #[tokio::test]
 async fn wrong_key_wrong_pin_is_blocked_and_delivers_nothing() {
     let (h, addr) = host(true, &[]).await;

@@ -195,6 +195,28 @@ pub struct Scanner {
     rng: Rng,
 }
 
+/// Scans of one address per hour in this process. The scan target comes from the host's signed
+/// record, so a malicious host can aim its guests at an address of its choice; this keeps
+/// reconnect attempts from turning that into a steady stream.
+pub const SCANS_PER_IP_PER_HOUR: usize = 3;
+
+/// Start times of recent scans, per address.
+pub struct ScanBudget(Vec<(Ipv4Addr, Instant)>);
+
+impl ScanBudget {
+    /// May a scan of `ip` start now? Records it when it may.
+    pub fn try_start(&mut self, ip: Ipv4Addr, now: Instant) -> bool {
+        self.0.retain(|(_, t)| now.saturating_duration_since(*t) < Duration::from_secs(3600));
+        if self.0.iter().filter(|(i, _)| *i == ip).count() >= SCANS_PER_IP_PER_HOUR {
+            return false;
+        }
+        self.0.push((ip, now));
+        true
+    }
+}
+
+pub static SCAN_BUDGET: std::sync::Mutex<ScanBudget> = std::sync::Mutex::new(ScanBudget(Vec::new()));
+
 /// Neighbours of the announced port tried first (sweep 1 only).
 const SCAN_NEAR: u16 = 64;
 
@@ -653,5 +675,15 @@ mod tests {
         let mut off = Sprayer::new(Birthday { enabled: false, ..cfg(10, 100) });
         off.add("10.1.2.3:5000".parse().unwrap(), Duration::from_secs(60));
         assert!(off.ips().is_empty());
+    }
+
+    #[test]
+    fn an_address_is_scanned_at_most_three_times_an_hour() {
+        let (mut b, t0) = (ScanBudget(Vec::new()), Instant::now());
+        let (a, c) = (Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(198, 51, 100, 2));
+        assert!((0..3).all(|_| b.try_start(a, t0)));
+        assert!(!b.try_start(a, t0 + Duration::from_secs(60)), "fourth scan within the hour");
+        assert!(b.try_start(c, t0), "other addresses have their own budget");
+        assert!(b.try_start(a, t0 + Duration::from_secs(3601)), "an hour later");
     }
 }

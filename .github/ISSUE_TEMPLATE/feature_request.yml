@@ -1,0 +1,17 @@
+name: Feature request
+description: An idea or an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+  - type: markdown
+    attributes:
+      value: Strait never relays tunnel traffic through a server; ideas that need a relay cannot be taken.

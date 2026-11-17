@@ -23,10 +23,15 @@
 //! never completes is closed silently after [`HEAD_TIMEOUT`]. Token and path are derivable by any invite holder (same documented
 //! limit as handshake v2); the end-to-end AEAD, not this token, protects the tunnel.
 //!
-//! TLS identity: a self-signed Ed25519 certificate that is a pure function of the invite key (TLS
-//! 1.3 only, so the certificate is not visible on the wire). The client accepts exactly that
-//! certificate (pin = SHA-256 of its DER, see [`Identity::pin_hex`]) and still verifies the TLS
-//! signature, so no CA is involved. A wrong key gives a TLS failure, typed `Blocked`.
+//! TLS identity: a self-signed Ed25519 certificate (TLS 1.3 only, so the certificate is not
+//! visible on the wire). With `tls_sk` (host) / `tls_hk` (client) its key is the host key that
+//! every invite names: the client ignores the certificate's contents and checks the TLS handshake
+//! signature against `hk`, so only the host can complete it, not anyone holding the invite.
+//! Without them (tests, the host check's self-probe) the key is derived from the invite key and the
+//! client pins that exact certificate. No CA is involved either way. A wrong key gives a TLS
+//! failure, typed `Blocked`. Probing: a prober still completes TLS and sees a self-signed
+//! certificate; the Xray (REALITY) carrier, or `tls=ca` behind a real certificate, is the choice
+//! where active probing matters.
 //!
 //! Peer keys: one WebSocket connection = one peer. Host side: the TCP remote address (IPv4-mapped
 //! normalized); behind a reverse proxy that is the proxy's IP with the per-connection source port.
@@ -195,6 +200,10 @@ struct Cfg {
     lowat: usize,
     /// In-process pipe between the pump and the carrier, bytes.
     pipe: usize,
+    /// Host: the host key (Ed25519 seed) the certificate is made with.
+    tls_sk: Option<zeroize::Zeroizing<[u8; 32]>>,
+    /// Client: the invite's `hk`; the TLS handshake must be signed with it.
+    tls_hk: Option<[u8; 32]>,
 }
 
 impl Cfg {
@@ -234,6 +243,8 @@ impl Cfg {
             in_queue: num("in_queue")?.map(|v| v as usize),
             lowat: num("lowat")?.map(|v| v as usize).unwrap_or(DEFAULT_LOWAT),
             pipe: num("pipe")?.map(|v| v as usize).unwrap_or(DEFAULT_PIPE).max(1024),
+            tls_sk: get("tls_sk").map(|v| crate::tunnel::handshake::unhex::<32>(v).map(zeroize::Zeroizing::new).ok_or_else(|| bad("tls_sk"))).transpose()?,
+            tls_hk: get("tls_hk").map(|v| crate::tunnel::handshake::unhex::<32>(v).ok_or_else(|| bad("tls_hk"))).transpose()?,
         })
     }
 
@@ -275,6 +286,14 @@ pub struct Identity {
 }
 
 impl Identity {
+    /// Use the host key for the certificate instead of the derived seed.
+    fn with_host_key(mut self, sk: Option<&[u8; 32]>) -> Identity {
+        if let Some(sk) = sk {
+            self.seed = *sk;
+        }
+        self
+    }
+
     pub fn derive(key: &[u8]) -> Identity {
         let hk = Hkdf::<Sha256>::new(None, key);
         let out = |label: &str, buf: &mut [u8]| hk.expand(format!("strait-ws-v1:{label}").as_bytes(), buf).expect("hkdf length");
@@ -381,6 +400,51 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
     }
 }
 
+/// Client check when the invite names the host key: the certificate's contents do not matter, the
+/// TLS 1.3 handshake signature must verify under `hk` (so the server holds the host key).
+#[derive(Debug)]
+struct HostKeyVerifier {
+    hk: [u8; 32],
+}
+
+impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &pki_types::CertificateDer<'_>,
+        _intermediates: &[pki_types::CertificateDer<'_>],
+        _name: &pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _m: &[u8],
+        _c: &pki_types::CertificateDer<'_>,
+        _d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(rustls::PeerIncompatible::Tls12NotOffered))
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        _c: &pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let sig: Option<&[u8; 64]> = d.signature().try_into().ok();
+        match sig {
+            Some(sig) if d.scheme == rustls::SignatureScheme::ED25519 && crate::tunnel::handshake::verify_sig(&self.hk, m, sig) => {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            _ => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)),
+        }
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
 fn client_tls(cfg: &Cfg, id: &Identity) -> Result<tokio_rustls::TlsConnector, CarrierError> {
     let p = provider();
     let b = rustls::ClientConfig::builder_with_provider(p.clone())
@@ -390,6 +454,8 @@ fn client_tls(cfg: &Cfg, id: &Identity) -> Result<tokio_rustls::TlsConnector, Ca
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         b.with_root_certificates(roots).with_no_client_auth()
+    } else if let Some(hk) = cfg.tls_hk {
+        b.dangerous().with_custom_certificate_verifier(Arc::new(HostKeyVerifier { hk })).with_no_client_auth()
     } else {
         let want = id.cert()?.0;
         b.dangerous()
@@ -735,7 +801,7 @@ fn warn_tcp(c: &WsCarrier) {
 /// on `bind_port` (0 = any).
 pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
     let cfg = Cfg::from_spec(spec)?;
-    let id = Identity::derive(&cfg.key);
+    let id = Identity::derive(&cfg.key).with_host_key(cfg.tls_sk.as_deref());
     let tls = if cfg.tls == TlsMode::Off { None } else { Some(server_tls(&id)?) };
     let punch_mode = spec.endpoint.is_none();
     let (l, bind) = match &spec.endpoint {

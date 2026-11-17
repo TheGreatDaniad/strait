@@ -59,7 +59,7 @@ fn personal_invite(invite: &str, key: [u8; 32], id: u32, days: u32) -> Result<St
         return Err("this invite was not made with this device's host key".into());
     }
     let expires = if days == 0 { 0 } else { handshake::now_secs().saturating_add(days.saturating_mul(86_400)) };
-    let token = handshake::mint(&handshake::token_key(&key), handshake::Token { id, expires });
+    let token = handshake::mint(&handshake::token_key(&key, &inv.key), handshake::Token { id, expires });
     Ok(inv.with_host_key(handshake::public_of(&key)).with_token(Some(token)).encode())
 }
 
@@ -114,9 +114,10 @@ enum Command {
     HostKey,
     /// Turn a session invite of this host into one for a single person
     PersonalInvite {
-        /// The session invite the host runs with
+        /// The session invite the host runs with: `-` reads it from standard input (default:
+        /// STRAIT_INVITE)
         #[arg(long)]
-        invite: String,
+        invite: Option<String>,
         /// A number for this person (1 and up); `host` logs it when they join and
         /// STRAIT_REVOKED lists the withdrawn ones
         #[arg(long)]
@@ -184,7 +185,7 @@ enum Command {
     },
     /// Expose a local TCP service, or a whole TUN network, through the tunnel
     Host {
-        /// Self-contained invite (key, public endpoint, optional signal server)
+        /// Self-contained invite: `-` reads it from standard input (default: STRAIT_INVITE)
         #[arg(long)]
         invite: Option<String>,
         /// Signaling address, only needed when the host is behind NAT
@@ -197,7 +198,7 @@ enum Command {
         /// Room name shared with the guest
         #[arg(long)]
         room: Option<String>,
-        /// Pre-shared key shared with the guest
+        /// Pre-shared key shared with the guest (`-` reads it from standard input)
         #[arg(long)]
         key: Option<String>,
         /// Guest endpoint from its offline reply; lets a NATed host punch out
@@ -285,7 +286,7 @@ enum Command {
     },
     /// Listen locally and forward each connection, or run as a TUN client
     Guest {
-        /// Self-contained invite (key, public endpoint, optional signal server)
+        /// Self-contained invite: `-` reads it from standard input (default: STRAIT_INVITE)
         #[arg(long)]
         invite: Option<String>,
         /// Signaling address, only needed when the host is behind NAT
@@ -294,7 +295,7 @@ enum Command {
         /// Room name shared with the host
         #[arg(long)]
         room: Option<String>,
-        /// Pre-shared key shared with the host
+        /// Pre-shared key shared with the host (`-` reads it from standard input)
         #[arg(long)]
         key: Option<String>,
         /// Local TCP address to accept connections on (default mode)
@@ -407,44 +408,6 @@ fn gui_fatal(msg: String) {
     });
 }
 
-/// The macOS window server refuses bare CLI processes running as root.
-#[cfg(feature = "gui")]
-fn guard_gui_root() {
-    // Root GUI works from an app bundle (`sudo Strait.app/Contents/MacOS/nat-tunnel gui`),
-    // the way users already run it; refusing here broke that.
-    // A double-clicked app is not root, so ask once for the administrator password and reopen as root.
-    // Root never runs a file the user can change: it installs its own root-owned copy in a root-only
-    // folder, checks that copy against the hash of the bytes this process read, and runs it. Root's
-    // settings and host key live in root's home (`app::config_dir`), not in the HOME passed here. Its output goes to a root-owned
-    // log (a path in the user's home could be a link to a system file).
-    #[cfg(target_os = "macos")]
-    if unsafe { libc::geteuid() } != 0 && std::env::var_os("STRAIT_NO_ELEVATE").is_none() {
-        let (Ok(exe), Some(home)) = (std::env::current_exe(), std::env::var("HOME").ok()) else { return };
-        let Ok(dir) = privileged::run_dir() else { return };
-        let paths = privileged::Paths::new(&dir);
-        let Ok(sha) = privileged::stage_exe(&paths, &exe) else { return };
-        let q = |s: &str| privileged::sh_quote(s);
-        let (stage, dest) = (q(&paths.stage.display().to_string()), q(privileged::INSTALL_EXE));
-        let sh = format!(
-            "{{ install -d -m 0755 -o root -g wheel {dir} && install -m 0755 -o root -g wheel {stage} {dest} && \
-             [ \"$(shasum -a 256 {dest} | cut -d' ' -f1)\" = {sha} ]; }} >/dev/null 2>&1 || {{ rm -f {dest}; exit 1; }}; \
-             HOME={home} {dest} gui >>/var/log/strait-gui.log 2>&1 </dev/null &",
-            dir = q(privileged::INSTALL_DIR),
-            sha = q(&sha),
-            home = q(&home),
-        );
-        // shortcut: a cancelled prompt falls through to the unprivileged window, which says admin is needed.
-        let ok = std::process::Command::new("/usr/bin/osascript")
-            .args(privileged::osascript_args(&sh))
-            .output()
-            .is_ok_and(|o| o.status.success());
-        let _ = std::fs::remove_file(&paths.stage);
-        if ok {
-            std::process::exit(0);
-        }
-    }
-}
-
 /// Raise SIGTERM on ourselves once the stop file appears, so the normal
 /// graceful-shutdown path runs. Another user's file is ignored.
 #[cfg(unix)]
@@ -528,7 +491,12 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             let k = app::host_key()?;
             println!("{}", handshake::hex(&handshake::public_of(&k)));
         }
-        Some(Command::PersonalInvite { invite, id, days }) => println!("{}", personal_invite(&invite, app::host_key()?, id, days)?),
+        Some(Command::PersonalInvite { invite, id, days }) => {
+            let invite = secret_arg(invite, "--invite")?
+                .or_else(|| std::env::var("STRAIT_INVITE").ok())
+                .ok_or("give the invite with `--invite -` (standard input) or STRAIT_INVITE")?;
+            println!("{}", personal_invite(&invite, app::host_key()?, id, days)?)
+        }
         Some(Command::Signal { port }) => {
             app::run_relay(port).await?;
         }
@@ -558,7 +526,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let userspace = userspace
                 || (cfg!(windows) && std::env::var_os("NAT_TUNNEL_KERNEL_TUN").is_none());
-            let mut resolved = resolve_endpoints(invite, relay, room, key, true).await?;
+            let mut resolved = resolve_endpoints(secret_arg(invite, "--invite")?, relay, room, secret_arg(key, "--key")?, true).await?;
             if peer.is_some() {
                 resolved.peer = peer;
             }
@@ -606,7 +574,6 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         }
         #[cfg(feature = "gui")]
         Some(Command::Gui) => {
-            guard_gui_root();
             #[cfg(windows)]
             {
                 // Double-click: UAC prompt, no console window, and a message box if the window cannot start.
@@ -662,7 +629,7 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             userspace,
         }) => {
             let tun = tun_config(tun, tun_name, tun_default_route, tun_bypass, None, None)?;
-            let mut resolved = resolve_endpoints(invite, relay, room, key, role_is_host(role)).await?;
+            let mut resolved = resolve_endpoints(secret_arg(invite, "--invite")?, relay, room, secret_arg(key, "--key")?, role_is_host(role)).await?;
             if role_is_host(role) && peer.is_some() {
                 resolved.peer = peer;
             }
@@ -735,8 +702,9 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(path) => Some(privileged::take_invite_file(std::path::Path::new(&path), uid)?),
                 #[cfg(not(unix))]
                 Some(_) => return Err("--invite-file is not supported on this platform".into()),
-                None => invite,
+                None => secret_arg(invite, "--invite")?,
             };
+            let key = secret_arg(key, "--key")?;
             // Hook for the transport integration: methods this client must never use.
             if rv_disable.is_empty() {
                 std::env::remove_var("NAT_TUNNEL_RV_DISABLE");
@@ -787,7 +755,6 @@ async fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             // subcommand. Show the dashboard instead of sitting in a console.
             #[cfg(feature = "gui")]
             {
-                guard_gui_root();
                 gui::run()?;
             }
             #[cfg(not(feature = "gui"))]
@@ -831,11 +798,8 @@ async fn resolve_endpoints(
     key: Option<String>,
     host: bool,
 ) -> Result<Resolved, Box<dyn std::error::Error>> {
-    // Keeps the invite out of `ps`: STRAIT_INVITE (e.g. from a systemd EnvironmentFile) when no
-    // --invite or --key was given. (clap's `env` feature is not enabled.)
-    if invite.is_some() || key.is_some() {
-        log::warn!("the invite key on the command line is visible to other users of this computer (process list); set STRAIT_INVITE instead");
-    }
+    // STRAIT_INVITE (e.g. from a systemd EnvironmentFile) when no --invite or --key was given.
+    // (clap's `env` feature is not enabled.)
     let invite = invite.or_else(|| {
         key.is_none().then(|| std::env::var("STRAIT_INVITE").ok().filter(|v| !v.trim().is_empty())).flatten()
     });
@@ -885,6 +849,24 @@ async fn resolve_endpoints(
         cr: Vec::new(),
         auth: Default::default(),
     })
+}
+
+/// A secret on the command line is readable by every user of this computer (process list), so
+/// `--invite`/`--key` take `-` and read the value from standard input; any other value is refused.
+fn secret_arg(v: Option<String>, flag: &str) -> Result<Option<String>, String> {
+    match v.as_deref() {
+        None => Ok(None),
+        Some("-") => {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).map_err(|e| format!("{flag} -: {e}"))?;
+            Some(line.trim().to_string()).filter(|t| !t.is_empty()).map(Some).ok_or(format!("{flag} -: nothing on standard input"))
+        }
+        Some(_) => Err(format!(
+            "{flag} on the command line is readable by every user of this computer (process list): \
+             use `{flag} -` and paste it, or pipe it in{}",
+            if flag == "--invite" { ", or set STRAIT_INVITE" } else { "" }
+        )),
+    }
 }
 
 /// Print the preflight verdict; unhostable networks exit non-zero.
@@ -1062,7 +1044,7 @@ mod tests {
         let text = personal_invite(&base, key, 4, 2).unwrap();
         let inv = nat_tunnel::invite::Invite::parse(&text).unwrap();
         assert_eq!(inv.host_key, Some(handshake::public_of(&key)));
-        let t = handshake::verify(&handshake::token_key(&key), &inv.token.unwrap(), handshake::now_secs()).unwrap();
+        let t = handshake::verify(&handshake::token_key(&key, &inv.key), &inv.token.unwrap(), handshake::now_secs()).unwrap();
         assert!(t.id == 4 && t.expires > handshake::now_secs() + 86_000);
         let p = guest_policy(false, Some("3, 9,x"));
         assert!(p.require_token.load(std::sync::atomic::Ordering::Relaxed), "withdrawing implies personal invites only");
@@ -1117,7 +1099,7 @@ mod tests {
         std::env::set_var("STRAIT_INVITE", good);
         let r = resolve_endpoints(None, None, None, None, true).await.unwrap();
         assert_eq!(r.key, "00112233445566778899aabbccddeeff");
-        // --invite wins over the environment.
+        // An explicit invite wins over the environment.
         let other = "STRAIT2|8f3a1c5e7b9d2046a1c3e5f7092b4d6e|127.0.0.1:7100".to_string();
         let r = resolve_endpoints(Some(other), None, None, None, true).await.unwrap();
         assert_eq!(r.key, "8f3a1c5e7b9d2046a1c3e5f7092b4d6e");
@@ -1127,6 +1109,14 @@ mod tests {
         assert!(resolve_endpoints(None, None, None, Some("k".into()), true).await.is_err());
         std::env::remove_var("STRAIT_INVITE");
         assert!(resolve_endpoints(None, None, None, None, true).await.is_err());
+    }
+
+    #[test]
+    fn secrets_are_refused_on_the_command_line() {
+        assert_eq!(secret_arg(None, "--invite"), Ok(None));
+        let e = secret_arg(Some("STRAIT2|00112233445566778899aabbccddeeff|1.2.3.4:5".into()), "--invite").unwrap_err();
+        assert!(e.contains("process list") && e.contains("STRAIT_INVITE"), "{e}");
+        assert!(secret_arg(Some("k".into()), "--key").is_err());
     }
 
     #[test]

@@ -744,7 +744,7 @@ pub mod rvui {
 
     pub const PICK_HEADING: &str = "Pick at least one way for the two devices to find each other:";
 
-    pub const SEEN_MESSAGE: &str = "What these services see:\n• Your public IP address and when you connect\n• A code only you and the other device can work out\n• The address you publish, sealed so only the other device can read it (trackers can read it, that is how trackers work)\nWhat they never see:\n• Your traffic\n• The invite key\n• Anything readable about what you are doing\nThey are public services run by others, with no promise of uptime. MQTT brokers are for testing and may reset at any time.";
+    pub const SEEN_MESSAGE: &str = "What these services see:\n• Your public IP address and when you connect\n• A code only you and the other device can work out\n• The address you publish, sealed so only the other device can read it\nWhat they never see:\n• Your traffic\n• The invite key\n• Anything readable about what you are doing\nThey are public services run by others, with no promise of uptime. MQTT brokers are for testing and may reset at any time.";
 
     /// Very short description for the picker.
     pub fn short(id: &str) -> &'static str {

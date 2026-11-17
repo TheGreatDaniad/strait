@@ -174,7 +174,8 @@ fn local_host_both_fd_paths() {
     let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let invite = format!("STRAIT2|00112233445566778899aabbccddeeff|127.0.0.1:{port}");
     let mut child = Command::new(env!("CARGO_BIN_EXE_nat-tunnel"))
-        .args(["host", "--invite", &invite, "--tun", "10.7.0.1/16", "--userspace", "--max-clients", "2"])
+        .args(["host", "--tun", "10.7.0.1/16", "--userspace", "--max-clients", "2"])
+        .env("STRAIT_INVITE", &invite)
         .env("RUST_LOG", "info")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

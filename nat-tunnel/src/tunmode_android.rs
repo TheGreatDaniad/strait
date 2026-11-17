@@ -126,10 +126,9 @@ pub mod proto;
 
 /// Connect to Kotlin's fd socket, announce the assigned address, receive the TUN fd.
 ///
-/// Note: an abstract-namespace name (`@...`) can be bound by any app on the device that gets there
-/// first, which could then hand over a fake TUN fd. The Kotlin side should use a fresh random name
-/// per session (or a socketpair passed to this process) and check the peer's uid (SO_PEERCRED);
-/// not verified here.
+/// An abstract-namespace name (`@...`) can be bound by any app on the device that gets there first,
+/// which could then hand over a fake TUN fd: the listener must run as our own uid (SO_PEERCRED).
+/// The Kotlin side picks a fresh random name per session and checks our uid the same way.
 fn recv_fd(name: &str, ip: Ipv4Addr, prefix: u8, gw: Ipv4Addr) -> io::Result<i32> {
     use std::mem::{size_of, zeroed};
     use std::os::unix::ffi::OsStrExt;
@@ -184,6 +183,15 @@ fn recv_fd(name: &str, ip: Ipv4Addr, prefix: u8, gw: Ipv4Addr) -> io::Result<i32
     if !connected {
         unsafe { libc::close(sock) };
         return Err(last_err.unwrap_or_else(|| io::Error::other("fd socket connect failed")));
+    }
+    let mut cred: libc::ucred = unsafe { zeroed() };
+    let mut cred_len = size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(sock, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut libc::ucred as *mut libc::c_void, &mut cred_len)
+    };
+    if rc != 0 || cred.uid != unsafe { libc::getuid() } {
+        unsafe { libc::close(sock) };
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the fd socket belongs to another app"));
     }
 
     let r = proto::request_fd(sock, ip, prefix, gw);

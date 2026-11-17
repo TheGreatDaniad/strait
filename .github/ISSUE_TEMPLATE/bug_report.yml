@@ -1,0 +1,48 @@
+name: Bug report
+description: Something does not work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems: please report them privately (Security tab, "Report a vulnerability") instead.
+        Remove invites (`STRAIT2|...`) and keys from anything you paste here.
+  - type: input
+    id: version
+    attributes:
+      label: Strait version
+      description: "`nat-tunnel --version`, or the release you downloaded"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, macOS, Windows, Android, iOS, Other]
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: This device was the
+      options: [Host (sharing), Guest (connecting), Both / not sure]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: network
+    attributes:
+      label: Network check
+      description: Output of `nat-tunnel check-host`, or the result of the network check in the app
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `RUST_LOG=info`. Remove invites and keys.
+      render: text

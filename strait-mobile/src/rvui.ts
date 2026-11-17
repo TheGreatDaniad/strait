@@ -33,7 +33,7 @@ export const TRAFFIC_LINE =
   'Your traffic goes only between you and the other device; these services never carry it.';
 export const PICK_HEADING = 'Pick at least one way for the two devices to find each other:';
 export const SEEN_MESSAGE =
-  'What these services see:\n• Your public IP address and when you connect\n• A code only you and the other device can work out\n• The address you publish, sealed so only the other device can read it (trackers can read it, that is how trackers work)\nWhat they never see:\n• Your traffic\n• The invite key\n• Anything readable about what you are doing\nThey are public services run by others, with no promise of uptime. MQTT brokers are for testing and may reset at any time.';
+  'What these services see:\n• Your public IP address and when you connect\n• A code only you and the other device can work out\n• The address you publish, sealed so only the other device can read it\nWhat they never see:\n• Your traffic\n• The invite key\n• Anything readable about what you are doing\nThey are public services run by others, with no promise of uptime. MQTT brokers are for testing and may reset at any time.';
 export const DIRECT_TITLE = 'Connectable';
 export const DIRECT_COPY = 'Clients can reach this device directly, so no extra service is needed.';
 
@@ -85,9 +85,11 @@ const DIRECT_LABEL: Record<string, string> = {
 export const directLabel = (method: string) => DIRECT_LABEL[method] ?? method;
 
 // ---- picker ----
-/** Methods offered in the Host list (`sig` only with a configured signal server). */
+/** Methods offered in the Host list (`sig` only with a configured signal server). Trackers are
+ *  never offered: their announces are not encrypted, so anyone on the path could list who uses
+ *  an invite (same rule as the desktop app). */
 export const offered = (hasSignal: boolean, compiled: readonly string[] = KNOWN) =>
-  compiled.filter(i => i !== 'sig' || hasSignal);
+  compiled.filter(i => (i !== 'sig' || hasSignal) && i !== 'trk');
 
 export type MethodState =
   | { kind: 'checking' }

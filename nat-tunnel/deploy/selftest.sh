@@ -28,10 +28,10 @@ printf 'STRAIT_INVITE=STRAIT2|%s|1.2.3.4:7100\n' "$LAB" > "$ENVF"
 D > /dev/null 2>&1; ok "lab key in host.env refused without --rotate" $([ $? -ne 0 ] && echo 0 || echo 1)
 grep -q "$LAB" "$ENVF"; ok "refusal left file untouched" $?
 D --rotate > /dev/null 2>&1; ! grep -q "$LAB" "$ENVF"; ok "--rotate replaces the lab key" $?
-D --print-units | grep -q 'ExecStart=.*host --invite'; ok "--print-units prints the host unit" $?
+D --print-units | grep -q 'ExecStart=.*nat-tunnel host'; ok "--print-units prints the host unit" $?
 ! D --print-units | grep -q -- '--forward 127.0.0.1:22'; ok "no placeholder --forward in units" $?
 ! grep -q '^IPAddressDeny' "$HERE/strait-host.service"; ok "host unit sets no IPAddressDeny" $?
 for f in deploy.sh selftest.sh verify.sh; do bash -n "$HERE/$f"; ok "bash -n $f" $?; done
 if command -v shellcheck >/dev/null; then shellcheck "$HERE"/*.sh; ok shellcheck $?; else echo "skip shellcheck (not installed)"; fi
-echo "invite parse: regex only (the CLI has no parse-only path; guest --invite would dial)"
+echo "invite parse: regex only (the CLI has no parse-only path; a guest would dial)"
 exit $fail

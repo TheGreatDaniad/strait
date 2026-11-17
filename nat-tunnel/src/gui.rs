@@ -842,6 +842,10 @@ struct GuiApp {
     guest_name: String,
     guest_days: u32,
     guest_policy: crate::transport::GuestPolicy,
+    /// "Change every invite": sharing stopped; start again with a new invite key at this time.
+    rotate_at: Option<Instant>,
+    /// Start sharing as soon as the running network check finishes.
+    host_after_check: bool,
     new_signal: String,
     signal_error: Option<String>,
 
@@ -907,6 +911,8 @@ impl GuiApp {
             guest_name: String::new(),
             guest_days: 0,
             guest_policy: Default::default(),
+            rotate_at: None,
+            host_after_check: false,
             new_signal: String::new(),
             signal_error: None,
             rate_value: if settings.rate_bytes == 0 {
@@ -1012,7 +1018,16 @@ impl GuiApp {
                     Err(e) => CheckState::Failed(e),
                 };
                 self.check_rx = None;
+                if std::mem::take(&mut self.host_after_check) && matches!(self.check, CheckState::Done(_)) {
+                    self.host();
+                }
             }
+        }
+        // Every check makes a new invite key, so sharing again replaces every invite.
+        if self.rotate_at.is_some_and(|t| Instant::now() >= t) && !self.busy() {
+            self.rotate_at = None;
+            self.host_after_check = true;
+            self.run_check();
         }
         if let Some(rx) = &self.start_rx {
             if let Ok(result) = rx.try_recv() {
@@ -1338,17 +1353,16 @@ impl GuiApp {
         if self.busy() {
             return false;
         }
-        if !is_admin() {
+        // Sharing uses the userspace exit (no TUN, no routes), so on macOS and Linux it runs as the user.
+        let needs_admin = cfg!(windows) || mode != Mode::Host;
+        if needs_admin && !is_admin() {
             let exe = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "nat-tunnel".to_string());
             self.error = Some(if cfg!(windows) {
                 "Full tunnel needs administrator access. Close Strait and run it as administrator.".to_string()
-            } else if cfg!(target_os = "macos") && mode == Mode::Host {
-                let more = if self.cr_listen.is_empty() { "" } else { " --carriers-from-invite" };
-                format!("Sharing needs administrator access. In a terminal run: sudo {exe} host --invite '<your invite>' --tun 10.7.0.1/24{more}")
             } else {
-                // Linux without pkexec; the window itself may run as root there.
+                // Unix without a way to ask for the password (no pkexec).
                 format!("Full tunnel needs administrator access. Quit and run: sudo {exe} gui")
             });
             return false;
@@ -1472,8 +1486,8 @@ impl GuiApp {
                 return;
             }
         };
-        let paths = privileged::Paths::new(&dir);
-        for p in [&paths.log, &paths.pid, &paths.stop, &paths.invite, &paths.err] {
+        let paths = privileged::Paths::new(&dir, &privileged::state_dir(unsafe { libc::geteuid() }));
+        for p in [&paths.stop, &paths.invite] {
             let _ = std::fs::remove_file(p);
         }
         let (tx, rx) = mpsc::channel();
@@ -1538,8 +1552,10 @@ impl GuiApp {
                 dest_exe: privileged::INSTALL_EXE,
                 hash_cmd,
                 group,
+                state_dir: &ps.paths.state,
                 err: &ps.paths.err,
                 pid_file: &ps.paths.pid,
+                env: &privileged::child_env(),
             },
             &args,
         )?;
@@ -2022,6 +2038,8 @@ struct GuestRow {
     removed: bool,
 }
 
+const CHANGE_ALL_INTRO: &str = "Changing every invite disconnects everyone and makes a new shared invite. Old invites, personal ones too, stop working, so a removed person cannot even see where you are. Copy a new personal invite for each person who should stay.";
+
 const PEOPLE_INTRO: &str = "The invite above works for anyone who has it. A personal invite is for one person: you see when they are connected, and you can remove just them.";
 
 fn valid_for_label(days: u32) -> &'static str {
@@ -2046,7 +2064,7 @@ fn guest_status(online: usize, expires: u32, now: u32) -> (&'static str, Chip) {
 /// The session invite with guest `id`'s token: the text to give that one person.
 fn personal_invite(session_invite: &str, host_key: &[u8; 32], id: u32, expires: u32) -> Option<String> {
     let inv = Invite::parse(session_invite)?;
-    let token = handshake::mint(&handshake::token_key(host_key), handshake::Token { id, expires });
+    let token = handshake::mint(&handshake::token_key(host_key, &inv.key), handshake::Token { id, expires });
     Some(inv.with_token(Some(token)).encode())
 }
 
@@ -3188,6 +3206,16 @@ impl GuiApp {
         }
         if let Some(slot) = drop_slot {
             app::kick_slot(slot);
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new(CHANGE_ALL_INTRO).font(ui_font(12.0)).color(TEXT_MUTED));
+        ui.add_space(4.0);
+        if button_sized(ui, "Change every invite", ButtonKind::Secondary, self.rotate_at.is_none(), egui::vec2(170.0, 30.0), 8, 12.0).clicked() {
+            // Old personal invites die with the old invite key, so removed people need no lock any more.
+            self.settings.guests.retain(|g| !g.removed);
+            let _ = self.settings.save();
+            self.stop();
+            self.rotate_at = Some(Instant::now() + Duration::from_millis(3500)); // the old session releases its port
         }
     }
 
@@ -4744,7 +4772,7 @@ mod tests {
         let text = personal_invite(&session, &key, 3, 0).unwrap();
         let inv = Invite::parse(&text).unwrap();
         assert_eq!((inv.key.as_str(), inv.host_key, inv.rv.clone()), (KEY, Some(handshake::public_of(&key)), vec!["trk".to_string()]));
-        let t = handshake::verify(&handshake::token_key(&key), &inv.token.unwrap(), 0).unwrap();
+        let t = handshake::verify(&handshake::token_key(&key, &inv.key), &inv.token.unwrap(), 0).unwrap();
         assert_eq!((t.id, t.expires), (3, 0));
         assert_eq!(guest_status(1, 0, 5).0, "Connected");
         assert_eq!(guest_status(0, 4, 5).0, "Expired");

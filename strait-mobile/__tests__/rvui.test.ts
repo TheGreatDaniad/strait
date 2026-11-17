@@ -34,7 +34,7 @@ test('nat copy', () => {
 });
 
 test('offered, labels, chips', () => {
-  expect(r.offered(false)).toEqual(['trk', 'nostr', 'dht', 'ntfy', 'mqtt']);
+  expect(r.offered(false)).toEqual(['nostr', 'dht', 'ntfy', 'mqtt']);
   expect(r.offered(true)[0]).toBe('sig');
   expect(r.pickerLabel('sig', ['1.2.3.4:7000'])).toBe('Your signal server 1.2.3.4:7000');
   expect(r.pickerLabel('trk', [])).toBe('Trackers');

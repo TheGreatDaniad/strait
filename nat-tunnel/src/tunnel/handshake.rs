@@ -211,8 +211,10 @@ pub enum TokenError {
     Expired,
 }
 
-pub fn token_key(host_private: &[u8; 32]) -> [u8; 32] {
-    hmac(host_private, &[b"strait-guest-token-v3"])
+/// Key for personal-invite tokens: bound to the host key and to the invite key, so replacing the
+/// invite also cancels every personal invite made from it.
+pub fn token_key(host_private: &[u8; 32], invite_key: &str) -> [u8; 32] {
+    hmac(host_private, &[b"strait-guest-token-v4", invite_key.as_bytes()])
 }
 
 pub fn mint(key: &[u8; 32], t: Token) -> [u8; TOKEN_LEN] {
@@ -348,7 +350,7 @@ mod tests {
 
     #[test]
     fn tokens_verify_expire_and_cannot_be_forged() {
-        let key = token_key(&new_host_key());
+        let key = token_key(&new_host_key(), "k");
         let t = mint(&key, Token { id: 7, expires: 1000 });
         assert_eq!(verify(&key, &t, 999), Ok(Token { id: 7, expires: 1000 }));
         assert_eq!(verify(&key, &t, 1000), Err(TokenError::Expired));
@@ -356,7 +358,8 @@ mod tests {
         let mut forged = t;
         forged[3] = 8; // another guest's id under the same MAC
         assert_eq!(verify(&key, &forged, 0), Err(TokenError::Forged));
-        assert_eq!(verify(&token_key(&new_host_key()), &t, 0), Err(TokenError::Forged));
+        assert_eq!(verify(&token_key(&new_host_key(), "k"), &t, 0), Err(TokenError::Forged));
+        assert_eq!(verify(&token_key(&[7; 32], "other invite"), &mint(&token_key(&[7; 32], "k"), Token { id: 1, expires: 0 }), 0), Err(TokenError::Forged), "a new invite key cancels old tokens");
         assert_eq!(verify(&key, &t[..10], 0), Err(TokenError::Malformed));
         assert_eq!(unhex::<24>(&hex(&t)), Some(t));
         assert_eq!(unhex::<24>("zz"), None);

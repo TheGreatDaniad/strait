@@ -715,9 +715,13 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
 }
 
 /// Accept TCP connections and tunnel each one to the host side.
-pub async fn run_guest(opts: GuestOpts) -> io::Result<()> {
+pub async fn run_guest(mut opts: GuestOpts) -> io::Result<()> {
     // Nothing a retry changes: say so once and stop.
     crate::transport::check_host_key(&opts.auth).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // The ws carrier's TLS handshake must be signed with the host key the invite names.
+    if let Some(hk) = opts.auth.host_key {
+        opts.carrier_cfg.extra.push(("tls_hk".into(), crate::tunnel::handshake::hex(&hk)));
+    }
     let opts_ref = &opts;
     if let Some(cfg) = opts.tun.clone() {
         return run_tun_guest(&opts, cfg, "guest".to_string()).await;
@@ -941,7 +945,14 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
     let (shared, own): (Vec<CarrierEntry>, Vec<CarrierEntry>) =
         opts.carrier_list().into_iter().partition(|e| matches!(e.id, CarrierId::Ss | CarrierId::Awg) && e.endpoint.is_none());
     let shared: Vec<CarrierId> = shared.iter().map(|e| e.id).collect();
-    let (ios, failed) = start_carriers(&own, &opts.key, &opts.carrier_cfg).await;
+    let host_secret = match opts.host_key {
+        Some(k) => k,
+        None => host_key()?,
+    };
+    // The ws certificate is made with the host key, which guests check (see `carrier::ws`).
+    let mut carrier_cfg = opts.carrier_cfg.clone();
+    carrier_cfg.extra.push(("tls_sk".into(), crate::tunnel::handshake::hex(&host_secret)));
+    let (ios, failed) = start_carriers(&own, &opts.key, &carrier_cfg).await;
     for (id, why) in &failed {
         ui::status(&format!("carrier {id} not started: {why}"));
     }
@@ -992,10 +1003,7 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
             udp: !opts.no_udp,
             carriers: IoList(ios),
             shared,
-            host_key: Some(match opts.host_key {
-                Some(k) => k,
-                None => host_key()?,
-            }),
+            host_key: Some(host_secret),
             guests: opts.guests.clone(),
             timeout: peer_timeout(std::env::var("NAT_TUNNEL_PEER_TIMEOUT_SECS").ok().as_deref()),
             ..MuxConfig::default()
@@ -1220,6 +1228,47 @@ fn for_guest(packet: &[u8], local: Ipv4Addr) -> bool {
     packet.len() >= 20 && packet[0] >> 4 == 4 && packet[16..20] == local.octets()
 }
 
+/// The guest takes only replies from the host: a TCP segment that opens a connection (SYN without
+/// ACK) is dropped, and UDP reaches only a local port that sent through the tunnel in the last
+/// 3 minutes. So a host cannot connect to services that listen on the guest's device.
+#[derive(Default)]
+struct GuestInbound {
+    udp: std::collections::HashMap<u16, std::time::Instant>,
+}
+
+const UDP_REPLY_WINDOW: Duration = Duration::from_secs(180);
+const UDP_PORTS_KEPT: usize = 4096;
+
+/// (protocol, header length) of an IPv4 packet's first fragment; None for a later fragment.
+fn l4(p: &[u8]) -> Option<(u8, usize)> {
+    (p.len() >= 20 && u16::from_be_bytes([p[6], p[7]]) & 0x1fff == 0).then(|| (p[9], ((p[0] & 0x0f) as usize) * 4))
+}
+
+impl GuestInbound {
+    fn note_out(&mut self, p: &[u8]) {
+        if let Some((17, ihl)) = l4(p) {
+            if p.len() >= ihl + 2 {
+                let now = std::time::Instant::now();
+                if self.udp.len() >= UDP_PORTS_KEPT {
+                    self.udp.retain(|_, t| now.duration_since(*t) < UDP_REPLY_WINDOW);
+                }
+                self.udp.insert(u16::from_be_bytes([p[ihl], p[ihl + 1]]), now);
+            }
+        }
+    }
+
+    fn allow_in(&self, p: &[u8]) -> bool {
+        match l4(p) {
+            Some((6, ihl)) => p.len() >= ihl + 14 && !(p[ihl + 13] & 0x02 != 0 && p[ihl + 13] & 0x10 == 0),
+            Some((17, ihl)) => {
+                p.len() >= ihl + 4
+                    && self.udp.get(&u16::from_be_bytes([p[ihl + 2], p[ihl + 3]])).is_some_and(|t| t.elapsed() < UDP_REPLY_WINDOW)
+            }
+            _ => true, // ICMP (errors, the host's ping) and later fragments
+        }
+    }
+}
+
 fn guest_packet_allowed(packet: &[u8]) -> bool {
     userspace::packet_allowed(packet)
 }
@@ -1354,6 +1403,7 @@ async fn pipe_tun(
 
     let mut tun_read = 0u64;
     let mut tun_written = 0u64;
+    let mut inbound = GuestInbound::default();
     let mut last_sent = tunnel.bytes_sent();
     let mut last_recv = tunnel.bytes_received();
     let mut last_report = tokio::time::Instant::now();
@@ -1362,7 +1412,7 @@ async fn pipe_tun(
         loop {
             match tunnel.try_recv().await? {
                 Some(Event::Data(ip)) => {
-                    if !for_guest(&ip, local) {
+                    if !for_guest(&ip, local) || !inbound.allow_in(&ip) {
                         continue;
                     }
                     if let Some(limiter) = limiter {
@@ -1414,6 +1464,7 @@ async fn pipe_tun(
                 if let Some(limiter) = limiter {
                     limiter.wait(n).await;
                 }
+                inbound.note_out(&buf[..n]);
                 tunnel.send_packet(&buf[..n]).await?;
 
                 // Drain what the interface already has queued. One async wait
@@ -1429,6 +1480,7 @@ async fn pipe_tun(
                     if let Some(limiter) = limiter {
                         limiter.wait(more).await;
                     }
+                    inbound.note_out(&buf[..more]);
                     tunnel.send_packet(&buf[..more]).await?;
                 }
             }
@@ -1567,6 +1619,31 @@ mod tests {
         assert!(!for_guest(&to([10, 7, 0, 4]), me), "another guest");
         assert!(!for_guest(&[0x60; 40], me), "IPv6");
         assert!(!for_guest(&[0x45; 10], me), "truncated");
+    }
+
+    #[test]
+    fn the_host_cannot_open_connections_to_the_guest() {
+        let pkt = |proto: u8, sport: u16, dport: u16, flags: u8| {
+            let mut p = vec![0u8; 40];
+            p[0] = 0x45;
+            p[9] = proto;
+            p[20..22].copy_from_slice(&sport.to_be_bytes());
+            p[22..24].copy_from_slice(&dport.to_be_bytes());
+            p[33] = flags;
+            p
+        };
+        let mut g = GuestInbound::default();
+        assert!(!g.allow_in(&pkt(6, 4444, 22, 0x02)), "TCP SYN to the guest's SSH");
+        assert!(g.allow_in(&pkt(6, 443, 50000, 0x12)), "SYN-ACK answering the guest");
+        assert!(g.allow_in(&pkt(6, 443, 50000, 0x10)), "data on an open connection");
+        assert!(!g.allow_in(&pkt(17, 53, 5353, 0)), "UDP to a port the guest never used");
+        g.note_out(&pkt(17, 5353, 53, 0));
+        assert!(g.allow_in(&pkt(17, 53, 5353, 0)), "the DNS reply");
+        assert!(g.allow_in(&pkt(1, 0, 0, 0)), "ICMP");
+        let mut frag = pkt(6, 4444, 22, 0x02);
+        frag[6] = 0x00;
+        frag[7] = 0x10; // a later fragment: no TCP header to judge
+        assert!(g.allow_in(&frag));
     }
 
     #[test]

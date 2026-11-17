@@ -21,8 +21,8 @@ Thormarker, "On using the same key pair for Ed25519 and an X25519 based KEM" (IA
 Noise `NKpsk0` with X25519, ChaCha20-Poly1305 and SHA-256, through the `snow` crate. Prologue
 `strait-join-v3`. Full-tunnel mode and forward mode (one guest, TCP bridge) use it alike. A
 forward-mode host applies the same personal-invite rules, refuses a JOIN from another address as
-full while the current guest was heard from in the last 30 s, and opens a new connection to the
-forwarded service for every new session.
+full while the current guest was heard from in the last 30 s (an idle guest sends a keepalive every
+10 s), and opens a new connection to the forwarded service for every new session.
 
 | Input | Value |
 |---|---|
@@ -64,7 +64,8 @@ What this gives:
 ## Personal invites
 
 A token is `id (4) | expires (4, Unix seconds, 0 = none) | HMAC(token key, "guest" ‖ id ‖ expires)[..16]`,
-with `token key = HMAC(host key, "strait-guest-token-v3")`. It travels in the invite as `gt=` and on
+with `token key = HMAC(host key, "strait-guest-token-v4" ‖ invite key)`: a token works only with the
+invite it was made from. It travels in the invite as `gt=` and on
 the wire only inside Noise message 1, encrypted to the host.
 
 - The host verifies it without stored state, knows which invite joined, and can withdraw one id.
@@ -73,10 +74,17 @@ the wire only inside Noise message 1, encrypted to the host.
   window keeps its personal invites, withdrawn ones included, in its settings: ids are never
   reused, a withdrawal survives a restart, and the switch stays on while a withdrawn invite has
   not expired.
-- A token is a bearer secret: whoever holds a copy of that personal invite can use it.
+- A personal invite works on one device at a time: while its session was heard from in the last
+  40 s, a join with the same token from another address is refused as full; a silent session is
+  replaced once the new one confirms. A copy can still be used while the owner is offline.
+- "Change every invite" in the window stops sharing and starts again with a new invite key. Every
+  old invite stops working, personal ones too (their tokens are bound to the old invite key), so
+  a removed person no longer has the keys to the rendezvous records either.
 
-Command line: `host-key`, `personal-invite --invite … --id N [--days D]`, `host --personal-only`,
-`STRAIT_REVOKED=3,9`.
+Command line: `host-key`, `personal-invite --id N [--days D]`, `host --personal-only`,
+`STRAIT_REVOKED=3,9`. The invite and a raw `--key` never go on the command line, where every user
+of the computer can read them: they come from `STRAIT_INVITE`, or `--invite -` / `--key -` read
+them from standard input.
 
 ## Session keys
 
@@ -101,6 +109,9 @@ Command line: `host-key`, `personal-invite --invite … --id N [--days D]`, `hos
   a host sprays only sealed client records, at no more than 16 new addresses an hour.
 - The address a host signs comes from STUN only when two servers agree on it (or only one is
   configured).
+- A host record carries its signing time inside the signature and is refused 2 minutes later.
+- The birthday scan a symmetric-NAT host needs sends to ports 1024 and up of at most 2 addresses
+  from signed records, for at most 3 minutes, and a guest scans one address at most 3 times an hour.
 - The signal-server room changes every UTC day, like the other identifiers; the server does not
   let another address replace a host registration that is still live.
 
@@ -115,15 +126,45 @@ ranges, 192.0.0.0/24 and 198.18.0.0/15, never the cloud addresses; `STRAIT_EXIT_
 `STRAIT_EXIT_ALLOW_HOST=1` (labs) lets guests reach services on the host's tunnel address. Each
 guest may keep 64 TCP flows open through the userspace exit.
 
-A guest, in turn, only takes packets from the host addressed to its own tunnel address.
+A guest, in turn, only takes packets from the host that are addressed to its own tunnel address
+and answer something it sent: a TCP segment that opens a connection (SYN without ACK) is dropped,
+and UDP only reaches a local port that sent through the tunnel in the last 3 minutes. The host can
+ping the guest's tunnel address, but not connect to services on the guest's device.
+
+## WebSocket carrier identity
+
+The `ws` carrier's TLS certificate is made with the host key. A guest ignores the certificate's
+contents and checks the TLS 1.3 handshake signature against `hk`, so only the host can complete
+TLS; holding the invite is not enough. A prober without the invite still completes TLS and sees a
+self-signed certificate: where active probing matters, the Xray (REALITY) carrier, or `tls=ca`
+behind a real certificate, is the choice.
+
+## Privileges
+
+Sharing needs no administrator rights on macOS and Linux (the userspace exit). A full-tunnel guest
+asks for the password once per connection, and only the tunnel runs as root: the window stays an
+ordinary process. Root installs a verified copy of the program into
+`/Library/PrivilegedHelperTools/strait` (macOS) or `/usr/local/libexec/strait` (Linux), and writes
+its log only into `/var/run/strait/<uid>`, a folder it creates itself. It receives the rendezvous
+and carrier choices only, never a path to another program. Windows still runs the whole window as
+administrator.
+
+## Formal model
+
+`docs/proverif/strait_nkpsk0.pv` is a symbolic ProVerif model of the join against an attacker who
+holds the invite. ProVerif 2.05 proves that the guest's token and its traffic stay secret, that a
+guest that finishes a join has talked to the holder of the host key (injective agreement on both
+ephemeral keys and the session key), and that a host that sees the guest's token got it from that
+guest (results in `docs/proverif/README.md`). It leaves out the clock check,
+the replay cache, rotation and the rendezvous and carrier layers. Nonce uniqueness is argued under
+Session keys above.
 
 ## Not covered
 
-- A signed host record stays valid for its day, so an invite holder can replay it for the rest of
-  that day (guests then also try the host's previous address).
-- A host record that names an address makes guests probe many ports of it (the birthday scan a
-  symmetric NAT needs). A malicious host can point its guests' probes at an address of its choice
-  for a few minutes; guests do not scan addresses from unsigned sources.
-
-- Nothing here has been reviewed by an outside party or modelled formally.
+- An invite holder can replay a signed host record within its 2 minutes.
+- A malicious host can point its guests' birthday scan at an address of its choice, within the
+  limits above (high ports, 3 minutes, 3 times an hour).
+- A copy of a personal invite works while its owner is not connected.
+- No kill switch: if Strait stops, traffic uses the normal connection again.
+- Nothing here has been reviewed by an outside party.
 - The host owner sees where a guest's traffic goes and its unencrypted content, as any VPN exit does.

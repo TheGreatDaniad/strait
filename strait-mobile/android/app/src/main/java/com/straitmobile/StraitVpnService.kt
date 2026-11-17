@@ -90,8 +90,9 @@ class StraitVpnService : VpnService() {
     // then build the interface and pass its fd back over SCM_RIGHTS
     // (ProcessBuilder does not reliably inherit arbitrary descriptors).
     // LocalServerSocket(String) uses the Linux abstract namespace; the Rust
-    // side receives this as @strait-<package>.
-    val socketName = "strait-${packageName}"
+    // side receives this as @strait-<package>-<random>. A fresh random name per
+    // session: another app cannot claim it first (the core also checks our uid).
+    val socketName = "strait-${packageName}-${java.util.UUID.randomUUID()}"
     val server = try {
       LocalServerSocket(socketName)
     } catch (e: Exception) {

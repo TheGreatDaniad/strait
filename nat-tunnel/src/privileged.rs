@@ -2,8 +2,10 @@
 //!
 //! On macOS a bare CLI binary running as root cannot be a GUI process (the
 //! window-server connection crashes), so the GUI stays the normal user and
-//! starts `guest --tun ...` as root through one admin prompt. Everything here
-//! is pure or file-level so it can be tested without sudo.
+//! starts `guest --tun ...` as root through one admin prompt. Hosting needs no
+//! root (the userspace exit). Root writes only into a root-owned state folder,
+//! never into the user's folders. Everything here is pure or file-level so it
+//! can be tested without sudo.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -31,10 +33,14 @@ pub fn applescript_quote(s: &str) -> String {
     out
 }
 
-/// Files shared between the GUI and the privileged child, in a 0700 user dir.
+/// Files shared between the GUI and the privileged child. The user writes `stop`, `invite` and
+/// the staged binary in its 0700 `dir`; root writes `log`, `pid` and `err` only in `state`, a
+/// folder root creates and owns, so a link planted in the user's folders never redirects a
+/// root write.
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub dir: PathBuf,
+    pub state: PathBuf,
     pub log: PathBuf,
     pub pid: PathBuf,
     pub stop: PathBuf,
@@ -46,18 +52,42 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn new(dir: &Path) -> Self {
+    pub fn new(dir: &Path, state: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
-            log: dir.join("tunnel.log"),
-            pid: dir.join("tunnel.pid"),
+            state: state.to_path_buf(),
+            log: state.join("tunnel.log"),
+            pid: state.join("tunnel.pid"),
             stop: dir.join("tunnel.stop"),
             invite: dir.join("invite.txt"),
-            err: dir.join("tunnel.err"),
+            err: state.join("tunnel.err"),
             stage_dir: dir.join("stage"),
             stage: dir.join("stage").join("nat-tunnel"),
         }
     }
+}
+
+/// Root-owned folder for one user's privileged child (`/var/run` is writable by root only).
+pub fn state_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/var/run/strait/{uid}"))
+}
+
+/// Settings the GUI passes to the root child through its environment: rendezvous and carrier
+/// choices only. Never a path to a program (`NAT_TUNNEL_XRAY_BIN` would make root run a file the
+/// user controls).
+pub const CHILD_ENV: &[&str] = &[
+    "NAT_TUNNEL_RV",
+    "NAT_TUNNEL_RV_DISABLE",
+    "NAT_TUNNEL_RV_TRACKERS",
+    "NAT_TUNNEL_RV_RELAYS",
+    "NAT_TUNNEL_RV_NTFY",
+    "NAT_TUNNEL_RV_MQTT",
+    "NAT_TUNNEL_CARRIER_DISABLE",
+];
+
+/// The allowed variables that are set in this process.
+pub fn child_env() -> Vec<(String, String)> {
+    CHILD_ENV.iter().filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v))).collect()
 }
 
 /// Private run directory (created 0700, owned by the caller).
@@ -158,8 +188,12 @@ pub struct ShellSpec<'a> {
     pub hash_cmd: &'a str,
     /// `wheel` on macOS, `root` on Linux.
     pub group: &'a str,
+    /// Root-owned folder holding `err` and `pid_file` (made by the line itself).
+    pub state_dir: &'a Path,
     pub err: &'a Path,
     pub pid_file: &'a Path,
+    /// Environment for the child (names from `CHILD_ENV`).
+    pub env: &'a [(String, String)],
 }
 
 impl ShellSpec<'_> {
@@ -217,25 +251,35 @@ pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
     if s.sha256.len() != 64 || !s.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("bad SHA-256".into());
     }
+    if s.env.iter().any(|(k, _)| !CHILD_ENV.contains(&k.as_str())) {
+        return Err("environment variable not allowed".into());
+    }
     let strs = [
         s.stage.display().to_string(),
         s.dest_dir.to_string(),
         s.dest_exe.to_string(),
+        s.state_dir.display().to_string(),
         s.err.display().to_string(),
         s.pid_file.display().to_string(),
     ];
-    if strs.iter().map(String::as_str).chain(args.iter().map(String::as_str)).any(|x| x.contains('\0')) {
+    let env: Vec<String> = s.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    if strs.iter().chain(&env).map(String::as_str).chain(args.iter().map(String::as_str)).any(|x| x.contains('\0')) {
         return Err("argument contains a NUL byte".into());
     }
-    let [stage, dir, dest, err, pid] = strs.map(|x| sh_quote(&x));
+    let [stage, dir, dest, state, err, pid] = strs.map(|x| sh_quote(&x));
     let group = sh_quote(s.group);
     let sha = sh_quote(s.sha256);
-    let hash = format!("\"$({} {dest} 2>/dev/null | cut -d' ' -f1)\" = {sha}", s.hash_cmd);
+    // Read through stdin: shasum escapes file names that hold a backslash, which would change the output.
+    let hash = format!("\"$({} 2>/dev/null <{dest} | cut -d' ' -f1)\" = {sha}", s.hash_cmd);
+    let env: Vec<String> = env.iter().map(|e| sh_quote(e)).collect();
     let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    // `rm -f` first: root then creates the folder itself, so nothing planted there survives.
     Ok(format!(
-        "{{ [ {hash} ] || {{ install -d -m 0755 -o root -g {group} {dir} && install -m 0755 -o root -g {group} {stage} {dest}; }}; [ {hash} ]; }} >>{err} 2>&1 \
+        "rm -rf {state} && mkdir -p -m 0755 {state} || {{ echo 'cannot create the state folder' >&2; exit 1; }}; \
+         {{ [ {hash} ] || {{ install -d -m 0755 -o root -g {group} {dir} && install -m 0755 -o root -g {group} {stage} {dest}; }}; [ {hash} ]; }} >>{err} 2>&1 \
          || {{ rm -f {dest}; echo 'integrity check failed' >>{err}; echo 'integrity check failed' >&2; exit 1; }}; \
-         nohup {dest} {} >>{err} 2>&1 </dev/null & echo $! > {pid}",
+         nohup /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin {} {dest} {} >>{err} 2>&1 </dev/null & echo $! > {pid}",
+        env.join(" "),
         quoted.join(" ")
     ))
 }
@@ -255,12 +299,7 @@ pub fn pkexec_args(shell: &str) -> Vec<String> {
 
 /// How this platform can elevate, if at all: (program, builder).
 pub fn elevator() -> Option<(&'static str, fn(&str) -> Vec<String>)> {
-    // shortcut: admin-prompt launch is switched off (unfinished; root GUI via the app bundle is the
-    // supported path). Flip ENABLED once the install-line tests below pass and it is tested for real.
-    const ENABLED: bool = false;
-    if !ENABLED {
-        None
-    } else if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") {
         Some(("/usr/bin/osascript", osascript_args))
     } else if cfg!(target_os = "linux") {
         ["/usr/bin/pkexec", "/bin/pkexec"]
@@ -270,17 +309,6 @@ pub fn elevator() -> Option<(&'static str, fn(&str) -> Vec<String>)> {
     } else {
         None
     }
-}
-
-/// Why `gui` must not run as root, if it must not (macOS window server).
-pub fn gui_root_refusal(euid: u32, macos: bool, exe: &str) -> Option<String> {
-    (euid == 0 && macos).then(|| {
-        format!(
-            "error: the Strait window cannot run as root on macOS (the window server refuses it).\n\
-             Run it without sudo: {exe} gui\n\
-             Full tunnel asks for your administrator password when you press Connect."
-        )
-    })
 }
 
 /// A root process honours a stop file only if `uid` owns it, it is a regular
@@ -517,6 +545,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         stage: PathBuf,
         dest_dir: String,
         dest: String,
+        state: PathBuf,
         err: PathBuf,
         pid: PathBuf,
         sha: String,
@@ -529,13 +558,14 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(exec_mode)).unwrap();
         let sha = sha256_file(&stage).unwrap();
         let dest_dir = root.join("opt").display().to_string();
-        Fx { stage, dest: format!("{dest_dir}/nat-tunnel"), dest_dir, err: root.join("t.err"), pid: root.join("t.pid"), sha, root }
+        let state = root.join("state");
+        Fx { stage, dest: format!("{dest_dir}/nat-tunnel"), dest_dir, err: state.join("t.err"), pid: state.join("t.pid"), state, sha, root }
     }
 
     fn line(fx: &Fx, sha: &str, args: &[String]) -> String {
         let (hash_cmd, group) = ShellSpec::platform_defaults();
         shell_command(
-            &ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: &fx.dest_dir, dest_exe: &fx.dest, hash_cmd, group, err: &fx.err, pid_file: &fx.pid },
+            &ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: &fx.dest_dir, dest_exe: &fx.dest, hash_cmd, group, state_dir: &fx.state, err: &fx.err, pid_file: &fx.pid, env: &[] },
             args,
         )
         .unwrap()
@@ -568,7 +598,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
             let raw = std::fs::read(&launched).unwrap();
             let mut got: Vec<&[u8]> = raw.split(|&b| b == 0).collect();
             got.pop();
-            let mut want: Vec<Vec<u8>> = vec![fx.dest.clone().into_bytes()];
+            let mut want: Vec<Vec<u8>> = ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", &fx.dest].iter().map(|s| s.as_bytes().to_vec()).collect();
             want.extend(args.iter().map(|a| a.clone().into_bytes()));
             assert_eq!(got, want.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), "{h:?}");
             assert!(Path::new(&fx.dest).exists(), "installed copy");
@@ -578,7 +608,6 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
     }
 
     #[test]
-    #[ignore = "admin-prompt launch is disabled (unfinished); re-enable with elevator()"]
     fn hostile_paths_cannot_break_out_of_the_install_line() {
         for h in HOSTILE.iter().filter(|h| !h.is_empty()) {
             let fx = fixture("hostile", 0o755);
@@ -588,8 +617,9 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
                 stage: { let p = evil.join("s"); std::fs::copy(&fx.stage, &p).unwrap(); p },
                 dest_dir: evil.join("o p").display().to_string(),
                 dest: evil.join("o p").join("nat-tunnel").display().to_string(),
-                err: evil.join("e"),
-                pid: evil.join("p"),
+                state: evil.join("st"),
+                err: evil.join("st").join("e"),
+                pid: evil.join("st").join("p"),
                 sha: fx.sha.clone(),
                 root: fx.root.clone(),
             };
@@ -599,6 +629,20 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
             assert!(Path::new(&fx2.dest).exists());
             assert!(!Path::new("/tmp/pwn").exists());
         }
+    }
+
+    #[test]
+    fn a_planted_state_folder_is_replaced_not_followed() {
+        let fx = fixture("planted", 0o755);
+        let bin = shims(&fx.root, true);
+        let victim = fx.root.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("t.pid"), "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, &fx.state).unwrap();
+        assert!(run_sh(&line(&fx, &fx.sha, &["guest".into()]), &bin).success());
+        wait_for_file(&bin.join("launched"));
+        assert_eq!(std::fs::read_to_string(victim.join("t.pid")).unwrap(), "keep");
+        assert!(!std::fs::symlink_metadata(&fx.state).unwrap().file_type().is_symlink());
     }
 
     #[test]
@@ -641,9 +685,12 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
     fn bad_hash_and_nul_are_rejected_up_front() {
         let fx = fixture("rej", 0o755);
         let (hash_cmd, group) = ShellSpec::platform_defaults();
-        let mk = |sha: &str, a: &[String]| shell_command(&ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: "/d", dest_exe: "/d/x", hash_cmd, group, err: &fx.err, pid_file: &fx.pid }, a);
-        assert!(mk("$(touch x)", &[]).is_err());
-        assert!(mk(&fx.sha, &["a\0b".into()]).is_err());
+        let env = |k: &str| vec![(k.to_string(), "x".to_string())];
+        let mk = |sha: &str, a: &[String], env: &[(String, String)]| shell_command(&ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: "/d", dest_exe: "/d/x", hash_cmd, group, state_dir: &fx.state, err: &fx.err, pid_file: &fx.pid, env }, a);
+        assert!(mk("$(touch x)", &[], &[]).is_err());
+        assert!(mk(&fx.sha, &["a\0b".into()], &[]).is_err());
+        assert!(mk(&fx.sha, &[], &env("NAT_TUNNEL_XRAY_BIN")).is_err(), "only allowed variables reach root");
+        assert!(mk(&fx.sha, &[], &env("NAT_TUNNEL_CARRIER_DISABLE")).is_ok());
     }
 
     #[test]
@@ -651,7 +698,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         let d = scratch("stage");
         let exe = d.join("exe");
         std::fs::write(&exe, b"abc").unwrap();
-        let paths = Paths::new(&d);
+        let paths = Paths::new(&d, &d);
         let sha = stage_exe(&paths, &exe).unwrap();
         assert_eq!(sha, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(std::fs::metadata(&paths.stage).unwrap().permissions().mode() & 0o777, 0o700);
@@ -677,7 +724,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
 
     #[test]
     fn invite_is_never_on_the_command_line() {
-        let paths = Paths::new(Path::new("/d"));
+        let paths = Paths::new(Path::new("/d"), Path::new("/s"));
         let args = guest_args(&LaunchSpec { uid: 1, tun: "10.7.0.2/16", default_route: "10.7.0.1", bypass: &[], paths: &paths });
         assert!(!args.iter().any(|a| a.contains("STRAIT2")));
         assert!(args.contains(&"--invite-file".to_string()));
@@ -739,11 +786,5 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         assert!(!f.exists());
     }
 
-    #[test]
-    fn root_gui_guard_only_fires_for_root_on_macos() {
-        assert!(gui_root_refusal(0, true, "/x/nat-tunnel").unwrap().contains("without sudo"));
-        assert!(gui_root_refusal(501, true, "x").is_none());
-        assert!(gui_root_refusal(0, false, "x").is_none());
-    }
     }
 }

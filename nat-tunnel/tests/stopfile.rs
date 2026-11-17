@@ -13,9 +13,12 @@ fn scratch(mode: u32) -> PathBuf {
     d
 }
 
+const INVITE: &str = "STRAIT2|00112233445566778899aabbccddeeff|127.0.0.1:9|||||hk=2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12";
+
 fn spawn_guest(dir: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_nat-tunnel"))
-        .args(["guest", "--invite", "STRAIT2|00112233445566778899aabbccddeeff|127.0.0.1:9|||||hk=2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12", "--listen", "127.0.0.1:0"])
+        .args(["guest", "--listen", "127.0.0.1:0"])
+        .env("STRAIT_INVITE", INVITE)
         .arg("--stop-file")
         .arg(dir.join("stop"))
         .arg("--log-file")
@@ -80,7 +83,8 @@ fn stop_file_owned_by_another_uid_is_refused() {
     let dir = scratch(0o700);
     let me = unsafe { libc::geteuid() };
     let mut child = Command::new(env!("CARGO_BIN_EXE_nat-tunnel"))
-        .args(["guest", "--invite", "STRAIT2|00112233445566778899aabbccddeeff|127.0.0.1:9|||||hk=2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12", "--listen", "127.0.0.1:0"])
+        .args(["guest", "--listen", "127.0.0.1:0"])
+        .env("STRAIT_INVITE", INVITE)
         .arg("--stop-file")
         .arg(dir.join("stop"))
         .arg("--stop-uid")

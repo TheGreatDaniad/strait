@@ -21,8 +21,8 @@ See the [project README](../README.md) for what Strait does, downloads and test 
 cargo build --release
 cargo test
 nat-tunnel check-host          # what this network allows, and an invite for this device
-nat-tunnel host --invite '<invite>' --tun 10.7.0.1/16 --userspace
-nat-tunnel guest --invite '<invite>' --tun 10.7.0.2/24
+STRAIT_INVITE='<invite>' nat-tunnel host --tun 10.7.0.1/16 --userspace
+STRAIT_INVITE='<invite>' nat-tunnel guest --tun 10.7.0.2/24
 ```
 
 Every invite names the host's key (`hk=`); `check-host` makes invites with this device's key.

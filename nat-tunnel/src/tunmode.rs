@@ -423,48 +423,41 @@ impl WindowsDns {
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowsV6 {
-    /// Physical interface index.
-    interface: String,
+    /// Interface indexes whose IPv6 binding this session switched off.
+    interfaces: Vec<String>,
 }
 
 #[cfg(windows)]
 impl WindowsV6 {
-    /// Disable IPv6 on the physical adapter so apps fall back to IPv4 instead
-    /// of trying to reach an IPv6 default that the tunnel does not carry.
-    fn capture_and_disable(device: &str) -> Option<Self> {
-        let enabled = powershell(&format!(
-            "(Get-NetAdapter -ErrorAction Stop | Where-Object {{ $_.ifIndex -eq {device} }} | \
-             Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop).Enabled"
-        ))?;
-        if !enabled.trim().eq_ignore_ascii_case("True") {
-            log::info!("IPv6 is already disabled on interface {device}");
+    /// Disable IPv6 on every adapter except the tunnel, so no app can send IPv6 around the
+    /// IPv4-only tunnel (a second adapter, or one that connects later, included); apps fall back
+    /// to IPv4.
+    fn capture_and_disable(_device: &str) -> Option<Self> {
+        let out = powershell(
+            "$done = @(); Get-NetAdapter -IncludeHidden -ErrorAction Stop | \
+             Where-Object { $_.InterfaceDescription -notmatch 'Wintun' -and $_.Name -notmatch 'nat-tunnel' } | \
+             ForEach-Object { $b = $_ | Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue; \
+               if ($b -and $b.Enabled) { $_ | Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue; $done += $_.ifIndex } }; \
+             $done -join ','",
+        )?;
+        let interfaces: Vec<String> = out.trim().split(',').map(str::trim).filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())).map(str::to_string).collect();
+        if interfaces.is_empty() {
+            log::info!("IPv6 is already off on every adapter");
             return None;
         }
-        if powershell(&format!(
-            "Get-NetAdapter -ErrorAction Stop | Where-Object {{ $_.ifIndex -eq {device} }} | \
-             Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop"
-        ))
-        .is_some()
-        {
-            log::info!("IPv6 disabled on interface {device} for the tunnel session");
-            Some(Self {
-                interface: device.to_string(),
-            })
-        } else {
-            log::warn!("could not disable IPv6 on interface {device}");
-            None
-        }
+        log::info!("IPv6 disabled on interfaces {} for the tunnel session", interfaces.join(", "));
+        Some(Self { interfaces })
     }
 
     fn restore(&self) {
+        let list = self.interfaces.join(",");
         if powershell(&format!(
-            "Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {{ $_.ifIndex -eq {} }} | \
-             Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue",
-            self.interface
+            "Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {{ @({list}) -contains $_.ifIndex }} | \
+             Enable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue"
         ))
         .is_some()
         {
-            log::info!("IPv6 restored on interface {}", self.interface);
+            log::info!("IPv6 restored on interfaces {list}");
         }
     }
 }
@@ -662,7 +655,7 @@ fn sanitize_state(s: StaleState) -> Option<StaleState> {
             None => None,
         },
         v6: match s.v6 {
-            Some(v) => Some(WindowsV6 { interface: index(&v.interface)? }),
+            Some(v) => Some(WindowsV6 { interfaces: v.interfaces.iter().map(|i| index(i)).collect::<Option<_>>()? }),
             None => None,
         },
         bypass: s.bypass.iter().map(|v| net(v)).collect::<Option<_>>()?,
@@ -828,6 +821,7 @@ fn recover_mac_state() -> bool {
     let Ok(text) = std::fs::read_to_string(path) else { return false };
     if let Ok(state) = serde_json::from_str::<MacState>(&text) {
         log::warn!("restoring DNS/IPv6 left by a previous session that did not exit cleanly");
+        remove_v6_halves();
         if let Some((service, servers)) = state.dns {
             DnsRestore { service, servers }.restore();
         }
@@ -1299,6 +1293,7 @@ fn restore_ipv6(_original: Option<&str>) {}
 
 #[cfg(target_os = "macos")]
 fn restore_ipv6(original: Option<&str>) {
+    remove_v6_halves();
     let _ = run_route(&["route", "-n", "delete", "-inet6", "default"]);
     if let Some(gateway) = original {
         let _ = run_route(&["route", "-n", "add", "-inet6", "default", gateway]);
@@ -1374,6 +1369,23 @@ fn route_ipv6_fail_closed() {
     // IPv4, instead of hanging on silently dropped IPv6 packets.
     if let Err(e) = run_route(&["route", "-n", "add", "-inet6", "default", "-reject"]) {
         log::debug!("could not install the IPv6 reject route: {e}");
+    }
+    // The two halves of the IPv6 space beat any default, on every interface, and a router
+    // advertisement that puts a default back does not replace them.
+    for half in V6_HALVES {
+        if let Err(e) = run_route(&["route", "-n", "add", "-inet6", "-net", half, "::1", "-reject"]) {
+            log::warn!("could not install the IPv6 reject route {half}: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+const V6_HALVES: [&str; 2] = ["::/1", "8000::/1"];
+
+#[cfg(target_os = "macos")]
+fn remove_v6_halves() {
+    for half in V6_HALVES {
+        let _ = run_route(&["route", "-n", "delete", "-inet6", "-net", half]);
     }
 }
 
@@ -1791,7 +1803,7 @@ mod state_tests {
     fn recovery_state_roundtrip_and_defaults() {
         let st = StaleState {
             dns: Some(WindowsDns { interface: "14".into(), servers: vec!["192.0.2.2".into()] }),
-            v6: Some(WindowsV6 { interface: "14".into() }),
+            v6: Some(WindowsV6 { interfaces: vec!["14".into(), "7".into()] }),
             bypass: vec!["203.0.113.10/32".into()],
             gateway: "192.0.2.2".into(),
             device: "14".into(),
@@ -1802,21 +1814,22 @@ mod state_tests {
         assert_eq!(back.gateway, "192.0.2.2");
         assert_eq!(back.dns.unwrap().servers, vec!["192.0.2.2".to_string()]);
         // Older/partial files still parse; garbage does not.
-        let old = parse_state(r#"{"dns":null,"v6":{"interface":"14"}}"#).unwrap();
+        let old = parse_state(r#"{"dns":null,"v6":{"interfaces":["14"]}}"#).unwrap();
         assert!(old.bypass.is_empty() && old.gateway.is_empty());
         assert!(parse_state("not json").is_none());
     }
 
     #[test]
     fn recovery_state_refuses_injected_values() {
-        let ok = r#"{"dns":{"interface":"14","servers":["1.1.1.1","2606:4700::1111"]},"v6":{"interface":"14"},"bypass":["10.0.0.0/8","203.0.113.10"],"gateway":"192.168.1.1","device":"14"}"#;
+        let ok = r#"{"dns":{"interface":"14","servers":["1.1.1.1","2606:4700::1111"]},"v6":{"interfaces":["14","7"]},"bypass":["10.0.0.0/8","203.0.113.10"],"gateway":"192.168.1.1","device":"14"}"#;
         let st = parse_state(ok).expect("valid file");
         assert_eq!(st.bypass, ["10.0.0.0/8", "203.0.113.10"]);
         let patch = |from: &str, to: &str| ok.replace(from, to);
         for bad in [
             patch(r#""device":"14""#, r#""device":"14; calc""#),
             patch(r#""interface":"14","servers""#, r#""interface":"14 -x $(calc)","servers""#),
-            patch(r#""v6":{"interface":"14"}"#, r#""v6":{"interface":"-1"}"#),
+            patch(r#""v6":{"interfaces":["14","7"]}"#, r#""v6":{"interfaces":["14","-1"]}"#),
+            patch(r#""v6":{"interfaces":["14","7"]}"#, r#""v6":{"interfaces":["14); calc; @(1"]}"#),
             patch(r#""1.1.1.1""#, r#""1.1.1.1,evil""#),
             patch(r#""1.1.1.1""#, r#""1.1.1.1'; calc; '""#),
             patch(r#""10.0.0.0/8""#, r#""10.0.0.0/8 add""#),

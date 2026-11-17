@@ -20,7 +20,7 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  * start(options): Promise<void>
  *   mode        "client" | "host"        default "client"
  *   invite      string (required)        STRAIT2|<key>|<hosts>|<signals> or legacy server:port|room|key;
- *                                        passed verbatim as `--invite` to `libstrait.so guest|host`
+ *                                        passed verbatim in STRAIT_INVITE to `libstrait.so guest|host`
  *   maxClients  int 1..8                 host only, default 1  (--max-clients)
  *   rateKbps    int >= 0                 host only, default 0  (--rate-kbps)
  *   killSwitch  bool                     default true. Client: if the core process dies without a user stop, the
@@ -28,8 +28,8 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
  *                                        blocked, Status.blocked = true) until stop(); false = tear down, state "failed".
  *   blockIPv6   bool                     client only, default true
  *   Client: asks for VPN permission first (rejects "vpn_denied" / "no_activity"), then runs
- *   `guest --invite <invite> --tun 10.7.0.2/32 --tun-fd-socket @strait-<pkg>`.
- *   Host: runs `host --invite <invite> --tun 10.7.0.1/16 --userspace ...`; no host/forward port
+ *   `STRAIT_INVITE=<invite> guest --tun 10.7.0.2/32 --tun-fd-socket @strait-<pkg>-<random>`.
+ *   Host: runs `STRAIT_INVITE=<invite> host --tun 10.7.0.1/16 --userspace ...`; no host/forward port
  *   option exists (the invite's host endpoint decides the listen port on the Rust side).
  * generateKey(): Promise<string>
  *   32 lowercase hex chars (16 bytes from java.security.SecureRandom); used for host invite keys

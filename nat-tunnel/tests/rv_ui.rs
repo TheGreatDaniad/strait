@@ -269,7 +269,6 @@ fn shared_message_has_every_fact() {
         "when you connect",
         "A code only you and the other device can work out",
         "sealed",
-        "trackers can read it",
         "What they never see:",
         "Your traffic",
         "The invite key",
@@ -279,6 +278,7 @@ fn shared_message_has_every_fact() {
     ] {
         assert!(m.contains(k), "missing: {k}");
     }
+    assert!(!m.contains("trackers"), "the app does not offer trackers");
     assert_eq!(rvui::PICK_HEADING, "Pick at least one way for the two devices to find each other:");
 }
 
