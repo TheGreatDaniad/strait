@@ -1,7 +1,9 @@
 //! `dht` rendezvous: raw BEP 44 mutable items on the public Mainline DHT (no pkarr).
 //!
-//! Each role publishes `seal(candidates)` under its own ed25519 key (derived from the invite key,
-//! `Derived::dht_host_seed` / `dht_client_seed`), salt = current 10-minute window id. It polls
+//! Each role publishes `seal(candidates)` under its own ed25519 key, salt = current 10-minute
+//! window id. The host's key is its DHT subkey for this invite and day (`Derived::dht_host_signer`,
+//! so only the host can publish there; a guest derives the public half from `hk`). The client key
+//! comes from the invite key (`Derived::dht_client_seed`), shared by every invite holder. It polls
 //! the other role's key (current window, then previous) with exponential backoff, because a
 //! missed GET costs 100-170 DHT nodes. Client-mode node only: it never serves other peers.
 //!
@@ -201,12 +203,9 @@ impl Rendezvous for Dht {
 
     async fn run(&self, ctx: RvCtx, tx: mpsc::Sender<Candidate>, cancel: CancellationToken) -> Result<(), RvError> {
         let d = ctx.derived();
-        let (my_seed, their_seed) = match ctx.role {
-            Role::Host => (d.dht_host_seed, d.dht_client_seed),
-            Role::Client => (d.dht_client_seed, d.dht_host_seed),
-        };
-        let my_sk = SigningKey::from_bytes(&my_seed);
-        let their_key = SigningKey::from_bytes(&their_seed).verifying_key().to_bytes();
+        let unsigned = || RvError::Failed("dht: no host key".into());
+        let my_sk = Signer::of(&d, ctx.role).ok_or_else(unsigned)?;
+        let their_key = public_key(&d, opposite(ctx.role)).ok_or_else(unsigned)?;
 
         let dht = self.build_node()?;
         let up = tokio::select! {
@@ -226,7 +225,7 @@ impl Rendezvous for Dht {
         let mut poll_i = 0usize;
         let mut next_poll = Instant::now() + self.tune.poll_steps[0];
         let mut seen: HashSet<SocketAddr> = HashSet::new();
-        let my_key = my_sk.verifying_key().to_bytes();
+        let my_key = my_sk.public();
 
         loop {
             let window = (self.clock)() / WINDOW_SECS;
@@ -236,7 +235,7 @@ impl Rendezvous for Dht {
                 }
                 let blob = seal(&d, ctx.role, &ctx.local).map_err(|e| RvError::Failed(format!("cannot seal candidates: {e}")))?;
                 seq += 1;
-                let item = MutableItem::new(my_sk.clone(), &blob, seq, Some(&self.salt(0)));
+                let item = my_sk.item(&blob, seq, &self.salt(0));
                 let r = tokio::select! { _ = cancel.cancelled() => return Ok(()), r = dht.put_mutable(item, cas) => r };
                 published_window = Some(window);
                 match r {
@@ -306,6 +305,65 @@ impl Rendezvous for Dht {
             next_poll = Instant::now() + self.tune.poll_steps[poll_i];
         }
     }
+}
+
+fn opposite(r: Role) -> Role {
+    match r {
+        Role::Host => Role::Client,
+        Role::Client => Role::Host,
+    }
+}
+
+/// What one side signs its DHT items with.
+enum Signer {
+    Seed(SigningKey),
+    Host(crate::tunnel::handshake::Subkey),
+}
+
+impl Signer {
+    fn of(d: &Derived, role: Role) -> Option<Self> {
+        Some(match role {
+            Role::Host => Signer::Host(d.dht_host_signer()?),
+            Role::Client => Signer::Seed(SigningKey::from_bytes(&d.dht_client_seed)),
+        })
+    }
+
+    fn public(&self) -> [u8; 32] {
+        match self {
+            Signer::Seed(k) => k.verifying_key().to_bytes(),
+            Signer::Host(k) => k.public(),
+        }
+    }
+
+    fn item(&self, value: &[u8], seq: i64, salt: &[u8]) -> MutableItem {
+        match self {
+            Signer::Seed(k) => MutableItem::new(k.clone(), value, seq, Some(salt)),
+            Signer::Host(k) => MutableItem::new_signed_unchecked(k.public(), k.sign(&signable(seq, value, salt)), value, seq, Some(salt)),
+        }
+    }
+}
+
+/// BEP 44's signed bytes (as `mainline` builds them, which does not export its function).
+fn signable(seq: i64, value: &[u8], salt: &[u8]) -> Vec<u8> {
+    let mut b = format!("4:salt{}:", salt.len()).into_bytes();
+    b.extend_from_slice(salt);
+    b.extend_from_slice(format!("3:seqi{seq}e1:v{}:", value.len()).as_bytes());
+    b.extend_from_slice(value);
+    b
+}
+
+/// The DHT public key `role` publishes under.
+pub fn public_key(d: &Derived, role: Role) -> Option<[u8; 32]> {
+    match role {
+        Role::Host => d.dht_host_key(),
+        Role::Client => Some(SigningKey::from_bytes(&d.dht_client_seed).verifying_key().to_bytes()),
+    }
+}
+
+/// A DHT item as `role` would publish it (tests stand in for a peer with it).
+#[doc(hidden)]
+pub fn signed_item(d: &Derived, role: Role, value: &[u8], seq: i64, salt: &[u8]) -> Option<MutableItem> {
+    Some(Signer::of(d, role)?.item(value, seq, salt))
 }
 
 #[cfg(test)]

@@ -116,6 +116,11 @@ const FAN_MAX_TARGETS: usize = 4;
 const RV_MAX_TARGETS: usize = 64;
 /// Distinct client addresses a host port-sprays per hour.
 const SPRAY_IPS_PER_HOUR: usize = 16;
+/// Distinct client IPs a host punches per hour, UDP and TCP alike, and ports per IP: any invite
+/// holder can seal a client record, so this bounds what they can make the host send to. Sharing
+/// again (a new invite) starts a new budget.
+const PUNCH_IPS_PER_HOUR: usize = 64;
+const PUNCH_PORTS_PER_IP: usize = 8;
 /// Host IPs port-scanned at once (candidates are not trusted input).
 const SCAN_MAX_IPS: usize = 2;
 /// Source addresses of undecodable datagrams probed per attempt (see `FrameIo::take_rejected`).
@@ -611,7 +616,11 @@ struct FwdHost {
     cur: Option<([u8; 16], Vec<u8>)>,
     /// Where the current session's guest is, and when it was last heard from.
     guest: Option<(SocketAddr, Instant)>,
-    seen: HashSet<[u8; 16]>,
+    /// Ephemeral keys of JOINs already read (see [`join_epk`]), oldest first in `seen_order`.
+    seen: HashSet<[u8; 32]>,
+    seen_order: VecDeque<[u8; 32]>,
+    /// When this host started (Unix seconds): see [`handshake::fresh_since`].
+    started: u32,
     guests: GuestPolicy,
     limit: JoinLimit,
 }
@@ -633,6 +642,8 @@ impl FwdHost {
             cur: None,
             guest: None,
             seen: HashSet::new(),
+            seen_order: VecDeque::new(),
+            started: handshake::now_secs(),
             guests,
             limit: JoinLimit::default(),
         }
@@ -648,28 +659,40 @@ impl FwdHost {
         let (cn, msg1) = split_join(&self.base, d)?;
         if let Some((c, accept)) = &self.cur {
             if *c == cn {
-                return Some((accept.clone(), None)); // a retry: the same answer
+                // A retry gets the same answer, only where the session's guest is: never reflected
+                // at another address.
+                return self.guest.is_some_and(|(at, _)| at == from).then(|| (accept.clone(), None));
             }
         }
-        if self.seen.contains(&cn) || !self.limit.allow(from) {
+        let epk = join_epk(&msg1);
+        if self.seen.contains(&epk) || !self.limit.allow(from) {
             return None;
         }
         let (hs, payload) = handshake::HostHs::read(&self.base, &self.key, &msg1).ok()?;
         // Remembered before any verdict: a recorded JOIN, fresh or stale, costs one key exchange.
-        if self.seen.len() >= SEEN_CN_CAP {
-            self.seen.clear();
+        // Oldest forgotten first, never all at once (that would reopen every recorded JOIN).
+        if self.seen.insert(epk) {
+            self.seen_order.push_back(epk);
+            if self.seen_order.len() > SEEN_CN_CAP {
+                if let Some(old) = self.seen_order.pop_front() {
+                    self.seen.remove(&old);
+                }
+            }
         }
-        self.seen.insert(cn);
         let (ts, token) = handshake::parse_join_payload(&payload)?;
         let now = handshake::now_secs();
-        let live = self.guest.is_some_and(|(at, when)| at.ip() != from.ip() && when.elapsed() < FWD_TAKEOVER_AFTER);
-        let verdict = if !handshake::fresh(ts, now) {
+        // Another address, not only another IP: guests behind one carrier-grade NAT share an IP. A
+        // restarted guest that comes back on a new port waits out the 30 s like anyone else.
+        let live = self.guest.is_some_and(|(at, when)| at != from && when.elapsed() < FWD_TAKEOVER_AFTER);
+        let verdict = if !handshake::fresh_since(ts, now, self.started) {
             VERDICT_CLOCK
         } else if token.is_empty() {
             if self.guests.require_token.load(Ordering::Relaxed) { VERDICT_REFUSED } else { VERDICT_OK }
         } else {
             match handshake::verify(&self.token_key, token, now) {
-                Ok(t) if !self.guests.revoked.lock().unwrap().contains(&t.id) => VERDICT_OK,
+                Ok(t) if !self.guests.revoked.lock().unwrap().contains(&t.id) => {
+                    if self.limit.allow_invite(t.id) { VERDICT_OK } else { return None }
+                }
                 _ => VERDICT_REFUSED,
             }
         };
@@ -678,7 +701,7 @@ impl FwdHost {
         let dgram = accept_dgram(&self.base, &cn, &msg2);
         if verdict != VERDICT_OK {
             log::info!("refused a forward-mode join from {from} ({})", match verdict {
-                VERDICT_CLOCK => "clock off by more than 10 minutes",
+                VERDICT_CLOCK => "stale: clock off by more than 10 minutes, or made before this host started",
                 VERDICT_FULL => "another guest's session is live",
                 _ => "this invite is not admitted",
             });
@@ -2164,36 +2187,65 @@ const UNCONFIRMED_GRACE: Duration = Duration::from_secs(3);
 const JOIN_LIMIT: u32 = 20;
 const JOIN_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Per-network budget of new join handshakes, so a flood of JOINs cannot tie up the host.
+/// Networks the join limiter tracks at once; past this it forgets the older half.
+const JOIN_LIMIT_NETS: usize = 4096;
+
+/// Per-network budget of new join handshakes, so a flood of JOINs cannot tie up the host, and a
+/// per-personal-invite budget of new sessions.
 #[derive(Default)]
 struct JoinLimit {
     at: HashMap<(IpAddr, u8), (Instant, u32)>,
     /// Budget of everything that comes through a sidecar (at least `JOIN_LIMIT * 8`): every
     /// client of a full host may rejoin at once, twice over.
     sidecar: u32,
+    invites: HashMap<u32, (Instant, u32)>,
+}
+
+/// Count one event in `e`'s window; true while it stays within `limit`.
+fn count(e: &mut (Instant, u32), now: Instant, limit: u32) -> bool {
+    if now.duration_since(e.0) >= JOIN_LIMIT_WINDOW {
+        *e = (now, 0);
+    }
+    e.1 = e.1.saturating_add(1);
+    e.1 <= limit
 }
 
 impl JoinLimit {
-    fn allow(&mut self, from: SocketAddr) -> bool {
-        let now = Instant::now();
-        if self.at.len() >= 4096 {
-            self.at.retain(|_, (t, _)| now.duration_since(*t) < JOIN_LIMIT_WINDOW);
-            if self.at.len() >= 4096 {
-                return false; // more networks at once than a host serves: wait for the window
-            }
-        }
+    fn key(&self, from: SocketAddr) -> ((IpAddr, u8), u32) {
         // Everything through a sidecar shares one budget, a larger one.
-        let (key, limit) = if via_sidecar(from) {
+        if via_sidecar(from) {
             ((IpAddr::V4(Ipv4Addr::LOCALHOST), 0), self.sidecar.max(JOIN_LIMIT * 8))
         } else {
             (source_net(from), JOIN_LIMIT)
-        };
-        let e = self.at.entry(key).or_insert((now, 0));
-        if now.duration_since(e.0) >= JOIN_LIMIT_WINDOW {
-            *e = (now, 0);
         }
-        e.1 += 1;
-        e.1 <= limit
+    }
+
+    fn allow(&mut self, from: SocketAddr) -> bool {
+        let now = Instant::now();
+        let (key, limit) = self.key(from);
+        if self.at.len() >= JOIN_LIMIT_NETS && !self.at.contains_key(&key) {
+            self.at.retain(|_, (t, _)| now.duration_since(*t) < JOIN_LIMIT_WINDOW);
+            if self.at.len() >= JOIN_LIMIT_NETS {
+                // Still full: forget the older half (amortised O(1) per join). Never refuse
+                // everyone because many networks are sending: that would let one sender with many
+                // addresses lock every guest out.
+                let mut ts: Vec<Instant> = self.at.values().map(|v| v.0).collect();
+                let mid = ts.len() / 2;
+                let cut = *ts.select_nth_unstable(mid).1;
+                self.at.retain(|_, (t, _)| *t > cut);
+            }
+        }
+        count(self.at.entry(key).or_insert((now, 0)), now, limit)
+    }
+
+    /// New sessions one personal invite may start per window, wherever it joins from (it works on
+    /// one device at a time).
+    fn allow_invite(&mut self, id: u32) -> bool {
+        let now = Instant::now();
+        if self.invites.len() >= JOIN_LIMIT_NETS {
+            self.invites.retain(|_, (t, _)| now.duration_since(*t) < JOIN_LIMIT_WINDOW);
+        }
+        count(self.invites.entry(id).or_insert((now, 0)), now, JOIN_LIMIT)
     }
 }
 
@@ -2206,12 +2258,13 @@ struct Refusal {
 }
 const REFUSALS_KEPT: usize = 64;
 
-/// The network a source counts against: its IPv4 address, or its IPv6 /64.
+/// The network a source counts against: its IPv4 address, or its IPv6 /48 (one site: a single
+/// customer can hold thousands of /64s).
 fn source_net(a: SocketAddr) -> (IpAddr, u8) {
     match a.ip().to_canonical() {
         IpAddr::V6(v) => {
             let s = v.segments();
-            (IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)), 64)
+            (IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0)), 48)
         }
         v4 => (v4, 32),
     }
@@ -2245,10 +2298,22 @@ fn mux_base(psk: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// The outer tag's key, derived from `base` (which is also the Noise PSK) so the two never share
+/// a key.
+fn tag_key(base: &[u8; 32]) -> [u8; 32] {
+    hmac(base, &[b"strait-outer-tag-v1"])
+}
+
 fn tag(base: &[u8; 32], label: &[u8], parts: &[&[u8]]) -> [u8; 16] {
     let mut all = vec![label];
     all.extend_from_slice(parts);
-    hmac(base, &all)[..16].try_into().unwrap()
+    hmac(&tag_key(base), &all)[..16].try_into().unwrap()
+}
+
+/// Message 1's ephemeral key: the replay memory's key. `cn` is no good for that: it sits outside
+/// Noise, so an invite holder could re-wrap a captured message 1 under a fresh `cn`.
+fn join_epk(msg1: &[u8]) -> [u8; 32] {
+    msg1[..32].try_into().unwrap() // JOIN_MIN guarantees a full ephemeral key
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -2551,6 +2616,8 @@ struct Peer {
     /// Joined at; a peer that sends nothing under its session key is dropped after
     /// `MUX_UNCONFIRMED_TTL` (a replayed JOIN cannot produce such a packet).
     since: Instant,
+    /// When the ACCEPT was last sent again for a duplicate JOIN.
+    resent: Instant,
     confirmed: bool,
 }
 
@@ -2697,8 +2764,11 @@ pub struct MuxHost {
     cfg: MuxConfig,
     pool: AddrPool,
     peers: Vec<Option<Peer>>,
-    seen: HashSet<[u8; 16]>,
-    seen_order: VecDeque<[u8; 16]>,
+    /// Ephemeral keys of JOINs already read (see [`join_epk`]), oldest first in `seen_order`.
+    seen: HashSet<[u8; 32]>,
+    seen_order: VecDeque<[u8; 32]>,
+    /// When this host started (Unix seconds): see [`handshake::fresh_since`].
+    started: u32,
     limit: JoinLimit,
     refusals: VecDeque<Refusal>,
     events: VecDeque<MuxEvent>,
@@ -2720,6 +2790,8 @@ pub struct MuxHost {
     spray: Sprayer,
     /// Addresses port-sprayed in the last hour (bounded, see `SPRAY_IPS_PER_HOUR`).
     sprayed: std::collections::HashMap<IpAddr, Instant>,
+    /// IPs punched in the last hour, with the ports (bounded, see `PUNCH_IPS_PER_HOUR`).
+    punched: std::collections::HashMap<IpAddr, (Instant, Vec<u16>)>,
     sent_bytes: u64,
     received_bytes: u64,
 }
@@ -2797,8 +2869,10 @@ impl MuxHost {
             punch: Vec::new(),
             spray: Sprayer::new(cfg.birthday.clone()),
             sprayed: Default::default(),
+            punched: Default::default(),
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
+            started: handshake::now_secs(),
             limit: JoinLimit { sidecar: sidecar_joins, ..Default::default() },
             refusals: VecDeque::new(),
             events: VecDeque::new(),
@@ -2878,6 +2952,26 @@ impl MuxHost {
         if self.peers.iter().flatten().any(|p| p.addr == addr) {
             return;
         }
+        // A guest's NAT maps it to a high port; a low one would only aim the host at a service.
+        if addr.port() < 1024 {
+            log::debug!("rendezvous: client candidate {addr} has a port below 1024; not punched");
+            return;
+        }
+        let now = Instant::now();
+        self.punched.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(3600));
+        let ip = addr.ip().to_canonical();
+        if !self.punched.contains_key(&ip) && self.punched.len() >= PUNCH_IPS_PER_HOUR {
+            log::info!("rendezvous: {addr} not punched: {PUNCH_IPS_PER_HOUR} addresses punched in the last hour");
+            return;
+        }
+        let ports = &mut self.punched.entry(ip).or_insert((now, Vec::new())).1;
+        if !ports.contains(&addr.port()) {
+            if ports.len() >= PUNCH_PORTS_PER_IP {
+                log::info!("rendezvous: {addr} not punched: {PUNCH_PORTS_PER_IP} ports of that address punched in the last hour");
+                return;
+            }
+            ports.push(addr.port());
+        }
         match self.punch.iter_mut().find(|t| t.addr == addr) {
             Some(t) => {
                 if t.first.elapsed() > RV_HOST_PUNCH_TOTAL {
@@ -2894,7 +2988,6 @@ impl MuxHost {
         }
         // Even sealed records can come from any invite holder: spray (thousands of packets per
         // address) at a bounded number of distinct addresses per hour.
-        let now = Instant::now();
         self.sprayed.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3600));
         let ip = addr.ip().to_canonical();
         if self.sprayed.contains_key(&ip) || self.sprayed.len() < SPRAY_IPS_PER_HOUR {
@@ -3103,9 +3196,9 @@ impl MuxHost {
         }
     }
 
-    fn remember_cn(&mut self, cn: [u8; 16]) {
-        if self.seen.insert(cn) {
-            self.seen_order.push_back(cn);
+    fn remember(&mut self, epk: [u8; 32]) {
+        if self.seen.insert(epk) {
+            self.seen_order.push_back(epk);
             if self.seen_order.len() > SEEN_CN_CAP {
                 if let Some(old) = self.seen_order.pop_front() {
                     self.seen.remove(&old);
@@ -3150,21 +3243,24 @@ impl MuxHost {
     }
 
     async fn join_authenticated(&mut self, cn: [u8; 16], msg1: &[u8], from: SocketAddr, via: usize) {
-        let cpub: [u8; 32] = msg1[..32].try_into().unwrap();
+        let cpub = join_epk(msg1);
         // Duplicate JOIN from the peer's own address: repeat ACCEPT + ASSIGN.
         // A JOIN for a known cn from elsewhere is a replay; ignore it.
         if let Some(slot) = (0..self.peers.len())
             .find(|&i| self.peers[i].as_ref().is_some_and(|p| p.cn == cn))
         {
-            let p = self.peers[slot].as_ref().unwrap();
-            if p.addr == from && p.via == via && p.cpub == cpub {
+            let p = self.peers[slot].as_mut().unwrap();
+            // At most once a second, so a replayed JOIN cannot make the host send the guest more
+            // than it sends.
+            if p.addr == from && p.via == via && p.cpub == cpub && p.resent.elapsed() >= Duration::from_secs(1) {
+                p.resent = Instant::now();
                 let accept = p.accept.clone();
                 self.raw_send(&accept, from, via).await;
                 self.send_assign(slot).await;
             }
             return;
         }
-        if self.seen.contains(&cn) {
+        if self.seen.contains(&cpub) {
             // A retry of a refused JOIN gets the same refusal (at most once a second, only to
             // where the first went); any other known JOIN is a replay and gets nothing.
             if let Some(r) = self.refusals.iter_mut().find(|r| r.cn == cn && r.to == from) {
@@ -3185,12 +3281,14 @@ impl MuxHost {
             return;
         };
         // Remembered before any verdict: a recorded JOIN, fresh or stale, costs one key exchange.
-        self.remember_cn(cn);
+        // Keyed on the ephemeral key, not on `cn`: `cn` is outside Noise, so any invite holder could
+        // re-wrap a captured message 1 under a fresh one.
+        self.remember(cpub);
         let Some((ts, token)) = handshake::parse_join_payload(&payload) else { return };
         let now = handshake::now_secs();
-        if !handshake::fresh(ts, now) {
+        if !handshake::fresh_since(ts, now, self.started) {
             // A replay, or a client with a wrong clock.
-            log::info!("refused {from}: its clock is off by more than {} s", handshake::JOIN_MAX_SKEW);
+            log::info!("refused {from}: its JOIN is stale (clock off by more than {} s, or made before this host started)", handshake::JOIN_MAX_SKEW);
             return self.refuse(hs, &cn, VERDICT_CLOCK, from, via).await;
         }
         // Personal invite: who is this, and may they still come in?
@@ -3198,7 +3296,13 @@ impl MuxHost {
             None
         } else {
             match handshake::verify(&self.token_key, token, now) {
-                Ok(t) if !self.cfg.guests.revoked.lock().unwrap().contains(&t.id) => Some(t.id),
+                Ok(t) if !self.cfg.guests.revoked.lock().unwrap().contains(&t.id) => {
+                    if !self.limit.allow_invite(t.id) {
+                        log::info!("join from {from} ignored: personal invite {} started too many sessions", t.id);
+                        return;
+                    }
+                    Some(t.id)
+                }
                 r => {
                     log::info!("refused {from}: personal invite {}", match r {
                         Ok(_) => "was withdrawn",
@@ -3222,7 +3326,7 @@ impl MuxHost {
                 return self.refuse(hs, &cn, VERDICT_FULL, from, via).await;
             }
         }
-        // One network (an IPv4 address, an IPv6 /64) may hold a bounded share of the slots
+        // One network (an IPv4 address, an IPv6 /48) may hold a bounded share of the slots
         // (sidecar joins have no known network and are not capped here).
         let src = source_net(from);
         let sidecar = via_sidecar(from);
@@ -3250,8 +3354,8 @@ impl MuxHost {
             if self.peers.iter().flatten().any(|p| !p.confirmed) {
                 // Busy with other sources' fresh joins: no answer and no memory of this one, so
                 // the client's next retry is taken once a slot confirms or passes its grace time.
-                self.seen.remove(&cn);
-                self.seen_order.retain(|c| *c != cn);
+                self.seen.remove(&cpub);
+                self.seen_order.retain(|c| *c != cpub);
                 log::debug!("join from {from} deferred: every free slot holds a fresh unconfirmed join");
                 return;
             }
@@ -3281,6 +3385,7 @@ impl MuxHost {
             rx: Bucket::new(self.cfg.rate_bytes),
             tx: Bucket::new(self.cfg.rate_bytes),
             since: Instant::now(),
+            resent: Instant::now(),
             confirmed: false,
         });
         self.raw_send(&accept, from, via).await;
@@ -3730,7 +3835,9 @@ mod tests {
         assert!(k.is_none());
         assert_eq!(verdict(&mut hb, &cn, &reply), VERDICT_FULL, "another address while the session is live");
         let (_, ja2) = hs_join(key, &rand16(), JoinAuth::test());
-        assert!(h.join(&ja2, "203.0.113.1:1001".parse().unwrap()).unwrap().1.is_some(), "the same guest restarting");
+        assert!(h.join(&ja2, "203.0.113.1:1001".parse().unwrap()).unwrap().1.is_none(), "the same IP, another port: behind one carrier-grade NAT that can be someone else");
+        // A retry of the current JOIN is answered only at the guest's own address.
+        assert!(h.join(&ja, a).unwrap().1.is_none() && h.join(&ja, b).is_none());
         h.guest = Some((a, Instant::now() - FWD_TAKEOVER_AFTER));
         let (_, jc) = hs_join(key, &rand16(), JoinAuth::test());
         assert!(h.join(&jc, b).unwrap().1.is_some(), "after the guest went quiet");
@@ -3743,6 +3850,64 @@ mod tests {
         assert_eq!(verdict(&mut hs, &cn, &reply), VERDICT_REFUSED);
     }
 
+    /// Invite holders can seal client records naming anyone: the host punches at most
+    /// `PUNCH_IPS_PER_HOUR` addresses and `PUNCH_PORTS_PER_IP` ports of each an hour, and never a
+    /// port below 1024.
+    #[tokio::test]
+    async fn host_punch_targets_are_bounded() {
+        let mut h = MuxHost::bind("punch-budget-key", MuxConfig { bind_port: Some(0), host_key: Some(TEST_HOST_KEY), ..Default::default() }).await.unwrap();
+        h.add_punch_target("203.0.113.9:443".parse().unwrap(), true);
+        assert!(h.punch.is_empty(), "port below 1024");
+        for i in 0..20u16 {
+            h.add_punch_target(SocketAddr::new(Ipv4Addr::new(203, 0, 113, 9).into(), 2000 + i), true);
+        }
+        assert_eq!(h.punch.len(), PUNCH_PORTS_PER_IP, "ports of one address");
+        for i in 0..PUNCH_IPS_PER_HOUR as u32 + 10 {
+            h.add_punch_target(SocketAddr::new(Ipv4Addr::from(0xcb00_7100 + i).into(), 5000), true);
+        }
+        assert_eq!(h.punched.len(), PUNCH_IPS_PER_HOUR);
+    }
+
+    /// A captured message 1 re-wrapped under a fresh `cn` (any invite holder can make the outer
+    /// tag) is a replay: no key exchange, no slot, no answer.
+    #[tokio::test]
+    async fn a_rewrapped_join_is_a_replay() {
+        let key = "rewrap-test-key";
+        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), host_key: Some(TEST_HOST_KEY), ..Default::default() }).await.unwrap();
+        let (hs, d) = hs_join(key, &rand16(), JoinAuth::test());
+        let from: SocketAddr = "203.0.113.7:1000".parse().unwrap();
+        assert!(h.handle_join(&d, from, 0).await);
+        assert_eq!(h.peer_count(), 1);
+        for to in [from, "198.51.100.1:9".parse().unwrap()] {
+            let rewrapped = join_dgram(&mux_base(key), &rand16(), &hs.msg1);
+            assert!(h.handle_join(&rewrapped, to, 0).await, "the outer tag is valid");
+        }
+        assert_eq!(h.peer_count(), 1, "no second slot");
+        // Forward mode: the same.
+        let mut f = FwdHost::new(key, Some(TEST_HOST_KEY), GuestPolicy::default());
+        let (hs, d) = hs_join(key, &rand16(), JoinAuth::test());
+        assert!(f.join(&d, from).unwrap().1.is_some());
+        assert!(f.join(&join_dgram(&mux_base(key), &rand16(), &hs.msg1), from).is_none());
+    }
+
+    /// Many senders cannot lock everyone out of joining; IPv6 counts per /48; a personal invite
+    /// has its own budget.
+    #[test]
+    fn the_join_limiter_never_locks_everyone_out() {
+        let mut l = JoinLimit::default();
+        for i in 0..5000u16 {
+            l.allow(SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 7, i, 0, 0, 0, 1).into(), 1));
+        }
+        assert_eq!(l.at.len(), 1, "one /48 is one network");
+        assert!(!l.allow("[2001:db8:7:ffff::9]:1".parse().unwrap()), "and its budget is spent");
+        for i in 0..10_000u32 {
+            l.allow(SocketAddr::new(Ipv4Addr::from(0x0a00_0000 + i).into(), 1));
+        }
+        assert!(l.at.len() <= JOIN_LIMIT_NETS);
+        assert!(l.allow("198.51.100.9:1".parse().unwrap()), "a newcomer still gets in");
+        assert!((0..JOIN_LIMIT).all(|_| l.allow_invite(7)) && !l.allow_invite(7) && l.allow_invite(8));
+    }
+
     /// A recorded JOIN, however old, costs the host one key exchange: its nonce is remembered
     /// before the verdict, and a replay from elsewhere gets nothing.
     #[tokio::test]
@@ -3753,7 +3918,7 @@ mod tests {
         let (hs, _) = hs_join_at(key, &cn, JoinAuth::test(), Some(handshake::now_secs() - 3600));
         let from: SocketAddr = "203.0.113.7:1000".parse().unwrap();
         h.join_authenticated(cn, &hs.msg1, from, 0).await;
-        assert!(h.seen.contains(&cn) && h.refusals.len() == 1);
+        assert!(h.seen.contains(&join_epk(&hs.msg1)) && h.refusals.len() == 1);
         h.join_authenticated(cn, &hs.msg1, "198.51.100.1:9".parse().unwrap(), 0).await;
         h.join_authenticated(cn, &hs.msg1, from, 0).await;
         assert_eq!(h.refusals.len(), 1, "no second key exchange");

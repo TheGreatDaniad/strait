@@ -461,12 +461,23 @@ impl Rejects {
 }
 
 /// Parameters for building a carrier. Secrets are derived by the carrier from the invite key.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CarrierSpec {
     /// `host:port` the carrier talks to (client) or the local listen address (host).
     pub endpoint: Option<String>,
     pub bind_port: Option<u16>,
     pub params: Vec<(String, String)>,
+}
+
+/// Parameter names only: values include the invite key and, for `ws` on a host, the host key.
+impl std::fmt::Debug for CarrierSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierSpec")
+            .field("endpoint", &self.endpoint)
+            .field("bind_port", &self.bind_port)
+            .field("params", &self.params.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[async_trait::async_trait]

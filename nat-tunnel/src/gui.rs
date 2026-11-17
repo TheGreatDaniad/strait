@@ -1554,7 +1554,9 @@ impl GuiApp {
                 group,
                 state_dir: &ps.paths.state,
                 err: &ps.paths.err,
+                log: &ps.paths.log,
                 pid_file: &ps.paths.pid,
+                uid: unsafe { libc::geteuid() },
                 env: &privileged::child_env(),
             },
             &args,
@@ -3118,12 +3120,12 @@ impl GuiApp {
         ui.add_space(4.0);
         ui.label(RichText::new(PEOPLE_INTRO).font(ui_font(12.0)).color(TEXT_MUTED));
         ui.add_space(8.0);
-        // While a removed person's invite could still work, the shared invite stays closed.
-        let now = handshake::now_secs();
-        self.settings.guests.retain(|g| !(g.removed && g.expires != 0 && g.expires < now));
+        // A removed person keeps the shared invite key inside their personal invite, even after the
+        // token expires: the shared invite stays closed until "Change every invite" replaces the key
+        // (which also forgets the removed people).
         let locked = self.settings.guests.iter().any(|g| g.removed);
         let mut only = self.settings.personal_only || locked;
-        let hint = if locked { "Stays on while someone you removed could use the shared invite" } else { "The invite above stops letting new people in" };
+        let hint = if locked { "Stays on until you change every invite: someone you removed still has the shared invite" } else { "The invite above stops letting new people in" };
         toggle_row(ui, "Personal invites only", hint, &mut only, !locked);
         if only != self.settings.personal_only {
             self.settings.personal_only = only;

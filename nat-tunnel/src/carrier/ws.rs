@@ -24,9 +24,12 @@
 //! limit as handshake v2); the end-to-end AEAD, not this token, protects the tunnel.
 //!
 //! TLS identity: a self-signed Ed25519 certificate (TLS 1.3 only, so the certificate is not
-//! visible on the wire). With `tls_sk` (host) / `tls_hk` (client) its key is the host key that
-//! every invite names: the client ignores the certificate's contents and checks the TLS handshake
-//! signature against `hk`, so only the host can complete it, not anyone holding the invite.
+//! visible on the wire). With `tls_sk` (host) / `tls_hk` (client) its key is the host's TLS subkey
+//! for this invite (`handshake::Subkey`): the client ignores the certificate's contents and checks
+//! the TLS handshake signature against the subkey it derives from `hk` and the invite key, so only
+//! the host can complete it, not anyone holding the invite. The certificate is not the host key, and
+//! without the invite key it cannot be linked to `hk`, to the host's records, or to its
+//! certificates under other invites.
 //! Without them (tests, the host check's self-probe) the key is derived from the invite key and the
 //! client pins that exact certificate. No CA is involved either way. A wrong key gives a TLS
 //! failure, typed `Blocked`. Probing: a prober still completes TLS and sees a self-signed
@@ -76,6 +79,7 @@ use super::stream::{StreamCarrier, StreamCfg, StreamStats};
 use super::udp::norm;
 use super::{CarrierError, CarrierFactory, CarrierId, CarrierSpec, Caps, FrameIo, Health};
 use crate::rendezvous::{Disclosure, ProbeStatus};
+use crate::tunnel::handshake::{subkey_public, Subkey, SUBKEY_TLS};
 
 /// A header that has not completed after this long is dropped without an answer.
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -181,7 +185,7 @@ enum TlsMode {
     Off,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Cfg {
     key: Vec<u8>,
     tls: TlsMode,
@@ -200,9 +204,9 @@ struct Cfg {
     lowat: usize,
     /// In-process pipe between the pump and the carrier, bytes.
     pipe: usize,
-    /// Host: the host key (Ed25519 seed) the certificate is made with.
+    /// Host: the host key, from which the TLS subkey for this invite is derived.
     tls_sk: Option<zeroize::Zeroizing<[u8; 32]>>,
-    /// Client: the invite's `hk`; the TLS handshake must be signed with it.
+    /// Client: the invite's `hk`; the TLS handshake must be signed with its TLS subkey.
     tls_hk: Option<[u8; 32]>,
 }
 
@@ -277,20 +281,20 @@ impl Cfg {
 }
 
 /// Everything derived from the invite key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Identity {
     pub path: String,
     pub token: String,
     seed: [u8; 32],
     serial: [u8; 16],
+    /// The host's TLS subkey for this invite; replaces the derived seed when set.
+    subkey: Option<Arc<Subkey>>,
 }
 
 impl Identity {
-    /// Use the host key for the certificate instead of the derived seed.
-    fn with_host_key(mut self, sk: Option<&[u8; 32]>) -> Identity {
-        if let Some(sk) = sk {
-            self.seed = *sk;
-        }
+    /// Use the host's TLS subkey for invite `key` instead of the derived seed.
+    fn with_host_key(mut self, sk: Option<&[u8; 32]>, key: &[u8]) -> Identity {
+        self.subkey = sk.map(|sk| Arc::new(Subkey::new(sk, key, SUBKEY_TLS)));
         self
     }
 
@@ -303,24 +307,27 @@ impl Identity {
         out("tls-seed", &mut seed);
         out("tls-serial", &mut serial);
         serial[0] &= 0x7f; // positive DER INTEGER
-        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial }
+        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial, subkey: None }
     }
 
-    /// The deterministic self-signed certificate (DER) and its signing key (PKCS#8 DER).
+    /// The deterministic self-signed certificate (DER) and its signing key (PKCS#8 DER) for the
+    /// derived seed.
     pub fn cert(&self) -> Result<(Vec<u8>, Vec<u8>), CarrierError> {
-        let err = |e: rcgen::Error| CarrierError::Failed(format!("ws: certificate: {e}"));
         // PKCS#8 v1 wrapper of an Ed25519 seed (fixed 16 byte prefix).
         let mut pkcs8 = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
         pkcs8.extend_from_slice(&self.seed);
         let kp = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&pki_types::PrivatePkcs8KeyDer::from(pkcs8.clone()), &rcgen::PKCS_ED25519)
-            .map_err(err)?;
-        let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(err)?;
+            .map_err(cert_err)?;
+        Ok((self.self_signed(&kp)?, pkcs8))
+    }
+
+    fn self_signed(&self, kp: &rcgen::KeyPair) -> Result<Vec<u8>, CarrierError> {
+        let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(cert_err)?;
         p.distinguished_name.push(rcgen::DnType::CommonName, "localhost");
         p.serial_number = Some(rcgen::SerialNumber::from_slice(&self.serial));
         p.not_before = rcgen::date_time_ymd(2024, 1, 1);
         p.not_after = rcgen::date_time_ymd(2124, 1, 1);
-        let cert = p.self_signed(&kp).map_err(err)?;
-        Ok((cert.der().to_vec(), pkcs8))
+        Ok(p.self_signed(kp).map_err(cert_err)?.der().to_vec())
     }
 
     /// SHA-256 of the certificate DER, hex. A function of the key only; this is the client's pin.
@@ -345,15 +352,71 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+fn cert_err(e: rcgen::Error) -> CarrierError {
+    CarrierError::Failed(format!("ws: certificate: {e}"))
+}
+
+/// Signs the certificate and the TLS handshake with the host's TLS subkey.
+#[derive(Debug, Clone)]
+struct SubkeySigner {
+    key: Arc<Subkey>,
+    public: [u8; 32],
+}
+
+impl SubkeySigner {
+    fn new(key: &Arc<Subkey>) -> Self {
+        Self { public: key.public(), key: key.clone() }
+    }
+}
+
+impl rcgen::RemoteKeyPair for SubkeySigner {
+    fn public_key(&self) -> &[u8] {
+        &self.public
+    }
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
+        Ok(self.key.sign(msg).to_vec())
+    }
+    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+        &rcgen::PKCS_ED25519
+    }
+}
+
+impl rustls::sign::SigningKey for SubkeySigner {
+    fn choose_scheme(&self, offered: &[rustls::SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+        offered.contains(&rustls::SignatureScheme::ED25519).then(|| Box::new(self.clone()) as Box<dyn rustls::sign::Signer>)
+    }
+    fn algorithm(&self) -> rustls::SignatureAlgorithm {
+        rustls::SignatureAlgorithm::ED25519
+    }
+}
+
+impl rustls::sign::Signer for SubkeySigner {
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+        Ok(self.key.sign(msg).to_vec())
+    }
+    fn scheme(&self) -> rustls::SignatureScheme {
+        rustls::SignatureScheme::ED25519
+    }
+}
+
 fn server_tls(id: &Identity) -> Result<tokio_rustls::TlsAcceptor, CarrierError> {
-    let (cert, key) = id.cert()?;
     let tls = |e: rustls::Error| CarrierError::Failed(format!("ws: tls: {e}"));
-    let mut c = rustls::ServerConfig::builder_with_provider(provider())
+    let b = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(tls)?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert.into()], pki_types::PrivatePkcs8KeyDer::from(key).into())
-        .map_err(tls)?;
+        .with_no_client_auth();
+    let mut c = match &id.subkey {
+        Some(sub) => {
+            let signer = SubkeySigner::new(sub);
+            let cert = id.self_signed(&rcgen::KeyPair::from_remote(Box::new(signer.clone())).map_err(cert_err)?)?;
+            let ck = rustls::sign::CertifiedKey::new(vec![cert.into()], Arc::new(signer));
+            b.with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(ck)))
+        }
+        None => {
+            let (cert, key) = id.cert()?;
+            b.with_single_cert(vec![cert.into()], pki_types::PrivatePkcs8KeyDer::from(key).into()).map_err(tls)?
+        }
+    };
     c.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(c)))
 }
@@ -401,10 +464,11 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
 }
 
 /// Client check when the invite names the host key: the certificate's contents do not matter, the
-/// TLS 1.3 handshake signature must verify under `hk` (so the server holds the host key).
+/// TLS 1.3 handshake signature must verify under the host's TLS subkey for this invite (so the
+/// server holds the host key).
 #[derive(Debug)]
 struct HostKeyVerifier {
-    hk: [u8; 32],
+    subkey: [u8; 32],
 }
 
 impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
@@ -434,7 +498,7 @@ impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         let sig: Option<&[u8; 64]> = d.signature().try_into().ok();
         match sig {
-            Some(sig) if d.scheme == rustls::SignatureScheme::ED25519 && crate::tunnel::handshake::verify_sig(&self.hk, m, sig) => {
+            Some(sig) if d.scheme == rustls::SignatureScheme::ED25519 && crate::tunnel::handshake::verify_sig(&self.subkey, m, sig) => {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             _ => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)),
@@ -455,7 +519,8 @@ fn client_tls(cfg: &Cfg, id: &Identity) -> Result<tokio_rustls::TlsConnector, Ca
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         b.with_root_certificates(roots).with_no_client_auth()
     } else if let Some(hk) = cfg.tls_hk {
-        b.dangerous().with_custom_certificate_verifier(Arc::new(HostKeyVerifier { hk })).with_no_client_auth()
+        let subkey = subkey_public(&hk, &cfg.key, SUBKEY_TLS).ok_or_else(|| CarrierError::Failed("ws: the invite's host key is not valid".into()))?;
+        b.dangerous().with_custom_certificate_verifier(Arc::new(HostKeyVerifier { subkey })).with_no_client_auth()
     } else {
         let want = id.cert()?.0;
         b.dangerous()
@@ -801,7 +866,7 @@ fn warn_tcp(c: &WsCarrier) {
 /// on `bind_port` (0 = any).
 pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
     let cfg = Cfg::from_spec(spec)?;
-    let id = Identity::derive(&cfg.key).with_host_key(cfg.tls_sk.as_deref());
+    let id = Identity::derive(&cfg.key).with_host_key(cfg.tls_sk.as_deref(), &cfg.key);
     let tls = if cfg.tls == TlsMode::Off { None } else { Some(server_tls(&id)?) };
     let punch_mode = spec.endpoint.is_none();
     let (l, bind) = match &spec.endpoint {
@@ -1121,6 +1186,25 @@ mod pending_tests {
         assert_eq!(a.serial, b.serial);
         assert_ne!(a.serial, a.seed[..16]);
         assert_eq!(a.pin_hex(), b.pin_hex());
+    }
+
+    /// The host's certificate carries its TLS subkey for this invite, never the host key, and the
+    /// key changes with the invite (so certificates do not link a host across invites).
+    #[test]
+    fn host_certificate_is_a_per_invite_subkey() {
+        let sk = crate::tunnel::handshake::new_host_key();
+        let hk = crate::tunnel::handshake::public_of(&sk);
+        let der = |invite: &[u8]| {
+            let id = Identity::derive(invite).with_host_key(Some(&sk), invite);
+            let signer = SubkeySigner::new(id.subkey.as_ref().unwrap());
+            (id.self_signed(&rcgen::KeyPair::from_remote(Box::new(signer.clone())).unwrap()).unwrap(), signer.public)
+        };
+        let (a, pa) = der(b"invite-a");
+        let (b, pb) = der(b"invite-b");
+        let has = |c: &[u8], k: &[u8; 32]| c.windows(32).any(|w| w == k);
+        assert!(has(&a, &pa) && has(&b, &pb) && pa != pb);
+        assert!(!has(&a, &hk) && !has(&b, &hk));
+        assert_eq!(Some(pa), subkey_public(&hk, b"invite-a", SUBKEY_TLS));
     }
 }
 

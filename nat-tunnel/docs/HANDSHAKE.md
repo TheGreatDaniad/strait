@@ -12,17 +12,34 @@ Every host has a long-term Ed25519 key, made on first use and kept in the settin
 (owner-only file) or given as `STRAIT_HOST_KEY`. Its public half is in every invite as `hk=`. An
 invite without `hk` is refused, and a host refuses to run an invite that names another key.
 
-The Noise static key is the same key in X25519 form (`to_scalar_bytes` / `to_montgomery`), and the
-host signs its rendezvous records with it. Using one key pair for both purposes is analysed in
-Thormarker, "On using the same key pair for Ed25519 and an X25519 based KEM" (IACR ePrint 2021/509).
+The Noise static key is the same key in X25519 form (`to_scalar_bytes` / `to_montgomery`). Key exchange
+(X25519) is the host key's only direct use; every signature and MAC has a key of its own:
+
+| Use | Key |
+|---|---|
+| Noise static key (join handshake), and opening guests' rendezvous records (X25519 with a fresh key, see Rendezvous records) | the host key, X25519 form |
+| Rendezvous record signatures | per-invite subkey, purpose `record` |
+| The host's DHT items (BEP 44) | per-invite, per-day subkey, purpose `dht` |
+| WebSocket carrier TLS handshake | per-invite subkey, purpose `tls` |
+| Personal-invite token MAC | `HMAC(host key, "strait-guest-token-v4" ‖ invite key)` |
+
+A subkey is made by key blinding, as Tor v3 onion services do: `subkey = b · host key` with
+`b = SHA-512("strait-subkey-v1" ‖ purpose ‖ hk ‖ invite key) mod ℓ`, and its own nonce prefix
+`SHA-512("strait-subkey-prefix-v1" ‖ prefix ‖ b)[..32]`. A guest computes the public half, `b · hk`,
+from the invite. Without the invite key a subkey cannot be linked to `hk` or to the same host's
+subkeys under other invites, so knowing `hk` (a guest removed by "Change every invite", or anyone
+who probed a WebSocket host) does not let anyone recognise the host's records or certificates.
+The blinded signing keys and the X25519 use of the host key are related keys; no published proof
+covers that exact combination (Thormarker, IACR ePrint 2021/509, covers one key pair used for
+Ed25519 and an X25519 KEM).
 
 ## Handshake
 
 Noise `NKpsk0` with X25519, ChaCha20-Poly1305 and SHA-256, through the `snow` crate. Prologue
 `strait-join-v3`. Full-tunnel mode and forward mode (one guest, TCP bridge) use it alike. A
-forward-mode host applies the same personal-invite rules, refuses a JOIN from another address as
-full while the current guest was heard from in the last 30 s (an idle guest sends a keepalive every
-10 s), and opens a new connection to the forwarded service for every new session.
+forward-mode host applies the same personal-invite rules, refuses a JOIN from another address (IP
+and port) as full while the current guest was heard from in the last 30 s (an idle guest sends a
+keepalive every 10 s), and opens a new connection to the forwarded service for every new session.
 
 | Input | Value |
 |---|---|
@@ -35,8 +52,9 @@ JOIN    0xF8 | cn (16) | Noise message 1 (e, es; payload: clock (4) | optional t
 ACCEPT  0xF9 | cn (16) | Noise message 2 (e, ee; payload: slot (2) | cn (16) | verdict (1))  | tag (16)
 ```
 
-`tag` is `HMAC(psk, label ‖ fields)[..16]`: a cheap check, so only an invite holder makes the
-host run a key exchange. The verdict is 0 accepted, 1 full, 2 refused (withdrawn, expired or
+`tag` is `HMAC(tag key, label ‖ fields)[..16]` with `tag key = HMAC(psk, "strait-outer-tag-v1")`
+(never the psk itself): a cheap check, so only an invite holder makes the host run a key exchange.
+`cn` is outside Noise and authenticated only by this tag, which every invite holder can make. The verdict is 0 accepted, 1 full, 2 refused (withdrawn, expired or
 foreign personal invite; personal invites only), 3 clock. A refusal is message 2 like an
 acceptance, so only the host can send one. The session key is
 `HMAC(k1, "strait-session-v3" ‖ k2)` over Noise's two transport keys.
@@ -49,15 +67,25 @@ What this gives:
 - Both sides contribute a fresh key, so a recording stays unreadable if the invite or the host key
   leaks later, and no peer can read another peer's traffic.
 - Message 1 carries the guest's clock: the host refuses a JOIN more than 10 minutes off. It
-  remembers every nonce (`cn`) it opened before deciding anything, so a recorded JOIN, fresh or
-  stale, costs it one key exchange; a retry of a refused JOIN gets the same refusal from memory.
+  remembers the ephemeral key of every message 1 it opened before deciding anything (not `cn`,
+  which an invite holder could replace), so a recorded JOIN, fresh or stale and however re-wrapped,
+  costs it one key exchange; a retry of a refused JOIN gets the same refusal from memory, and a
+  repeated accepted JOIN gets its answer again at most once a second, only at its own address. The
+  memory starts empty, so a host also refuses a JOIN made before it started (with 60 s of slack for
+  a slow clock): a recording from before a restart is stale too. A guest that the host refused
+  stops, rather than retrying.
 - An accepted join takes an unconfirmed slot at once, for up to 20 s, and keeps it only once a
   packet under its session key arrives, so a replayed JOIN cannot keep a slot.
-- One network (an IPv4 address, an IPv6 /64) may start 20 new handshakes per 10 s, hold three
-  quarters of the slots, and hold four unconfirmed joins per invite. A full host frees an
+- One network (an IPv4 address, an IPv6 /48) may start 20 new handshakes per 10 s, hold three
+  quarters of the slots, and hold four unconfirmed joins per invite. The host tracks 4096 networks at once and then
+  forgets the older half: many senders slow each other down but never lock everyone out. One
+  personal invite may start 20 new sessions per 10 s wherever it joins from. A full host frees an
   unconfirmed slot of the same source, or one older than 3 s; a join younger than that is never
   pushed out by someone else's. Joins through a local sidecar (xray) have no known network: they
   share one larger handshake budget and are not held to the per-network slot share.
+- Holders of the shared invite on two networks can fill a host (three quarters each). The People
+  list shows them; withdraw or change the invite. A host that takes personal invites only is
+  filled one slot per personal invite.
 - A guest's pending handshake survives a forged answer: it rebuilds its Noise state from the same
   ephemeral key for each answer it tries.
 
@@ -72,8 +100,11 @@ the wire only inside Noise message 1, encrypted to the host.
 - Withdrawing a personal invite switches the host to personal invites only (otherwise the person
   could come back with the shared invite), in the window and from `STRAIT_REVOKED` alike. The
   window keeps its personal invites, withdrawn ones included, in its settings: ids are never
-  reused, a withdrawal survives a restart, and the switch stays on while a withdrawn invite has
-  not expired.
+  reused, a withdrawal survives a restart, and the switch stays on until "Change every invite":
+  a removed person's personal invite holds the invite key, which does not expire with the token.
+- While the shared invite is allowed, anyone holding a personal invite also holds the shared one
+  (drop the token and it is the shared invite), so the one-device rule and removal bind only on a
+  host that takes personal invites only. Removing someone turns that on.
 - A personal invite works on one device at a time: while its session was heard from in the last
   40 s, a join with the same token from another address is refused as full; a silent session is
   replaced once the new one confirms. A copy can still be used while the owner is offline.
@@ -100,13 +131,28 @@ them from standard input.
 
 ## Rendezvous records
 
-- Sealed with ChaCha20-Poly1305 under a key from the invite key; host records also carry an
-  Ed25519 signature by the host key. A guest accepts a host record only with a valid signature.
-- The identifiers each service sees (topics, the DHT keys, the info-hash) change every UTC day.
+- A guest's record (its public address) is for the host only: sealed with ChaCha20-Poly1305 under
+  `HKDF(salt = record key, X25519(fresh key, host Noise key) ‖ fresh public key)`, the fresh public
+  key in front, and a 16-byte HMAC under the record key at the end, checked before the key
+  exchange, so only an invite holder makes the host do one. Other invite holders cannot read it.
+- Host records are sealed with ChaCha20-Poly1305 under a key from the invite key, and carry an
+  Ed25519 signature over `"strait-record-v1" ‖ nonce ‖ ciphertext` by the host's record subkey for
+  this invite. A guest accepts a host record only with a valid signature. Without the invite key
+  the signature cannot be checked, so `hk` alone does not link one host's records.
+- The identifiers each service sees (topics, the DHT keys, the info-hash) change every UTC day. The
+  host's DHT key is its subkey (purpose `dht`) for the invite and the day, so only the host can
+  publish there; the guests' DHT key comes from the invite key and is shared by every guest.
 - Trackers (`trk`) cannot carry a signature and announce in cleartext: they are never offered in
   the app, come with a warning on the command line, and a guest never port-scans or fans out at an
   address that only an unsigned source reported. A guest keeps at most 8 such addresses at once;
-  a host sprays only sealed client records, at no more than 16 new addresses an hour.
+  a host punches only addresses from sealed client records: at most 64 new addresses an hour and
+  8 ports of each, never a port below 1024 (UDP, and TCP for the WebSocket carrier), and
+  port-sprays at most 16 new addresses an hour. An invite holder can use up that budget, which
+  then stops a host behind NAT from reaching new guests until the hour ends or it shares again.
+- On the command line, trackers (`trk`) announce guests' addresses in cleartext under the invite's
+  info-hash, so any invite holder can list them; the app never uses trackers.
+- Any invite holder can block the guests' shared DHT slot for a 10-minute window with a maximal
+  sequence number; guests then find the host through the other services.
 - The address a host signs comes from STUN only when two servers agree on it (or only one is
   configured).
 - A host record carries its signing time inside the signature and is refused 2 minutes later.
@@ -128,36 +174,52 @@ guest may keep 64 TCP flows open through the userspace exit.
 
 A guest, in turn, only takes packets from the host that are addressed to its own tunnel address
 and answer something it sent: a TCP segment that opens a connection (SYN without ACK) is dropped,
-and UDP only reaches a local port that sent through the tunnel in the last 3 minutes. The host can
-ping the guest's tunnel address, but not connect to services on the guest's device.
+UDP passes only from an address and port that a local port sent to through the tunnel in the last
+3 minutes, and of ICMP only
+echo replies and errors pass. Every other protocol (GRE, IP-in-IP, IPv6-in-IPv4, SCTP, ...) and
+every fragment is dropped (overlapping fragments could rewrite the TCP flags, RFC 1858). The host
+cannot ping the guest or connect to services on the guest's device. A reply that arrives
+fragmented is lost; DNS keeps answers under 1232 bytes, and TCP and QUIC avoid fragmentation.
 
 ## WebSocket carrier identity
 
-The `ws` carrier's TLS certificate is made with the host key. A guest ignores the certificate's
-contents and checks the TLS 1.3 handshake signature against `hk`, so only the host can complete
-TLS; holding the invite is not enough. A prober without the invite still completes TLS and sees a
-self-signed certificate: where active probing matters, the Xray (REALITY) carrier, or `tls=ca`
-behind a real certificate, is the choice.
+The `ws` carrier's TLS certificate is made with the host's TLS subkey for the current invite, not
+the host key. A guest ignores the certificate's contents and checks the TLS 1.3 handshake signature
+against the subkey it derives from `hk` and the invite key, so only the host can complete TLS;
+holding the invite is not enough. A prober without the invite still completes TLS and sees a
+self-signed certificate, which tells it nothing about `hk` or the host's records, and changes with
+the invite: where active probing matters, the Xray (REALITY) carrier, or `tls=ca` behind a real
+certificate, is the choice.
 
 ## Privileges
 
 Sharing needs no administrator rights on macOS and Linux (the userspace exit). A full-tunnel guest
 asks for the password once per connection, and only the tunnel runs as root: the window stays an
-ordinary process. Root installs a verified copy of the program into
-`/Library/PrivilegedHelperTools/strait` (macOS) or `/usr/local/libexec/strait` (Linux), and writes
+ordinary process. Root installs its own copy of the program into
+`/Library/PrivilegedHelperTools/strait` (macOS) or `/usr/local/libexec/strait` (Linux) and checks
+that the copy has the SHA-256 the window computed when it staged the program. That stops the file
+being swapped between staging and use; it does not prove the program is genuine (the app is not
+code-signed yet): what approves it is the password prompt. Root writes
 its log only into `/var/run/strait/<uid>`, a folder it creates itself. It receives the rendezvous
 and carrier choices only, never a path to another program. Windows still runs the whole window as
-administrator.
+administrator. The tunnel's log files are 0600 and belong to the user, so other users of the
+computer cannot read them.
 
 ## Formal model
 
 `docs/proverif/strait_nkpsk0.pv` is a symbolic ProVerif model of the join against an attacker who
-holds the invite. ProVerif 2.05 proves that the guest's token and its traffic stay secret, that a
-guest that finishes a join has talked to the holder of the host key (injective agreement on both
-ephemeral keys and the session key), and that a host that sees the guest's token got it from that
-guest (results in `docs/proverif/README.md`). It leaves out the clock check,
-the replay cache, rotation and the rendezvous and carrier layers. Nonce uniqueness is argued under
-Session keys above.
+holds the invite, and who gets the host key once every session is over. ProVerif 2.05 proves that
+the guest's token stays secret while the host key does; that traffic in both directions stays
+secret, also after the host key leaks; that a guest that finishes a join has talked to the holder
+of the host key (injective agreement on both ephemeral keys and the session key); that every
+session the host accepts under the guest's token has a key the attacker never learns; and that a
+message 1 carrying the token was made by that guest. It also confirms the limit that the token is
+not forward secret. Results are in `docs/proverif/README.md`. The model's header lists its
+abstractions: the AEAD's associated data is the ephemeral key rather than the transcript hash; one
+host and one `hk`; no signing oracle on the host key (the subkeys and the token MAC are not
+modelled); `cn`, the outer tag, the clock check and the replay memory are not modelled; nor are
+rotation and the rendezvous and carrier layers. Nonce uniqueness is argued under Session keys
+above.
 
 ## Not covered
 
@@ -166,5 +228,13 @@ Session keys above.
   limits above (high ports, 3 minutes, 3 times an hour).
 - A copy of a personal invite works while its owner is not connected.
 - No kill switch: if Strait stops, traffic uses the normal connection again.
-- Nothing here has been reviewed by an outside party.
+- A personal token is not forward secret: someone who records a join and later gets the host key
+  learns which token was used (not the traffic).
+- The record and TLS subkeys are related to the host key's X25519 use (see Host key).
+- Root checks that its copy of the tunnel program matches what the window staged, not that it is
+  genuine: the app is not code-signed yet.
+- Holders of the shared invite on two networks can fill a host (see Handshake).
+- A WebSocket host behind a reverse proxy sees every guest at the proxy's address: the per-address
+  cap of 16 connections does not apply there, only the total of 256.
+- Nothing here has been audited by an outside party.
 - The host owner sees where a guest's traffic goes and its unencrypted content, as any VPN exit does.

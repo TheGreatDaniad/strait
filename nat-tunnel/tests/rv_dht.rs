@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mainline::{Dht as Node, MutableItem, SigningKey, Testnet};
+use mainline::{Dht as Node, Testnet};
 use nat_tunnel::rendezvous::derive::{seal, seal_at, Derived};
 use nat_tunnel::rendezvous::dht::{poll_windows, Dht, PutSchedule, Tune};
 use nat_tunnel::rendezvous::{Candidate, ProbeStatus, Rendezvous, Role, RvCtx, RvError};
@@ -57,11 +57,10 @@ async fn stop(c: CancellationToken, h: Handle) {
 /// Raw publisher standing in for a peer: put `blob` under `role`'s key at the window of `clock`.
 fn raw_put(tn: &Testnet, key: [u8; 16], role: Role, blob: &[u8], seq: i64, cas: Option<i64>, clock: u64) {
     let d = Derived::new_test(&key);
-    let seed = if role == Role::Host { d.dht_host_seed } else { d.dht_client_seed };
     let node = Node::builder().bootstrap(&tn.bootstrap).bind_address(Ipv4Addr::LOCALHOST).build().unwrap();
     assert!(node.bootstrapped());
     let salt = (clock / 600).to_be_bytes();
-    node.put_mutable(MutableItem::new(SigningKey::from_bytes(&seed), blob, seq, Some(&salt)), cas).unwrap();
+    node.put_mutable(nat_tunnel::rendezvous::dht::signed_item(&d, role, blob, seq, &salt).unwrap(), cas).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -302,7 +301,7 @@ async fn host_repeats_its_put_early() {
     let dd = Dht::with_network(tn.bootstrap.clone(), Ipv4Addr::LOCALHOST, Arc::new(now), t);
     let t0 = now() as i64; // the host's seq starts at its start time and rises by one per PUT
     let (_rx, c, h) = start(dd, key, Role::Host, vec![sa("192.0.2.1:1111")]);
-    let pk = SigningKey::from_bytes(&Derived::new_test(&key).dht_host_seed).verifying_key().to_bytes();
+    let pk = nat_tunnel::rendezvous::dht::public_key(&Derived::new_test(&key), Role::Host).unwrap();
     let salt = (now() / 600).to_be_bytes();
     let reader = Node::builder().bootstrap(&tn.bootstrap).bind_address(Ipv4Addr::LOCALHOST).build().unwrap();
     assert!(reader.bootstrapped());

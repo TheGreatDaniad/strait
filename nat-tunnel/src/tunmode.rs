@@ -1281,6 +1281,9 @@ fn restore_default(gateway: &str, device: &str, tun: &str) {
 #[cfg(target_os = "linux")]
 fn restore_ipv6(original: Option<&str>) {
     let _ = run_route(&["ip", "-6", "route", "del", "unreachable", "default", "metric", V6_REJECT_METRIC]);
+    for half in V6_HALVES {
+        let _ = run_route(&["ip", "-6", "route", "del", "unreachable", half, "metric", V6_REJECT_METRIC]);
+    }
     if let Some(line) = original {
         let mut args = vec!["ip", "-6", "route", "replace"];
         args.extend(line.split_whitespace());
@@ -1355,6 +1358,13 @@ fn route_ipv6_fail_closed() {
     if let Err(e) = run_route(&["ip", "-6", "route", "replace", "unreachable", "default", "metric", V6_REJECT_METRIC]) {
         log::debug!("could not install the IPv6 blackhole route: {e}");
     }
+    // The two halves are more specific than any default, so a router advertisement that adds a
+    // default (or a route to a large prefix) does not get around them.
+    for half in V6_HALVES {
+        if let Err(e) = run_route(&["ip", "-6", "route", "replace", "unreachable", half, "metric", V6_REJECT_METRIC]) {
+            log::warn!("could not install the IPv6 reject route {half}: {e}");
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1379,7 +1389,7 @@ fn route_ipv6_fail_closed() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const V6_HALVES: [&str; 2] = ["::/1", "8000::/1"];
 
 #[cfg(target_os = "macos")]

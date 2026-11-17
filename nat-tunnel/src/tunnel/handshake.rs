@@ -2,11 +2,12 @@
 //!
 //! * The invite key is the pre-shared key: without it neither message can be produced or read.
 //! * The host has a long-term Ed25519 key. Its public half is the invite's `hk`; the Noise static
-//!   key is the same key in X25519 form (`to_scalar_bytes` / `to_montgomery`), and the host signs
-//!   its rendezvous records with it. Using one key pair for both is analysed in Thormarker,
-//!   "On using the same key pair for Ed25519 and an X25519 based KEM" (IACR ePrint 2021/509).
-//!   The client encrypts to that key, so only its holder can complete the handshake: knowing the
-//!   invite is not enough to pose as the host. An invite without `hk` is refused.
+//!   key is the same key in X25519 form (`to_scalar_bytes` / `to_montgomery`). The client encrypts
+//!   to that key, so only its holder can complete the handshake: knowing the invite is not enough
+//!   to pose as the host. An invite without `hk` is refused.
+//! * One key, one use each: the host key itself signs nothing. Rendezvous records and the
+//!   WebSocket transport's TLS handshake are signed with per-invite subkeys ([`Subkey`]), and
+//!   personal-invite tokens use an HMAC key derived from it ([`token_key`]).
 //! * Both sides add a fresh ephemeral key, so a recorded session stays unreadable when the
 //!   invite or the host key leaks later.
 //!
@@ -84,13 +85,96 @@ pub fn valid_public(hk: &[u8; 32]) -> bool {
     ed25519_dalek::VerifyingKey::from_bytes(hk).is_ok_and(|v| !v.is_weak())
 }
 
-/// Sign `msg` with the host key (rendezvous records).
-pub fn sign(host_key: &[u8; 32], msg: &[u8]) -> [u8; 64] {
-    use ed25519_dalek::Signer;
-    ed25519_dalek::SigningKey::from_bytes(host_key).sign(msg).to_bytes()
+// ---- per-invite subkeys --------------------------------------------------------------------
+//
+// Each signature uses a subkey for its purpose and its invite, made by key blinding as Tor v3
+// onion services do: subkey = b * host key, b = SHA-512(label, purpose, hk, invite key) mod l. A
+// guest derives the subkey's public half from `hk` and the invite key ([`subkey_public`]). Without
+// the invite key a subkey cannot be linked to `hk` or to the same host's subkeys for other
+// invites: someone who only knows `hk` (a guest removed by "Change every invite", or a prober
+// that saw a TLS certificate) cannot recognise the host's records or certificates.
+
+/// Subkey purposes.
+pub const SUBKEY_RECORD: &[u8] = b"record";
+pub const SUBKEY_TLS: &[u8] = b"tls";
+pub const SUBKEY_DHT: &[u8] = b"dht";
+
+fn blind_factor(hk: &[u8; 32], invite: &[u8], purpose: &[u8]) -> curve25519_dalek::Scalar {
+    use ed25519_dalek::Digest;
+    let mut h = ed25519_dalek::Sha512::new();
+    for part in [b"strait-subkey-v1".as_slice(), &[purpose.len() as u8], purpose, hk, invite] {
+        h.update(part);
+    }
+    curve25519_dalek::Scalar::from_bytes_mod_order_wide(&h.finalize().into())
 }
 
-/// Check a signature made by [`sign`] against the invite's `hk` (strict verification).
+/// The host's signing key for one purpose under one invite.
+pub struct Subkey {
+    esk: ed25519_dalek::hazmat::ExpandedSecretKey,
+    vk: ed25519_dalek::VerifyingKey,
+}
+
+impl std::fmt::Debug for Subkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Subkey(..)") // never print key material
+    }
+}
+
+impl Subkey {
+    pub fn new(host_key: &[u8; 32], invite: &[u8], purpose: &[u8]) -> Self {
+        use ed25519_dalek::hazmat::ExpandedSecretKey;
+        use ed25519_dalek::Digest;
+        let b = blind_factor(&public_of(host_key), invite, purpose);
+        let root = ExpandedSecretKey::from(host_key);
+        // The nonce prefix must differ from every other key's: the same nonce under two related
+        // scalars would reveal the key.
+        let mut p = ed25519_dalek::Sha512::new();
+        p.update(b"strait-subkey-prefix-v1");
+        p.update(root.hash_prefix);
+        p.update(b.as_bytes());
+        let hash_prefix: [u8; 32] = p.finalize()[..32].try_into().unwrap();
+        let esk = ExpandedSecretKey { scalar: b * root.scalar, hash_prefix };
+        let vk = ed25519_dalek::VerifyingKey::from(&esk);
+        Self { esk, vk }
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        self.vk.to_bytes()
+    }
+
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] {
+        ed25519_dalek::hazmat::raw_sign::<ed25519_dalek::Sha512>(&self.esk, msg, &self.vk).to_bytes()
+    }
+}
+
+/// The public half of the host's subkey for `purpose` under `invite`, from the invite's `hk`.
+pub fn subkey_public(hk: &[u8; 32], invite: &[u8], purpose: &[u8]) -> Option<[u8; 32]> {
+    let v = ed25519_dalek::VerifyingKey::from_bytes(hk).ok().filter(|v| !v.is_weak())?;
+    Some(ed25519_dalek::VerifyingKey::from(blind_factor(hk, invite, purpose) * v.to_edwards()).to_bytes())
+}
+
+// ---- guest records sealed to the host ---------------------------------------------------------
+//
+// A guest's rendezvous record (its public address) is for the host only, not for every invite
+// holder: it is sealed with a key from an X25519 exchange between a fresh key and the host's Noise
+// static key (one-way, like Noise `N`).
+
+/// Guest side: a fresh public key and the secret it shares with the host named by `hk`.
+pub fn dh_to_host(hk: &[u8; 32]) -> Option<([u8; 32], zeroize::Zeroizing<[u8; 32]>)> {
+    let rs = x25519_dalek::PublicKey::from(noise_public(hk).ok()?);
+    let e = x25519_dalek::StaticSecret::random();
+    let shared = e.diffie_hellman(&rs);
+    shared.was_contributory().then(|| (x25519_dalek::PublicKey::from(&e).to_bytes(), zeroize::Zeroizing::new(shared.to_bytes())))
+}
+
+/// Host side: the secret shared with the sender of `epk`. None for a low-order `epk`.
+pub fn dh_as_host(host_key: &[u8; 32], epk: &[u8; 32]) -> Option<zeroize::Zeroizing<[u8; 32]>> {
+    let sk = x25519_dalek::StaticSecret::from(*noise_private(host_key));
+    let shared = sk.diffie_hellman(&x25519_dalek::PublicKey::from(*epk));
+    shared.was_contributory().then(|| zeroize::Zeroizing::new(shared.to_bytes()))
+}
+
+/// Check a signature against a public key (strict verification).
 pub fn verify_sig(hk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     ed25519_dalek::VerifyingKey::from_bytes(hk)
         .is_ok_and(|v| !v.is_weak() && v.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(sig)).is_ok())
@@ -121,6 +205,16 @@ pub fn fresh(ts: u32, now: u32) -> bool {
     ts.abs_diff(now) <= JOIN_MAX_SKEW
 }
 
+/// Slack for a guest's slow clock when a host has just started.
+pub const RESTART_SLACK: u32 = 60;
+
+/// [`fresh`], and not made before the host `started` (less [`RESTART_SLACK`]): the host's replay
+/// memory starts empty, so a JOIN recorded before a restart would otherwise be new to it. A guest
+/// whose clock is late by more than the slack waits that long after a host restart.
+pub fn fresh_since(ts: u32, now: u32, started: u32) -> bool {
+    fresh(ts, now) && ts.saturating_add(RESTART_SLACK) >= started
+}
+
 /// Client side, between message 1 and message 2.
 pub struct ClientHs {
     psk: [u8; 32],
@@ -148,6 +242,9 @@ impl ClientHs {
     fn state(&self) -> Result<(snow::HandshakeState, Vec<u8>), Failed> {
         let mut state = builder(&self.psk)?
             .remote_public_key(&self.rs)
+            // Despite its name this is safe here: `e` is a fresh random key for this handshake only
+            // (made in `new`, never reused), and setting it lets message 1 be rebuilt byte for byte
+            // so each candidate message 2 is read on a fresh state (snow states cannot be cloned).
             .and_then(|b| b.fixed_ephemeral_key_for_testing_only(&self.e[..]).build_initiator())
             .map_err(|_| Failed)?;
         let mut msg1 = vec![0u8; self.payload.len() + OVERHEAD];
@@ -328,14 +425,39 @@ mod tests {
         let x = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*noise_private(&k))).to_bytes();
         assert_eq!(noise_public(&hk).unwrap(), x);
         assert!(valid_public(&hk));
-        let sig = sign(&k, b"record");
-        assert!(verify_sig(&hk, b"record", &sig));
-        assert!(!verify_sig(&hk, b"recorD", &sig));
-        assert!(!verify_sig(&public_of(&new_host_key()), b"record", &sig));
+        // Subkeys: the guest's public half matches the host's; each purpose and invite has its
+        // own; none is `hk`, and a signature under one does not verify under another.
+        let sub = Subkey::new(&k, b"invite-a", SUBKEY_RECORD);
+        let pk = subkey_public(&hk, b"invite-a", SUBKEY_RECORD).unwrap();
+        assert_eq!(sub.public(), pk);
+        let sig = sub.sign(b"record");
+        assert!(verify_sig(&pk, b"record", &sig));
+        assert!(!verify_sig(&pk, b"recorD", &sig));
+        assert!(!verify_sig(&hk, b"record", &sig), "the host key itself signs nothing");
+        for other in [
+            subkey_public(&hk, b"invite-b", SUBKEY_RECORD).unwrap(),
+            subkey_public(&hk, b"invite-a", SUBKEY_TLS).unwrap(),
+            subkey_public(&public_of(&new_host_key()), b"invite-a", SUBKEY_RECORD).unwrap(),
+        ] {
+            assert!(other != pk && !verify_sig(&other, b"record", &sig));
+        }
+        // Signing is deterministic per subkey and differs between subkeys for the same message.
+        assert_eq!(sub.sign(b"m"), sub.sign(b"m"));
+        assert_ne!(sub.sign(b"m")[..32], Subkey::new(&k, b"invite-a", SUBKEY_TLS).sign(b"m")[..32]);
+        assert!(subkey_public(&[0u8; 32], b"x", SUBKEY_TLS).is_none() || !valid_public(&[0u8; 32]));
         // The identity point (y = 1) is a valid encoding of a weak key: refused.
         let mut ident = [0u8; 32];
         ident[0] = 1;
         assert!(!valid_public(&ident) && ClientHs::new(&PSK, &ident, b"").is_err(), "a low-order hk is refused");
+    }
+
+    #[test]
+    fn joins_from_before_a_host_restart_are_stale() {
+        let started = 1_800_000_000;
+        assert!(fresh_since(started, started + 5, started));
+        assert!(fresh_since(started - RESTART_SLACK, started + 5, started), "a slow clock");
+        assert!(!fresh_since(started - RESTART_SLACK - 1, started + 5, started), "recorded before the restart");
+        assert!(!fresh_since(started + 5 + JOIN_MAX_SKEW + 1, started + 5, started), "from the future");
     }
 
     #[test]

@@ -168,6 +168,7 @@ async fn identity_is_a_pure_function_of_the_key() {
 /// the invite key but not the host key (anyone holding the invite) is refused, as is a wrong `hk`.
 #[tokio::test]
 async fn tls_is_bound_to_the_host_key() {
+    // The host signs with its TLS subkey for this invite; the client derives it from `hk`.
     let sk = nat_tunnel::tunnel::handshake::new_host_key();
     let hk = nat_tunnel::tunnel::handshake::hex(&nat_tunnel::tunnel::handshake::public_of(&sk));
     let sk_hex = nat_tunnel::tunnel::handshake::hex(&sk);

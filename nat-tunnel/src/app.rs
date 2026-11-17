@@ -72,8 +72,9 @@ pub struct HostOpts {
     pub guests: crate::transport::GuestPolicy,
 }
 
-/// Local, per-device carrier settings. Never travels in an invite, never holds a secret.
-#[derive(Clone, Default, Debug)]
+/// Local, per-device carrier settings. Never travels in an invite. The only secret is the host key
+/// (host side), which goes to the `ws` carrier alone and is never printed.
+#[derive(Clone, Default)]
 pub struct CarrierCfg {
     /// Absolute path of the Xray binary (`NAT_TUNNEL_XRAY_BIN` when unset).
     pub xray_bin: Option<String>,
@@ -81,6 +82,18 @@ pub struct CarrierCfg {
     pub xray_sha256: Option<String>,
     /// Extra spec parameters handed to every carrier; they win over derived ones (tests, tuning).
     pub extra: Vec<(String, String)>,
+    /// Host: the host key, from which the `ws` carrier derives its TLS subkey.
+    pub host_key: Option<zeroize::Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for CarrierCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CarrierCfg")
+            .field("xray_bin", &self.xray_bin)
+            .field("extra", &self.extra.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())
+            .field("host_key", &self.host_key.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -302,6 +315,11 @@ pub fn carrier_spec(entry: &CarrierEntry, key: &str, cfg: &CarrierCfg, endpoint:
             params.push(("xray_target".into(), t));
         }
     }
+    if entry.id == CarrierId::Ws {
+        if let Some(k) = &cfg.host_key {
+            params.push(("tls_sk".into(), crate::tunnel::handshake::hex(&k[..])));
+        }
+    }
     for (k, v) in &cfg.extra {
         params.retain(|(n, _)| n != k);
         params.push((k.clone(), v.clone()));
@@ -444,9 +462,11 @@ fn permanent(e: &ConnectError) -> bool {
 }
 
 /// A permanent failure ends the process only before the first successful connect: a host that
-/// restarts mid-session (every carrier timing out for a while) must not end a running client.
+/// restarts mid-session (every carrier timing out for a while) must not end a running client. A
+/// refusal always ends it: the host itself said no (the guest was removed), and retrying would
+/// only cost the host a key exchange a second.
 fn ends_process(e: &ConnectError, ever_connected: bool) -> bool {
-    permanent(e) && !ever_connected
+    matches!(e, ConnectError::Refused) || (permanent(e) && !ever_connected)
 }
 
 /// Connect as a guest (the connect step of `run_guest`, public for tests and embedders). Without carriers in the invite this is exactly the old UDP path; with
@@ -718,7 +738,8 @@ pub async fn run_host(opts: HostOpts) -> io::Result<()> {
 pub async fn run_guest(mut opts: GuestOpts) -> io::Result<()> {
     // Nothing a retry changes: say so once and stop.
     crate::transport::check_host_key(&opts.auth).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    // The ws carrier's TLS handshake must be signed with the host key the invite names.
+    // The ws carrier's TLS handshake must be signed with the host's TLS subkey for this invite,
+    // derived from the host key the invite names (see `carrier::ws`).
     if let Some(hk) = opts.auth.host_key {
         opts.carrier_cfg.extra.push(("tls_hk".into(), crate::tunnel::handshake::hex(&hk)));
     }
@@ -949,9 +970,10 @@ async fn run_host_mux(opts: &HostOpts, cfg: Option<TunConfig>) -> io::Result<()>
         Some(k) => k,
         None => host_key()?,
     };
-    // The ws certificate is made with the host key, which guests check (see `carrier::ws`).
+    // The ws certificate is made with the host's TLS subkey for this invite, derived from the host
+    // key; guests check it (see `carrier::ws`).
     let mut carrier_cfg = opts.carrier_cfg.clone();
-    carrier_cfg.extra.push(("tls_sk".into(), crate::tunnel::handshake::hex(&host_secret)));
+    carrier_cfg.host_key = Some(zeroize::Zeroizing::new(host_secret));
     let (ios, failed) = start_carriers(&own, &opts.key, &carrier_cfg).await;
     for (id, why) in &failed {
         ui::status(&format!("carrier {id} not started: {why}"));
@@ -1229,42 +1251,66 @@ fn for_guest(packet: &[u8], local: Ipv4Addr) -> bool {
 }
 
 /// The guest takes only replies from the host: a TCP segment that opens a connection (SYN without
-/// ACK) is dropped, and UDP reaches only a local port that sent through the tunnel in the last
-/// 3 minutes. So a host cannot connect to services that listen on the guest's device.
+/// ACK) is dropped, UDP passes only from an address and port that a local port sent to through
+/// the tunnel in the last 3 minutes, and of ICMP only echo replies and errors pass. Every other protocol and every
+/// fragment is dropped (overlapping fragments could rewrite the TCP flags checked here, RFC 1858).
+/// So a host cannot connect to services that listen on the guest's device.
 #[derive(Default)]
 struct GuestInbound {
-    udp: std::collections::HashMap<u16, std::time::Instant>,
+    /// (local port, remote address, remote port) of UDP the guest sent, and when.
+    udp: std::collections::HashMap<(u16, [u8; 4], u16), std::time::Instant>,
 }
 
 const UDP_REPLY_WINDOW: Duration = Duration::from_secs(180);
-const UDP_PORTS_KEPT: usize = 4096;
+const UDP_FLOWS_KEPT: usize = 4096;
 
-/// (protocol, header length) of an IPv4 packet's first fragment; None for a later fragment.
-fn l4(p: &[u8]) -> Option<(u8, usize)> {
-    (p.len() >= 20 && u16::from_be_bytes([p[6], p[7]]) & 0x1fff == 0).then(|| (p[9], ((p[0] & 0x0f) as usize) * 4))
+/// A UDP packet's (source port, destination port).
+fn udp_ports(p: &[u8], ihl: usize) -> Option<(u16, u16)> {
+    let h = p.get(ihl..ihl + 4)?;
+    Some((u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[2], h[3]])))
+}
+
+fn addr4(b: &[u8]) -> [u8; 4] {
+    b.try_into().unwrap()
+}
+
+/// (protocol, header length, fragment bits: more-fragments flag and offset) of an IPv4 packet;
+/// None for a malformed header.
+fn l4(p: &[u8]) -> Option<(u8, usize, u16)> {
+    let ihl = ((*p.first()? & 0x0f) as usize) * 4;
+    (p.len() >= 20 && ihl >= 20 && p.len() >= ihl).then(|| (p[9], ihl, u16::from_be_bytes([p[6], p[7]]) & 0x3fff))
 }
 
 impl GuestInbound {
     fn note_out(&mut self, p: &[u8]) {
-        if let Some((17, ihl)) = l4(p) {
-            if p.len() >= ihl + 2 {
+        if let Some((17, ihl, frag)) = l4(p) {
+            if let (0, Some((sport, dport))) = (frag & 0x1fff, udp_ports(p, ihl)) {
                 let now = std::time::Instant::now();
-                if self.udp.len() >= UDP_PORTS_KEPT {
+                if self.udp.len() >= UDP_FLOWS_KEPT && !self.udp.contains_key(&(sport, addr4(&p[16..20]), dport)) {
                     self.udp.retain(|_, t| now.duration_since(*t) < UDP_REPLY_WINDOW);
+                    if self.udp.len() >= UDP_FLOWS_KEPT {
+                        // Still full (torrents, games): forget the older half, never stop new flows.
+                        let mut ts: Vec<std::time::Instant> = self.udp.values().copied().collect();
+                        let mid = ts.len() / 2;
+                        let cut = *ts.select_nth_unstable(mid).1;
+                        self.udp.retain(|_, t| *t > cut);
+                    }
                 }
-                self.udp.insert(u16::from_be_bytes([p[ihl], p[ihl + 1]]), now);
+                self.udp.insert((sport, addr4(&p[16..20]), dport), now);
             }
         }
     }
 
     fn allow_in(&self, p: &[u8]) -> bool {
         match l4(p) {
-            Some((6, ihl)) => p.len() >= ihl + 14 && !(p[ihl + 13] & 0x02 != 0 && p[ihl + 13] & 0x10 == 0),
-            Some((17, ihl)) => {
-                p.len() >= ihl + 4
-                    && self.udp.get(&u16::from_be_bytes([p[ihl + 2], p[ihl + 3]])).is_some_and(|t| t.elapsed() < UDP_REPLY_WINDOW)
-            }
-            _ => true, // ICMP (errors, the host's ping) and later fragments
+            Some((_, _, frag)) if frag != 0 => false,
+            Some((6, ihl, _)) => p.len() >= ihl + 14 && !(p[ihl + 13] & 0x02 != 0 && p[ihl + 13] & 0x10 == 0),
+            Some((17, ihl, _)) => udp_ports(p, ihl).is_some_and(|(sport, dport)| {
+                self.udp.get(&(dport, addr4(&p[12..16]), sport)).is_some_and(|t| t.elapsed() < UDP_REPLY_WINDOW)
+            }),
+            // ICMP: echo reply, destination unreachable (path MTU), time exceeded, parameter problem.
+            Some((1, ihl, _)) => p.len() > ihl && matches!(p[ihl], 0 | 3 | 11 | 12),
+            _ => false,
         }
     }
 }
@@ -1639,11 +1685,36 @@ mod tests {
         assert!(!g.allow_in(&pkt(17, 53, 5353, 0)), "UDP to a port the guest never used");
         g.note_out(&pkt(17, 5353, 53, 0));
         assert!(g.allow_in(&pkt(17, 53, 5353, 0)), "the DNS reply");
-        assert!(g.allow_in(&pkt(1, 0, 0, 0)), "ICMP");
-        let mut frag = pkt(6, 4444, 22, 0x02);
-        frag[6] = 0x00;
-        frag[7] = 0x10; // a later fragment: no TCP header to judge
-        assert!(g.allow_in(&frag));
+        let mut other = pkt(17, 53, 5353, 0);
+        other[12..16].copy_from_slice(&[198, 51, 100, 7]);
+        assert!(!g.allow_in(&other), "the same port, from an address the guest never sent to");
+        assert!(!g.allow_in(&pkt(17, 54, 5353, 0)), "the same address, another port");
+        for i in 0..(UDP_FLOWS_KEPT as u16 + 100) {
+            g.note_out(&pkt(17, 10000 + i, 53, 0));
+        }
+        assert!(g.udp.len() <= UDP_FLOWS_KEPT);
+        assert!(g.allow_in(&pkt(17, 53, 10000 + UDP_FLOWS_KEPT as u16 + 99, 0)), "a new flow still gets its replies when the table is full");
+        let icmp = |t: u8| {
+            let mut p = pkt(1, 0, 0, 0);
+            p[20] = t;
+            p
+        };
+        assert!(g.allow_in(&icmp(0)) && g.allow_in(&icmp(3)) && g.allow_in(&icmp(11)), "echo reply and errors");
+        assert!(!g.allow_in(&icmp(8)) && !g.allow_in(&icmp(13)), "echo or timestamp request from the host");
+        for proto in [47, 4, 41, 132, 50] {
+            assert!(!g.allow_in(&pkt(proto, 0, 0, 0)), "protocol {proto}");
+        }
+        let mut later = pkt(6, 443, 50000, 0x10);
+        later[7] = 0x10; // a later fragment
+        let mut first = pkt(6, 443, 50000, 0x10);
+        first[6] = 0x20; // more fragments follow
+        assert!(!g.allow_in(&later) && !g.allow_in(&first), "fragments");
+        let mut df = pkt(6, 443, 50000, 0x10);
+        df[6] = 0x40; // don't fragment: a whole packet
+        assert!(g.allow_in(&df));
+        let mut bad = pkt(6, 443, 50000, 0x10);
+        bad[0] = 0x44; // header length 16
+        assert!(!g.allow_in(&bad) && !g.allow_in(&[0x45; 10]), "malformed");
     }
 
     #[test]
@@ -1703,6 +1774,7 @@ mod tests {
         assert!(ends_process(&e, false), "a bad invite must still end the process at the start");
         assert!(!ends_process(&e, true), "a host restart must keep the client waiting");
         assert!(!ends_process(&ConnectError::HostUnreachable, false));
+        assert!(ends_process(&ConnectError::Refused, true), "a removed guest stops instead of retrying");
     }
 
     #[test]

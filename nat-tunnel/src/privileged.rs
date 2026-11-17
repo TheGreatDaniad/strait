@@ -191,7 +191,12 @@ pub struct ShellSpec<'a> {
     /// Root-owned folder holding `err` and `pid_file` (made by the line itself).
     pub state_dir: &'a Path,
     pub err: &'a Path,
+    /// The tunnel's log (`--log-file`): made with `err` before the child starts.
+    pub log: &'a Path,
     pub pid_file: &'a Path,
+    /// The user the logs belong to: they are created 0600 and given to this uid, so only that user
+    /// (and root) can read them.
+    pub uid: u32,
     /// Environment for the child (names from `CHILD_ENV`).
     pub env: &'a [(String, String)],
 }
@@ -245,8 +250,10 @@ pub fn last_line(path: &Path) -> Option<String> {
     Some(l.chars().take(300).collect())
 }
 
-/// Shell line, run once as root: install a verified root-owned copy of the
-/// binary, then start it detached, logging to `err` and recording its pid.
+/// Shell line, run once as root: install a root-owned copy of the binary and check that it holds
+/// the bytes the window staged (the hash comes from the window: this stops a swap between staging
+/// and use, it does not prove the program is genuine; the password prompt is what approves it),
+/// then start it detached, logging to `err` and recording its pid.
 pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
     if s.sha256.len() != 64 || !s.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("bad SHA-256".into());
@@ -261,12 +268,14 @@ pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
         s.state_dir.display().to_string(),
         s.err.display().to_string(),
         s.pid_file.display().to_string(),
+        s.log.display().to_string(),
     ];
     let env: Vec<String> = s.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     if strs.iter().chain(&env).map(String::as_str).chain(args.iter().map(String::as_str)).any(|x| x.contains('\0')) {
         return Err("argument contains a NUL byte".into());
     }
-    let [stage, dir, dest, state, err, pid] = strs.map(|x| sh_quote(&x));
+    let [stage, dir, dest, state, err, pid, log] = strs.map(|x| sh_quote(&x));
+    let uid = s.uid;
     let group = sh_quote(s.group);
     let sha = sh_quote(s.sha256);
     // Read through stdin: shasum escapes file names that hold a backslash, which would change the output.
@@ -275,7 +284,8 @@ pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
     let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
     // `rm -f` first: root then creates the folder itself, so nothing planted there survives.
     Ok(format!(
-        "rm -rf {state} && mkdir -p -m 0755 {state} || {{ echo 'cannot create the state folder' >&2; exit 1; }}; \
+        "rm -rf {state} && mkdir -p -m 0755 {state} && (umask 077 && : >{err} && : >{log}) && chown {uid} {err} {log} \
+         || {{ echo 'cannot create the state folder' >&2; exit 1; }}; \
          {{ [ {hash} ] || {{ install -d -m 0755 -o root -g {group} {dir} && install -m 0755 -o root -g {group} {stage} {dest}; }}; [ {hash} ]; }} >>{err} 2>&1 \
          || {{ rm -f {dest}; echo 'integrity check failed' >>{err}; echo 'integrity check failed' >&2; exit 1; }}; \
          nohup /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin {} {dest} {} >>{err} 2>&1 </dev/null & echo $! > {pid}",
@@ -335,7 +345,7 @@ pub fn stop_file_valid(path: &Path, uid: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Create `path` for logging: 0644, owned by the caller, never through a symlink.
+/// Open `path` for logging: 0600, never through a symlink (`shell_command` made it, owned by the user).
 #[cfg(unix)]
 pub fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -343,10 +353,11 @@ pub fn open_log_file(path: &Path) -> std::io::Result<std::fs::File> {
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o644)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    f.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    // Only the user (who owns it, see `shell_command`) and root read the log: it holds addresses.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     Ok(f)
 }
 
@@ -565,7 +576,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
     fn line(fx: &Fx, sha: &str, args: &[String]) -> String {
         let (hash_cmd, group) = ShellSpec::platform_defaults();
         shell_command(
-            &ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: &fx.dest_dir, dest_exe: &fx.dest, hash_cmd, group, state_dir: &fx.state, err: &fx.err, pid_file: &fx.pid, env: &[] },
+            &ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: &fx.dest_dir, dest_exe: &fx.dest, hash_cmd, group, state_dir: &fx.state, err: &fx.err, log: &fx.state.join("t.log"), pid_file: &fx.pid, uid: unsafe { libc::geteuid() }, env: &[] },
             args,
         )
         .unwrap()
@@ -643,6 +654,10 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         wait_for_file(&bin.join("launched"));
         assert_eq!(std::fs::read_to_string(victim.join("t.pid")).unwrap(), "keep");
         assert!(!std::fs::symlink_metadata(&fx.state).unwrap().file_type().is_symlink());
+        for f in ["t.err", "t.log"] {
+            let m = std::fs::metadata(fx.state.join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o600, "{f}: other users of the computer must not read the logs");
+        }
     }
 
     #[test]
@@ -686,7 +701,7 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         let fx = fixture("rej", 0o755);
         let (hash_cmd, group) = ShellSpec::platform_defaults();
         let env = |k: &str| vec![(k.to_string(), "x".to_string())];
-        let mk = |sha: &str, a: &[String], env: &[(String, String)]| shell_command(&ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: "/d", dest_exe: "/d/x", hash_cmd, group, state_dir: &fx.state, err: &fx.err, pid_file: &fx.pid, env }, a);
+        let mk = |sha: &str, a: &[String], env: &[(String, String)]| shell_command(&ShellSpec { stage: &fx.stage, sha256: sha, dest_dir: "/d", dest_exe: "/d/x", hash_cmd, group, state_dir: &fx.state, err: &fx.err, log: &fx.state.join("t.log"), pid_file: &fx.pid, uid: 0, env }, a);
         assert!(mk("$(touch x)", &[], &[]).is_err());
         assert!(mk(&fx.sha, &["a\0b".into()], &[]).is_err());
         assert!(mk(&fx.sha, &[], &env("NAT_TUNNEL_XRAY_BIN")).is_err(), "only allowed variables reach root");

@@ -57,7 +57,7 @@ fn stop_file_shuts_the_guest_down_cleanly() {
     let mut child = spawn_guest(&dir);
     wait_log(&dir, "guest listening");
     let mode = std::fs::metadata(dir.join("log")).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o644);
+    assert_eq!(mode, 0o600, "only the user reads the log");
     std::fs::write(dir.join("stop"), b"").unwrap();
     let status = wait_for(&mut child, Duration::from_secs(3)).expect("exits within 3 s");
     assert!(status.success(), "exit status {status:?}");

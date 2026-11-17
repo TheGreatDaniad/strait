@@ -726,7 +726,7 @@ async fn guest_without_ipv6_says_so_when_only_v6_addresses_exist() {
 async fn host_only_fires_at_client_addresses_it_can_route() {
     bound(async {
         stun_init();
-        let (v4, v6): (SocketAddr, SocketAddr) = ("127.0.0.1:9".parse().unwrap(), "[2001:db8::1]:5555".parse().unwrap());
+        let (v4, v6): (SocketAddr, SocketAddr) = ("127.0.0.1:4009".parse().unwrap(), "[2001:db8::1]:5555".parse().unwrap());
         for (route, want) in [(false, vec![v4]), (true, vec![v4, v6])] {
             let rv = rv_host(vec![Arc::new(Fixed(vec![v6, v4]))]);
             let mut mux = MuxHost::bind(KEY, MuxConfig { host_key: Some(nat_tunnel::transport::TEST_HOST_KEY), bind_port: Some(0), stun: true, rv: Some(rv), ..MuxConfig::default() })

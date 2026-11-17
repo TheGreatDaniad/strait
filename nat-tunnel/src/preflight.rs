@@ -1034,7 +1034,7 @@ pub mod crui {
     /// Local carrier settings handed to the host and the guest.
     pub fn carrier_cfg(xray_path: &str, xray_sha256: &str) -> CarrierCfg {
         let opt = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
-        CarrierCfg { xray_bin: opt(xray_path), xray_sha256: opt(xray_sha256), extra: Vec::new() }
+        CarrierCfg { xray_bin: opt(xray_path), xray_sha256: opt(xray_sha256), ..Default::default() }
     }
 
     /// The carrier list is shown where the rendezvous picker / the "Connectable" card is (and nowhere

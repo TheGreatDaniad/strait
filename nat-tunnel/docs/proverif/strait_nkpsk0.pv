@@ -2,16 +2,27 @@
    Symbolic model for ProVerif (run: proverif strait_nkpsk0.pv).
 
    Attacker: controls the network and holds the invite, so it knows the invite key (psk) and the
-   host's public key (hk). It can run any number of its own guests. It does not have the host's
-   private key, or the personal token of the honest guest.
+   host's public key (hk). It can run any number of its own guests, with tokens of its own. It does
+   not have the host's private key, or the personal token of the honest guest. In phase 1 (after
+   every session of phase 0) it also learns the host's private key: this checks forward secrecy.
 
    Message 1 (guest -> host): e, es, then AEAD(payload = clock || token)
    Message 2 (host -> guest): e, ee, then AEAD(payload = slot || verdict)
    Session key: from the chaining key after ee.
 
-   What the model leaves out: the timestamp check and the replay cache (a replayed message 1 is
-   only accepted again, which the host bounds; see HANDSHAKE.md), key rotation, and the
-   rendezvous and carrier layers. *)
+   Abstractions (what the model leaves out or simplifies):
+   - The AEAD's associated data is the sender's ephemeral key, not Noise's transcript hash h.
+   - One host with one host key hk; one honest guest identity (one token), any number of sessions.
+   - The host key is only used here as the Noise static key. In the code it also derives the
+     per-invite record and TLS signing subkeys (key blinding) and the token MAC key; there is no
+     signing oracle on it in the model, and those uses are not modelled.
+   - The token is an opaque secret: the host does not check its MAC, so the host accepts any token,
+     the attacker's own included. The properties below are about the honest guest's token.
+   - The outer datagram (the client nonce cn and its invite-key tag), the timestamp check and the
+     replay memory are not modelled. A replayed message 1 is accepted again here; in the code the
+     host remembers the ephemeral key of every message 1 it read (see HANDSHAKE.md), keyed on the
+     ephemeral key because cn is not authenticated by Noise.
+   - Key rotation, the data channel's nonces, and the rendezvous and carrier layers. *)
 
 type G.
 const g: G [data].
@@ -32,35 +43,50 @@ reduc forall k: bitstring, ad: G, m: bitstring; dec(k, ad, enc(k, ad, m)) = m.
 free c: channel.
 free psk: bitstring.                        (* public: every invite holder has it *)
 free token: bitstring [private].            (* the honest guest's personal token *)
-free secret_data: bitstring [private].      (* traffic the honest guest sends in the session *)
+free g2h: bitstring [private].              (* traffic the honest guest sends in its sessions *)
+free h2g: bitstring [private].              (* traffic the host sends in the honest guest's sessions *)
 free clock: bitstring.
 free slot: bitstring.
 
-event HostAccepted(G, G, G, bitstring).     (* hk, guest e, host e, session key *)
-event GuestDone(G, G, G, bitstring).
-event GuestSentToken(bitstring).
-event HostSawToken(bitstring).
+event GuestStarted(G).                                  (* guest e *)
+event GuestDone(G, G, G, bitstring).                    (* hk, guest e, host e, session key *)
+event HostAccepted(G, G, G, bitstring).                 (* hk, guest e, host e, session key *)
+event HostAcceptedTok(bitstring, G, G, bitstring).      (* token read, guest e, host e, session key *)
 
-query attacker(token).
-query attacker(secret_data).
+(* 1. The honest guest's token stays secret while the host key does (it travels under es only). *)
+query attacker(token) phase 0.
+(* 2, 3. Traffic in both directions stays secret, even after the host key leaks (forward secrecy). *)
+query attacker(g2h).
+query attacker(h2g).
+(* 4. A guest that finishes a join talked to the holder of the host key: both agree on the two
+   ephemeral keys and the session key, one host run per guest run. *)
 query hk: G, eg: G, eh: G, k: bitstring; inj-event(GuestDone(hk, eg, eh, k)) ==> inj-event(HostAccepted(hk, eg, eh, k)).
-query event(HostSawToken(token)) ==> event(GuestSentToken(token)).
-(* Sanity: a join can complete, so the results above are not vacuous. Expected: "is false". *)
+(* 5. Host side: a session the host accepts under the honest guest's token has a key the attacker
+   never learns (not in a replay of the guest's message 1, not after the host key leaks). *)
+query eg: G, eh: G, k: bitstring; event(HostAcceptedTok(token, eg, eh, k)) && attacker(k).
+(* 6. Host side: a message 1 that carries the honest guest's token was made by that guest (the
+   ephemeral key is the guest's own). Not injective: a replay is stopped by the replay memory. *)
+query eg: G, eh: G, k: bitstring; event(HostAcceptedTok(token, eg, eh, k)) ==> event(GuestStarted(eg)).
+(* Expected "false" (documented limits and sanity checks):
+   7. The token is not forward secret: with the host key, a recorded message 1 opens.
+   8, 9. A join can complete, on both sides, with the honest token: 1 to 6 are not vacuous. *)
+query attacker(token).
 query hk: G, eg: G, eh: G, k: bitstring; event(GuestDone(hk, eg, eh, k)).
+query eg: G, eh: G, k: bitstring; event(HostAcceptedTok(token, eg, eh, k)).
 
 let Guest(hk: G) =
     new eg: bitstring;
     let EG = exp(g, eg) in
+    event GuestStarted(EG);
     let ck1 = mixe(mixpsk(h0(hk), psk), EG) in
     let ck2 = mixdh(ck1, exp(hk, eg)) in            (* es *)
-    event GuestSentToken(token);
     out(c, (EG, enc(kenc(ck2), EG, (clock, token))));
     in(c, (EH: G, m2: bitstring));
     let ck3 = mixdh(mixe(ck2, EH), exp(EH, eg)) in  (* ee *)
     let s = dec(kenc(ck3), EH, m2) in
     let k = ksession(ck3) in
     event GuestDone(hk, EG, EH, k);
-    out(c, enc(k, EG, secret_data)).
+    out(c, enc(k, EG, g2h)).
 
 let Host(sh: bitstring) =
     let hk = exp(g, sh) in
@@ -68,16 +94,19 @@ let Host(sh: bitstring) =
     let ck1 = mixe(mixpsk(h0(hk), psk), EG) in
     let ck2 = mixdh(ck1, exp(EG, sh)) in            (* es *)
     let (ts: bitstring, t: bitstring) = dec(kenc(ck2), EG, m1) in
-    event HostSawToken(t);
     new eh: bitstring;
     let EH = exp(g, eh) in
     let ck3 = mixdh(mixe(ck2, EH), exp(EG, eh)) in  (* ee *)
     let k = ksession(ck3) in
     event HostAccepted(hk, EG, EH, k);
-    out(c, (EH, enc(kenc(ck3), EH, slot))).
+    event HostAcceptedTok(t, EG, EH, k);
+    out(c, (EH, enc(kenc(ck3), EH, slot)));
+    (* The host's traffic to this guest: the honest guest's data only in its own sessions (to a
+       guest of the attacker's the host sends the attacker's own data, which is no secret). *)
+    if t = token then out(c, enc(k, EH, h2g)).
 
 process
     new sh: bitstring;
     let hk = exp(g, sh) in
     out(c, hk);
-    ( (!Guest(hk)) | (!Host(sh)) )
+    ( (!Guest(hk)) | (!Host(sh)) | (phase 1; out(c, sh)) )
