@@ -786,7 +786,7 @@ fn save_mac_state(dns: &Option<DnsRestore>, v6: &Option<V6Restore>, gateway: &st
 
 /// Write a crash-recovery file into a root-only (0700) folder, never through a link.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn save_root_state(path: &str, state: &impl serde::Serialize) {
+fn save_root_state(path: &str, state: &impl serde::Serialize) -> bool {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = std::path::Path::new(path);
     let write = || -> io::Result<()> {
@@ -796,8 +796,12 @@ fn save_root_state(path: &str, state: &impl serde::Serialize) {
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(path)?;
         io::Write::write_all(&mut f, serde_json::to_string(state)?.as_bytes())
     };
-    if let Err(e) = write() {
-        log::warn!("could not write the crash-recovery state: {e}");
+    match write() {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("could not write the crash-recovery state: {e}");
+            false
+        }
     }
 }
 
@@ -820,24 +824,124 @@ const LINUX_STATE: &str = "/run/strait-restore/restore.json";
 
 /// Send every DNS name to 1.1.1.1/8.8.8.8 on the tunnel link (systemd-resolved), so lookups travel
 /// inside the tunnel even when the system resolver is a LAN address the tunnel bypasses. The
-/// setting belongs to the link and goes away with it. Without systemd-resolved, DNS is unchanged.
+/// setting belongs to the link and goes away with it. False without systemd-resolved.
 #[cfg(target_os = "linux")]
-fn linux_tunnel_dns(tun: &str) {
+fn linux_tunnel_dns(tun: &str) -> bool {
     let set = [
         vec!["resolvectl", "dns", tun, "1.1.1.1", "8.8.8.8"],
         vec!["resolvectl", "domain", tun, "~."],
         vec!["resolvectl", "default-route", tun, "true"],
     ];
     match set.iter().try_for_each(|a| run_route(a)) {
-        Ok(()) => log::info!("DNS set to 1.1.1.1/8.8.8.8 on {tun} for every name (through the tunnel)"),
-        Err(e) => log::warn!("DNS unchanged ({e}): without systemd-resolved, lookups to a resolver on the local network leave outside the tunnel"),
+        Ok(()) => {
+            log::info!("DNS set to 1.1.1.1/8.8.8.8 on {tun} for every name (through the tunnel)");
+            true
+        }
+        Err(e) => {
+            log::info!("no systemd-resolved ({e}): DNS goes through /etc/resolv.conf instead");
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+/// The original resolv.conf while a session has replaced it. Unlike the route state it must survive
+/// a reboot: a resolv.conf that nothing regenerates would otherwise keep the tunnel's servers.
+#[cfg(target_os = "linux")]
+const RESOLV_BACKUP: &str = "/var/lib/strait-restore/resolv.json";
+
+/// The resolv.conf a session without systemd-resolved uses: the original's search and options
+/// lines, with 1.1.1.1/8.8.8.8 (reached through the tunnel) as the only servers.
+#[cfg(any(target_os = "linux", test))]
+fn resolv_for_tunnel(original: &str) -> String {
+    let mut out = String::from("# Set by Strait while its full tunnel runs; put back when it stops.\n");
+    for l in original.lines().filter(|l| ["search", "domain", "options"].contains(&l.split_whitespace().next().unwrap_or(""))) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    out.push_str("nameserver 1.1.1.1\nnameserver 8.8.8.8\n");
+    out
+}
+
+/// Replace `path` (the file a link points to, if it is one) in one step: a crash never leaves half
+/// a file.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn write_whole(path: &std::path::Path, content: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = std::fs::canonicalize(path)?;
+    let tmp = target.with_file_name(".resolv.conf.strait-tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::rename(&tmp, &target)
+}
+
+/// Put the original resolv.conf back, unless something else (a DHCP client, NetworkManager) has
+/// rewritten it since: that newer version is kept. True when it was put back.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn restore_resolv_at(path: &std::path::Path, original: &str) -> bool {
+    if !std::fs::read_to_string(path).is_ok_and(|now| now == resolv_for_tunnel(original)) {
+        return false;
+    }
+    match write_whole(path, original) {
+        Ok(()) => true,
+        Err(e) => {
+            log::warn!("could not restore {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+/// [`restore_resolv_at`] for the system file, then forget the backup.
+#[cfg(target_os = "linux")]
+fn restore_resolv(original: &str) {
+    if restore_resolv_at(std::path::Path::new(RESOLV_CONF), original) {
+        log::info!("restored {RESOLV_CONF}");
+    }
+    let _ = std::fs::remove_file(RESOLV_BACKUP);
+}
+
+/// A resolv.conf left by a session that did not end cleanly (a crash, or a reboot that cleared
+/// /run): put it back. True when there was a backup.
+#[cfg(target_os = "linux")]
+fn recover_resolv() -> bool {
+    let Ok(text) = std::fs::read_to_string(RESOLV_BACKUP) else { return false };
+    match serde_json::from_str::<String>(&text) {
+        Ok(orig) => restore_resolv(&orig),
+        Err(_) => {
+            let _ = std::fs::remove_file(RESOLV_BACKUP);
+        }
+    }
+    true
+}
+
+/// Without systemd-resolved: point resolv.conf at the tunnel's servers, after saving the original
+/// where a crash or a reboot cannot lose it. The original, when it was replaced.
+#[cfg(target_os = "linux")]
+fn linux_resolv_conf() -> Option<String> {
+    let orig = std::fs::read_to_string(RESOLV_CONF).ok()?;
+    if !save_root_state(RESOLV_BACKUP, &orig) {
+        log::warn!("DNS unchanged: the original resolv.conf could not be saved first");
+        return None;
+    }
+    match write_whole(std::path::Path::new(RESOLV_CONF), &resolv_for_tunnel(&orig)) {
+        Ok(()) => {
+            log::info!("DNS set to 1.1.1.1/8.8.8.8 in {RESOLV_CONF} (through the tunnel)");
+            Some(orig)
+        }
+        Err(e) => {
+            log::warn!("DNS unchanged ({e}): lookups to a resolver on the local network leave outside the tunnel");
+            let _ = std::fs::remove_file(RESOLV_BACKUP);
+            None
+        }
     }
 }
 
 /// Undo the routes of a full tunnel that did not exit cleanly. True when there was a file.
 #[cfg(target_os = "linux")]
 pub fn recover_stale_state() -> bool {
-    let Ok(text) = std::fs::read_to_string(LINUX_STATE) else { return false };
+    let resolv = recover_resolv();
+    let Ok(text) = std::fs::read_to_string(LINUX_STATE) else { return resolv };
     if let Ok(s) = serde_json::from_str::<LinuxState>(&text) {
         log::warn!("restoring routes left by a previous session that did not exit cleanly");
         restore_default(&s.gateway, &s.device);
@@ -888,6 +992,8 @@ struct RouteRestore {
     v6: Option<WindowsV6>,
     #[cfg(windows)]
     tun: String,
+    #[cfg(target_os = "linux")]
+    resolv: Option<String>,
 }
 
 impl RouteRestore {
@@ -923,7 +1029,7 @@ impl RouteRestore {
             (state.dns.filter(|d| d.apply(tun)), state.v6.filter(WindowsV6::disable))
         };
         #[cfg(target_os = "linux")]
-        linux_tunnel_dns(tun);
+        let resolv = if linux_tunnel_dns(tun) { None } else { linux_resolv_conf() };
         Self {
             gateway: gateway.to_string(),
             device: device.to_string(),
@@ -939,6 +1045,8 @@ impl RouteRestore {
             v6,
             #[cfg(windows)]
             tun: tun.to_string(),
+            #[cfg(target_os = "linux")]
+            resolv,
         }
     }
 
@@ -977,6 +1085,10 @@ impl RouteRestore {
         let _ = std::fs::remove_file(state_path());
         #[cfg(target_os = "macos")]
         let _ = std::fs::remove_file(MAC_STATE);
+        #[cfg(target_os = "linux")]
+        if let Some(r) = &self.resolv {
+            restore_resolv(r);
+        }
         #[cfg(target_os = "linux")]
         let _ = std::fs::remove_file(LINUX_STATE);
     }
@@ -1810,6 +1922,37 @@ fn run_route(args: &[&str]) -> io::Result<()> {
 
 #[cfg(test)]
 mod state_tests {
+    /// Put back only over the tunnel's own version, through a link, in one piece.
+    #[cfg(unix)]
+    #[test]
+    fn resolv_conf_is_restored_only_over_the_tunnels_version() {
+        let dir = std::env::temp_dir().join(format!("strait-resolv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (real, link) = (dir.join("real.conf"), dir.join("resolv.conf"));
+        let orig = "nameserver 192.168.1.1\nsearch lan\n";
+        std::fs::write(&real, orig).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_whole(&link, &resolv_for_tunnel(orig)).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link stays a link");
+        assert!(restore_resolv_at(&link, orig));
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), orig);
+        // Rewritten by someone else meanwhile: kept.
+        std::fs::write(&real, "nameserver 10.0.0.1\n").unwrap();
+        assert!(!restore_resolv_at(&link, orig));
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "nameserver 10.0.0.1\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolv_conf_for_the_tunnel_keeps_search_and_options_only() {
+        let orig = "# by NetworkManager\nsearch corp.example\nnameserver 192.168.1.1\noptions edns0 trust-ad\nnameserver fe80::1%eth0\n";
+        let t = resolv_for_tunnel(orig);
+        assert!(t.contains("search corp.example\n") && t.contains("options edns0 trust-ad\n"));
+        assert!(!t.contains("192.168.1.1") && !t.contains("fe80"));
+        assert!(t.ends_with("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"));
+    }
+
     use super::*;
 
     #[test]

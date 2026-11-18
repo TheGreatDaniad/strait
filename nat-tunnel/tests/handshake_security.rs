@@ -10,7 +10,7 @@ use nat_tunnel::tunnel::handshake::{self, ClientHs, Token};
 use tokio::net::UdpSocket;
 
 const KEY: &str = "handshake-security-key";
-const ACCEPT_LEN: usize = 100;
+const ACCEPT_LEN: usize = 104;
 
 async fn host_with(cfg: MuxConfig) -> (MuxHost, SocketAddr) {
     let host_key = cfg.host_key.or(Some(TEST_HOST_KEY));

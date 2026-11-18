@@ -7,7 +7,8 @@
    every session of phase 0) it also learns the host's private key: this checks forward secrecy.
 
    Message 1 (guest -> host): e, es, then AEAD(payload = clock || token)
-   Message 2 (host -> guest): e, ee, then AEAD(payload = slot || verdict)
+   Message 2 (host -> guest): e, ee, then AEAD(payload = slot || verdict); the code also sends cn and
+   the host's clock in this payload
    Session key: from the chaining key after ee.
 
    Abstractions (what the model leaves out or simplifies):
@@ -15,15 +16,17 @@
    - One host with one host key hk; one honest guest identity (one token), any number of sessions.
    - The host key is used here as the Noise static key and to open guests' rendezvous records: the
      host runs X25519 on any key the attacker sends and returns what that record says (an oracle
-     on the same scalar as es). In the code it also derives the per-invite record, DHT and TLS
+     on the same scalar as es). The record key is its own symbol krec, distinct from every Noise
+     key, so in the model the oracle can never return a Noise key: that the two derivations
+     (different HKDF inputs and labels) do not meet is assumed, not proved. In the code it also derives the per-invite record, DHT and TLS
      signing subkeys (key blinding) and the token MAC key; there is no signing oracle on it in the
      model, and those uses are not modelled.
    - The token is an opaque secret: the host does not check its MAC, so the host accepts any token,
      the attacker's own included. The properties below are about the honest guest's token.
-   - The outer datagram (the client nonce cn and its invite-key tag), the timestamp check and the
-     replay memory are not modelled. A replayed message 1 is accepted again here; in the code the
-     host remembers the ephemeral key of every message 1 it read (see HANDSHAKE.md), keyed on the
-     ephemeral key because cn is not authenticated by Noise.
+   - The outer datagram (the client nonce cn and its invite-key tag), the Noise prologue (which
+     carries cn in the code, binding message 1 to it), the timestamp check and the replay memory are
+     not modelled. A replayed message 1 is accepted again here; in the code the host remembers the
+     ephemeral key of every fresh message 1 it read (see HANDSHAKE.md).
    - Key rotation, the data channel's nonces, and the rendezvous and carrier layers. *)
 
 type G.

@@ -189,8 +189,9 @@ pub fn verify_sig(hk: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
 }
 
 /// A JOIN older or newer than this (seconds) is refused: replays are useless after it, and the
-/// host's replay cache only has to cover this span.
-pub const JOIN_MAX_SKEW: u32 = 600;
+/// host's replay cache only has to cover this span. A guest whose clock is further off learns the
+/// host's clock from the (authenticated) refusal and joins again with it, so this can stay short.
+pub const JOIN_MAX_SKEW: u32 = 120;
 
 /// Message 1's payload: the client's clock and the optional token.
 pub fn join_payload(now: u32, token: Option<&[u8; TOKEN_LEN]>) -> Vec<u8> {

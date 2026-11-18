@@ -45,7 +45,8 @@
 //! * Both sides add ephemeral keys: a recording stays unreadable when the
 //!   invite or the host key leaks later, and one peer cannot read another's.
 //! * Replays: message 1 carries the client's clock and is refused outside
-//!   `handshake::JOIN_MAX_SKEW`; inside it the host remembers `cn`s. A join holds
+//!   `handshake::JOIN_MAX_SKEW` (a clock refusal carries the host's clock, and the
+//!   client joins again with it); inside it the host remembers each JOIN. A join holds
 //!   a slot only once a packet under its session key arrives.
 //! * Personal tokens (in message 1, encrypted to the host) name a guest; the
 //!   host can withdraw one, or take personal invites only.
@@ -175,7 +176,7 @@ impl std::fmt::Display for ConnectError {
                 f.write_str("Direct path unavailable - both networks are symmetric.")
             }
             Self::HostFull => f.write_str("Host is full - it has no free client slot."),
-            Self::Clock => f.write_str("The host refused the connection because this device's clock is more than 10 minutes off. Set the date and time automatically and try again."),
+            Self::Clock => f.write_str("The host kept refusing this device's clock. Set the date and time automatically on both devices and try again."),
             Self::Refused => f.write_str("The host did not accept this invite: it was withdrawn, has expired, or the host only takes personal invites."),
             Self::PortInUse(p) => write!(f, "UDP port {p} is already in use by another process."),
             Self::NoRendezvous => f.write_str(
@@ -608,6 +609,8 @@ pub(crate) const NO_HOST_KEY: &str =
 /// A client renews its JOIN (new clock, new nonce) after this long: well inside the host's
 /// restart slack, so a host that starts while the guest waits still finds the JOIN fresh.
 const JOIN_RENEW: Duration = Duration::from_secs(30);
+/// Clock refusals a guest answers by joining again on the host's clock before it gives up.
+const CLOCK_RETRIES: u8 = 3;
 
 /// Forward mode (one guest): the host's side of the join handshake.
 struct FwdHost {
@@ -684,9 +687,9 @@ impl FwdHost {
         let (ts, token) = handshake::parse_join_payload(&payload)?;
         let now = handshake::now_secs();
         // A fresh JOIN is remembered before any verdict: recorded, it costs one key exchange.
-        let fresh = handshake::fresh_since(ts, now, self.started) && !self.seen.below_mark(ts);
-        if fresh {
-            self.seen.remember(epk, ts);
+        let fresh = handshake::fresh_since(ts, now, self.started);
+        if fresh && !self.seen.remember(epk, ts) {
+            return None;
         }
         // Another address, not only another IP: guests behind one carrier-grade NAT share an IP. A
         // restarted guest that comes back on a new port waits out the 30 s like anyone else.
@@ -710,7 +713,7 @@ impl FwdHost {
         let dgram = accept_dgram(&self.base, &cn, &msg2);
         if verdict != VERDICT_OK {
             log::info!("refused a forward-mode join from {from} ({})", match verdict {
-                VERDICT_CLOCK => "stale: clock off by more than 10 minutes, or made before this host started",
+                VERDICT_CLOCK => "stale: its clock is off, or it was made before this host started",
                 VERDICT_FULL => "another guest's session is live",
                 _ => "this invite is not admitted",
             });
@@ -1476,13 +1479,22 @@ impl Tunnel {
             Some(&T_ACCEPT) if !m.joined && d.len() == ACCEPT_LEN => {
                 // Only the holder of the host key the invite names can produce a readable message 2.
                 let done = m.hs.as_mut().and_then(|hs| open_accept(&m.base, hs, &m.cn, d));
-                let Some((slot, verdict, key)) = done else {
+                let Some((slot, verdict, key, host_clock)) = done else {
                     if d[1..17] == m.cn {
                         // The pending handshake stays: a forged answer cannot end the join.
                         log::warn!("a host answered the join but could not prove the host key of this invite; ignored");
                     }
                     return Err(CryptoError::BadTag);
                 };
+                if verdict == VERDICT_CLOCK && m.clock_retries < CLOCK_RETRIES {
+                    // This device's clock is off (or the host just restarted): join again on the
+                    // host's clock, which only the host could have sent.
+                    m.clock_retries += 1;
+                    m.clock_offset = i64::from(host_clock) - i64::from(handshake::now_secs());
+                    log::info!("the host refused this device's clock; joining again with the host's (off by {} s)", m.clock_offset);
+                    m.restart();
+                    return Err(CryptoError::BadTag);
+                }
                 if verdict != VERDICT_OK {
                     m.rejected = Some(verdict);
                     m.restart();
@@ -1491,6 +1503,7 @@ impl Tunnel {
                 self.crypto = AeadSession::from_key(&key, false);
                 m.slot = slot;
                 m.joined = true;
+                m.clock_retries = 0;
                 m.hs = None;
                 m.last_rx = Instant::now();
                 Ok((reliable::encode(&Frame::Hello), true))
@@ -2172,9 +2185,10 @@ const T_ACCEPT: u8 = 0xF9;
 /// JOIN = type | cn (16) | Noise message 1 (payload: clock (4) | optional guest token) | tag (16).
 const JOIN_MIN: usize = 1 + 16 + 4 + handshake::OVERHEAD + 16;
 const JOIN_MAX: usize = JOIN_MIN + handshake::TOKEN_LEN;
-/// ACCEPT = type | cn (16) | Noise message 2 (payload: slot (2) | cn (16) | verdict (1)) | tag (16).
-/// A refusal travels the same way, so only the host can send one.
-const ACCEPT_LEN: usize = 1 + 16 + 19 + handshake::OVERHEAD + 16;
+/// ACCEPT = type | cn (16) | Noise message 2 (payload: slot (2) | cn (16) | verdict (1) | host
+/// clock (4)) | tag (16). A refusal travels the same way, so only the host can send one.
+const ACCEPT_LEN: usize = 1 + 16 + VERDICT_LEN + handshake::OVERHEAD + 16;
+const VERDICT_LEN: usize = 23;
 const VERDICT_OK: u8 = 0;
 const VERDICT_FULL: u8 = 1;
 const VERDICT_REFUSED: u8 = 2;
@@ -2201,25 +2215,28 @@ fn routine_leave(why: &str) -> bool {
 pub const MUX_HOST_IP: Ipv4Addr = Ipv4Addr::new(10, 7, 0, 1);
 /// Prefix length of the tunnel network (10.7.0.0/16).
 pub const MUX_PREFIX: u8 = 16;
-/// How many past `cn`s the host remembers to refuse replayed JOINs. A JOIN older than
-/// `handshake::JOIN_MAX_SKEW` is refused anyway, so the cache only has to span that time.
-/// Fresh JOINs the replay memory holds. Each is kept `REPLAY_KEEP`, the span in which its clock
-/// passes `handshake::fresh_since`; only past this many fresh JOINs within that span would the
-/// oldest be forgotten early.
+/// Fresh JOINs the replay memory holds at most.
 const SEEN_CN_CAP: usize = 1 << 18;
-const REPLAY_KEEP: Duration = Duration::from_secs(2 * (handshake::JOIN_MAX_SKEW as u64 + handshake::RESTART_SLACK as u64) + 60);
+/// How long a fresh JOIN is remembered. Remembered at host time `t`, its clock is at most
+/// `t + JOIN_MAX_SKEW`, so it stops being fresh by `t + 2 * JOIN_MAX_SKEW`; the extra minute covers
+/// drift between the monotonic clock and the wall clock.
+const REPLAY_KEEP: Duration = Duration::from_secs(2 * handshake::JOIN_MAX_SKEW as u64 + 60);
+// Every remembered JOIN first passed the global join budget, so the memory never fills: no fresh
+// JOIN is ever forgotten early, whatever clocks a flood carries (fixed windows: at most one extra
+// window's worth at each end).
+const _: () = assert!(
+    JOIN_LIMIT_ALL as u64 * (REPLAY_KEEP.as_secs() / JOIN_LIMIT_WINDOW.as_secs() + 2) <= SEEN_CN_CAP as u64
+);
 
 /// Ephemeral keys of the fresh JOINs a host has read (see [`join_epk`]): a recorded JOIN is
 /// answered once. A stale JOIN is not remembered (its clock refuses it every time, and keeping it
-/// would let a flood of them push fresh ones out).
-/// If a flood of fresh JOINs ever fills it, the clock of every JOIN pushed out early becomes a
-/// low-water mark: a JOIN made at or before it is refused as stale, so it cannot be replayed.
+/// would let a flood of them push fresh ones out). Entries leave only by age, once both the
+/// monotonic clock and the wall clock say the JOIN is stale (the wall clock may step back).
 #[derive(Default)]
 struct ReplayMemory {
     set: HashSet<[u8; 32]>,
     /// (ephemeral key, when remembered, the JOIN's clock)
     order: VecDeque<([u8; 32], Instant, u32)>,
-    low_water: u32,
 }
 
 impl ReplayMemory {
@@ -2227,27 +2244,26 @@ impl ReplayMemory {
         self.set.contains(epk)
     }
 
-    /// Made at or before a JOIN this memory had to forget early?
-    fn below_mark(&self, ts: u32) -> bool {
-        ts <= self.low_water
-    }
-
-    fn remember(&mut self, epk: [u8; 32], ts: u32) {
-        let now = Instant::now();
+    /// Remember a fresh JOIN. False (the JOIN must be dropped) only if the memory is full, which the
+    /// join budget rules out: a JOIN is never forgotten while it could still be replayed.
+    fn remember(&mut self, epk: [u8; 32], ts: u32) -> bool {
+        let (now, wall) = (Instant::now(), handshake::now_secs());
         while let Some(&(k, t, at)) = self.order.front() {
-            let expired = now.duration_since(t) >= REPLAY_KEEP;
-            if !expired && self.order.len() < SEEN_CN_CAP {
+            if now.duration_since(t) < REPLAY_KEEP || handshake::fresh(at, wall) {
                 break;
-            }
-            if !expired {
-                self.low_water = self.low_water.max(at);
             }
             self.order.pop_front();
             self.set.remove(&k);
         }
-        if self.set.insert(epk) {
-            self.order.push_back((epk, now, ts));
+        if self.set.contains(&epk) {
+            return true;
         }
+        if self.order.len() >= SEEN_CN_CAP {
+            return false;
+        }
+        self.set.insert(epk);
+        self.order.push_back((epk, now, ts));
+        true
     }
 }
 /// Fewest slots one source address may hold (three quarters of the pool, at least this many):
@@ -2463,11 +2479,12 @@ fn accept_dgram(base: &[u8; 32], cn: &[u8; 16], msg2: &[u8]) -> Vec<u8> {
     d
 }
 
-/// Message 2's payload.
+/// Message 2's payload. The host's clock lets a guest whose clock is off join again with it.
 fn verdict_payload(slot: u16, cn: &[u8; 16], verdict: u8) -> Vec<u8> {
     let mut p = slot.to_be_bytes().to_vec();
     p.extend_from_slice(cn);
     p.push(verdict);
+    p.extend_from_slice(&handshake::now_secs().to_be_bytes());
     p
 }
 
@@ -2481,8 +2498,8 @@ fn split_join(base: &[u8; 32], d: &[u8]) -> Option<([u8; 16], Vec<u8>)> {
     ct_eq(&tag(base, b"join", &[&cn, msg1]), &d[d.len() - 16..]).then(|| (cn, msg1.to_vec()))
 }
 
-/// Client side: open an ACCEPT for handshake `hs` / nonce `cn`: (slot, verdict, session key).
-fn open_accept(base: &[u8; 32], hs: &mut handshake::ClientHs, cn: &[u8; 16], d: &[u8]) -> Option<(u16, u8, [u8; 32])> {
+/// Client side: open an ACCEPT for handshake `hs` / nonce `cn`: (slot, verdict, session key, host clock).
+fn open_accept(base: &[u8; 32], hs: &mut handshake::ClientHs, cn: &[u8; 16], d: &[u8]) -> Option<(u16, u8, [u8; 32], u32)> {
     if d.len() != ACCEPT_LEN || d[0] != T_ACCEPT || d[1..17] != cn[..] {
         return None;
     }
@@ -2491,7 +2508,8 @@ fn open_accept(base: &[u8; 32], hs: &mut handshake::ClientHs, cn: &[u8; 16], d: 
         return None;
     }
     let (p, key) = hs.finish(msg2).ok()?;
-    (p.len() == 19 && p[2..18] == cn[..]).then(|| (u16::from_be_bytes([p[0], p[1]]), p[18], key))
+    (p.len() == VERDICT_LEN && p[2..18] == cn[..])
+        .then(|| (u16::from_be_bytes([p[0], p[1]]), p[18], key, u32::from_be_bytes(p[19..23].try_into().unwrap())))
 }
 
 /// The handshake's pre-shared key for an invite key. Test helper.
@@ -2526,7 +2544,7 @@ pub fn hs_join(invite_key: &str, cn: &[u8; 16], auth: JoinAuth) -> (handshake::C
 /// Test helper.
 #[doc(hidden)]
 pub fn hs_finish(invite_key: &str, hs: &mut handshake::ClientHs, cn: &[u8; 16], accept: &[u8]) -> Option<(u16, AeadSession)> {
-    let (slot, verdict, key) = open_accept(&mux_base(invite_key), hs, cn, accept)?;
+    let (slot, verdict, key, _) = open_accept(&mux_base(invite_key), hs, cn, accept)?;
     (verdict == VERDICT_OK).then(|| (slot, AeadSession::from_key(&key, false)))
 }
 
@@ -2605,6 +2623,9 @@ struct MuxClient {
     assigned: Option<(Ipv4Addr, u8, Ipv4Addr)>,
     /// The host's refusal (`REJECT_*`), once it sent one.
     rejected: Option<u8>,
+    /// Seconds to add to this device's clock in a JOIN: learned from a host's clock refusal.
+    clock_offset: i64,
+    clock_retries: u8,
     bye: bool,
     last_rx: Instant,
     last_tx: Instant,
@@ -2626,6 +2647,8 @@ impl MuxClient {
             joined: false,
             assigned: None,
             rejected: None,
+            clock_offset: 0,
+            clock_retries: 0,
             bye: false,
             last_rx: Instant::now(),
             last_tx: Instant::now(),
@@ -2640,7 +2663,8 @@ impl MuxClient {
     fn restart(&mut self) {
         self.cn = rand16();
         self.made = Instant::now();
-        let payload = handshake::join_payload(handshake::now_secs(), self.auth.token.as_ref());
+        let clock = (i64::from(handshake::now_secs()) + self.clock_offset).clamp(0, u32::MAX.into()) as u32;
+        let payload = handshake::join_payload(clock, self.auth.token.as_ref());
         // No host key (refused before this runs) or an invalid one: no JOIN at all.
         let cn = self.cn;
         self.hs = self.auth.host_key.and_then(|hk| handshake::ClientHs::new(&self.base, &hk, &cn, &payload).ok());
@@ -3416,8 +3440,11 @@ impl MuxHost {
         let now = handshake::now_secs();
         // A fresh JOIN is remembered before any verdict: recorded, it costs one key exchange.
         // Keyed on the ephemeral key (`cn` is also bound into message 1, see `handshake`).
-        if handshake::fresh_since(ts, now, self.started) && !self.seen.below_mark(ts) {
-            self.seen.remember(cpub, ts);
+        if handshake::fresh_since(ts, now, self.started) {
+            if !self.seen.remember(cpub, ts) {
+                log::warn!("join from {from} ignored: the replay memory is full");
+                return;
+            }
         } else {
             // A replay, or a client with a wrong clock.
             log::info!("refused {from}: its JOIN is stale (clock off by more than {} s, or made before this host started)", handshake::JOIN_MAX_SKEW);
@@ -4121,16 +4148,87 @@ mod tests {
         assert_eq!(h.peer_count(), 0);
     }
 
-    /// The replay memory forgets by age, so a flood cannot push a fresh JOIN out early.
+    /// The replay memory forgets only by age: when full it drops the newcomer, never an entry that
+    /// could still be replayed (and the join budget keeps it from filling, see `REPLAY_KEEP`).
     #[test]
     fn the_replay_memory_keeps_fresh_joins() {
         let mut m = ReplayMemory::default();
-        for i in 0..1000u32 {
+        let k = |i: u32| {
             let mut k = [0u8; 32];
             k[..4].copy_from_slice(&i.to_be_bytes());
-            m.remember(k, 1000 + i);
+            k
+        };
+        for i in 0..SEEN_CN_CAP as u32 {
+            assert!(m.remember(k(i), 1000));
         }
-        assert!(m.contains(&[0; 32]) && m.set.len() == 1000 && !m.below_mark(1));
+        assert!(!m.remember(k(u32::MAX), 1000), "full: the newcomer is dropped");
+        assert!(m.remember(k(0), 1000), "a known JOIN is still known");
+        assert!(m.contains(&k(0)) && m.set.len() == SEEN_CN_CAP);
+    }
+
+    /// An entry past its keeping time stays while its clock is still fresh by the wall clock (a
+    /// host clock that stepped back must not reopen a replay); a stale one goes.
+    #[test]
+    fn the_replay_memory_keeps_an_entry_while_its_clock_is_fresh() {
+        let mut m = ReplayMemory::default();
+        let old = Instant::now().checked_sub(REPLAY_KEEP + Duration::from_secs(1)).expect("monotonic clock far enough along");
+        let now = handshake::now_secs();
+        m.order.push_back(([1; 32], old, now));
+        m.set.insert([1; 32]);
+        m.remember([2; 32], now);
+        assert!(m.contains(&[1; 32]), "still fresh by the wall clock");
+        m.order[0].2 = now - handshake::JOIN_MAX_SKEW - 1;
+        m.remember([3; 32], now);
+        assert!(!m.contains(&[1; 32]) && m.contains(&[2; 32]));
+    }
+
+    /// JOINs dated at the far edge of the window are remembered like any other and leave nothing
+    /// behind that refuses honest JOINs (0.8.0 could raise a low-water mark from them, but only once
+    /// its memory filled; that it never fills is the const assertion next to `REPLAY_KEEP`).
+    #[tokio::test]
+    async fn a_flood_of_future_joins_does_not_lock_out_honest_ones() {
+        let key = "future-flood-test-key";
+        let guests = GuestPolicy::default();
+        let mut h = MuxHost::bind(key, MuxConfig { bind_port: Some(0), host_key: Some(TEST_HOST_KEY), guests: guests.clone(), ..Default::default() }).await.unwrap();
+        // Refused after being remembered, so the flood holds no slots.
+        guests.require_token.store(true, Ordering::Relaxed);
+        let future = handshake::now_secs() + handshake::JOIN_MAX_SKEW;
+        for i in 0..200u32 {
+            let cn = rand16();
+            let (hs, _) = hs_join_at(key, &cn, JoinAuth::test(), Some(future));
+            let from = SocketAddr::new(Ipv4Addr::from(0x6400_0000 + (i << 8)).into(), 1);
+            h.join_authenticated(cn, &hs.msg1, from, 0).await;
+        }
+        assert_eq!((h.seen.set.len(), h.peer_count()), (200, 0), "fresh, so remembered");
+        guests.require_token.store(false, Ordering::Relaxed);
+        let cn = rand16();
+        let (hs, _) = hs_join(key, &cn, JoinAuth::test());
+        h.join_authenticated(cn, &hs.msg1, "198.51.100.1:9".parse().unwrap(), 0).await;
+        assert!(h.peers.iter().flatten().any(|p| p.cn == cn), "an honest JOIN after the flood is taken");
+        // A JOIN from beyond the window is refused (and not remembered).
+        let (hs, _) = hs_join_at(key, &rand16(), JoinAuth::test(), Some(future + 2));
+        let before = h.seen.set.len();
+        h.join_authenticated(rand16(), &hs.msg1, "198.51.100.2:9".parse().unwrap(), 0).await;
+        assert_eq!(h.seen.set.len(), before);
+    }
+
+    /// A guest whose clock is far off joins anyway: the host's refusal carries its clock, and the
+    /// guest's next JOIN uses it.
+    #[test]
+    fn a_guest_with_a_wrong_clock_joins_on_the_hosts_clock() {
+        let key = "clock-fix-test-key";
+        let mut f = FwdHost::new(key, Some(TEST_HOST_KEY), GuestPolicy::default());
+        let mut m = MuxClient::new(key, JoinAuth::test(), true);
+        m.clock_offset = -3600; // an hour slow
+        m.restart();
+        let from: SocketAddr = "198.51.100.1:9".parse().unwrap();
+        let (reply, key2) = f.join(&m.join, from).unwrap();
+        assert!(key2.is_none(), "refused");
+        let (_, verdict, _, host_clock) = open_accept(&m.base, m.hs.as_mut().unwrap(), &m.cn, &reply).unwrap();
+        assert_eq!(verdict, VERDICT_CLOCK);
+        m.clock_offset = i64::from(host_clock) - i64::from(handshake::now_secs());
+        m.restart();
+        assert!(f.join(&m.join, from).unwrap().1.is_some(), "joined on the host's clock");
     }
 
     #[test]

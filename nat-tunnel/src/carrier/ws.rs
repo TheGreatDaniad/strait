@@ -302,7 +302,6 @@ pub struct Identity {
     pub path: String,
     pub token: String,
     seed: [u8; 32],
-    serial: [u8; 16],
     /// Host: the host key and the invite key, from which each day's TLS subkey is made; replaces
     /// the derived seed when set.
     host: Option<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)>,
@@ -318,13 +317,11 @@ impl Identity {
     pub fn derive(key: &[u8]) -> Identity {
         let hk = Hkdf::<Sha256>::new(None, key);
         let out = |label: &str, buf: &mut [u8]| hk.expand(format!("strait-ws-v1:{label}").as_bytes(), buf).expect("hkdf length");
-        let (mut p, mut t, mut seed, mut serial) = ([0u8; 8], [0u8; 24], [0u8; 32], [0u8; 16]);
+        let (mut p, mut t, mut seed) = ([0u8; 8], [0u8; 24], [0u8; 32]);
         out("path", &mut p);
         out("token", &mut t);
         out("tls-seed", &mut seed);
-        out("tls-serial", &mut serial);
-        serial[0] &= 0x7f; // positive DER INTEGER
-        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial, host: None }
+        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, host: None }
     }
 
     /// The deterministic self-signed certificate (DER) and its signing key (PKCS#8 DER) for the
@@ -341,7 +338,11 @@ impl Identity {
     fn self_signed(&self, kp: &rcgen::KeyPair) -> Result<Vec<u8>, CarrierError> {
         let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).map_err(cert_err)?;
         p.distinguished_name.push(rcgen::DnType::CommonName, "localhost");
-        p.serial_number = Some(rcgen::SerialNumber::from_slice(&self.serial));
+        // From the certificate's own key, so it changes with each day's TLS subkey and links no more
+        // than the key does.
+        let mut serial: [u8; 16] = Sha256::digest([b"strait-ws-v1:tls-serial".as_slice(), kp.public_key_raw()].concat())[..16].try_into().unwrap();
+        serial[0] &= 0x7f; // positive DER INTEGER
+        p.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
         p.not_before = rcgen::date_time_ymd(2024, 1, 1);
         p.not_after = rcgen::date_time_ymd(2124, 1, 1);
         Ok(p.self_signed(kp).map_err(cert_err)?.der().to_vec())
@@ -1250,11 +1251,10 @@ mod pending_tests {
     }
 
     #[test]
-    fn serial_is_not_seed_material_and_deterministic() {
+    fn certificate_is_deterministic_and_holds_no_seed_material() {
         let (a, b) = (Identity::derive(b"k"), Identity::derive(b"k"));
-        assert_eq!(a.serial, b.serial);
-        assert_ne!(a.serial, a.seed[..16]);
         assert_eq!(a.pin_hex(), b.pin_hex());
+        assert!(!a.cert().unwrap().0.windows(16).any(|w| w == &a.seed[..16]));
     }
 
     /// The host's certificate carries its TLS subkey for this invite and day, never the host key,
@@ -1270,10 +1270,26 @@ mod pending_tests {
         };
         let key = |invite: &[u8], day: u32| subkey_public(&hk, &tls_context(invite, day), SUBKEY_TLS).unwrap();
         let has = |c: &[u8], k: &[u8; 32]| c.windows(32).any(|w| w == k);
+        let serial = |c: &[u8]| x509_serial(c);
         let (a, b, a2) = (der(b"invite-a", 20_000), der(b"invite-b", 20_000), der(b"invite-a", 20_001));
         assert!(has(&a, &key(b"invite-a", 20_000)) && has(&b, &key(b"invite-b", 20_000)) && has(&a2, &key(b"invite-a", 20_001)));
         assert!(key(b"invite-a", 20_000) != key(b"invite-b", 20_000) && key(b"invite-a", 20_000) != key(b"invite-a", 20_001));
         assert!(!has(&a, &hk) && !has(&b, &hk) && !has(&a2, &hk));
+        // Nothing else in the certificate is fixed per host either: the serial changes with the day.
+        assert!(serial(&a) != serial(&a2) && serial(&a) != serial(&b));
+        assert_eq!(serial(&a), serial(&der(b"invite-a", 20_000)), "one day, one certificate");
+    }
+
+    /// The serial number of a DER certificate (tbsCertificate's INTEGER after the [0] version).
+    fn x509_serial(der: &[u8]) -> Vec<u8> {
+        // Skip SEQUENCE (cert) and SEQUENCE (tbs) headers, then the [0] version element.
+        let skip_hdr = |d: &[u8]| -> usize { if d[1] & 0x80 == 0 { 2 } else { 2 + (d[1] & 0x7f) as usize } };
+        let mut i = skip_hdr(der);
+        i += skip_hdr(&der[i..]);
+        assert_eq!(der[i], 0xa0, "version");
+        i += 2 + der[i + 1] as usize;
+        assert_eq!(der[i], 0x02, "serial INTEGER");
+        der[i + 2..i + 2 + der[i + 1] as usize].to_vec()
     }
 }
 

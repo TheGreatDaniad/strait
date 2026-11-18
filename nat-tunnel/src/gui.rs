@@ -2040,6 +2040,8 @@ struct GuestRow {
     removed: bool,
 }
 
+/// What a removed person can still do until the invite key changes.
+const REMOVED_NOTE: &str = "Someone you removed can't connect, but still holds this host's invite key: until you change every invite, they could keep new people from joining by flooding this host with join attempts.";
 const CHANGE_ALL_INTRO: &str = "Changing every invite disconnects everyone and makes a new shared invite. Old invites, personal ones too, stop working, so a removed person cannot even see where you are. Copy a new personal invite for each person who should stay.";
 
 const PEOPLE_INTRO: &str = "The invite above works for anyone who has it. A personal invite is for one person: you see when they are connected, and you can remove just them.";
@@ -3127,6 +3129,10 @@ impl GuiApp {
         let mut only = self.settings.personal_only || locked;
         let hint = if locked { "Stays on until you change every invite: someone you removed still has the shared invite" } else { "The invite above stops letting new people in" };
         toggle_row(ui, "Personal invites only", hint, &mut only, !locked);
+        if locked {
+            ui.add_space(4.0);
+            ui.label(RichText::new(REMOVED_NOTE).font(ui_font(12.0)).color(TEXT_MUTED));
+        }
         if only != self.settings.personal_only {
             self.settings.personal_only = only;
             self.guest_policy.require_token.store(only, std::sync::atomic::Ordering::Relaxed);

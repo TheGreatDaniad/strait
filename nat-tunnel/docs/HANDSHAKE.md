@@ -68,16 +68,20 @@ What this gives:
   invite is not enough to pose as the host, or to make a guest give up.
 - Both sides contribute a fresh key, so a recording stays unreadable if the invite or the host key
   leaks later, and no peer can read another peer's traffic.
-- Message 1 carries the guest's clock: the host refuses a JOIN more than 10 minutes off, or made
+- Message 1 carries the guest's clock: the host refuses a JOIN more than 2 minutes off, or made
   before the host started (with 60 s of slack): its memory starts empty, so a recording from before
-  a restart is stale too. A waiting guest renews its JOIN every 30 s, so a host that starts or
-  restarts while it waits still finds it fresh.
+  a restart is stale too. The refusal (message 2, so only the host can send it) carries the host's
+  clock, and the guest joins again on that clock (up to three times), so a wrong clock on either
+  side costs one round trip, not the connection. A waiting guest renews its JOIN every 30 s, so a
+  host that starts or restarts while it waits still finds it fresh.
 - The host remembers the ephemeral key of every fresh message 1 it opened, before deciding
-  anything, for 22 minutes (longer than a JOIN stays fresh): a recorded JOIN costs it one key
+  anything, for 5 minutes (longer than a JOIN stays fresh): a recorded JOIN costs it one key
   exchange. A stale JOIN is refused every time and not remembered, so a flood of them cannot push
-  fresh ones out. The memory holds 262,144 JOINs; if a flood of fresh ones ever filled it, the clock
-  of every JOIN forgotten early becomes a low-water mark, and a JOIN made at or before it is refused
-  as stale. A JOIN deferred while every free slot is busy stays remembered; only its own retry
+  fresh ones out. The memory holds 262,144 JOINs, more than the global join budget (5000 per 10 s)
+  lets in over 5 minutes, so it never fills and no JOIN is forgotten early, whatever clocks a flood
+  carries; were it ever full, a new JOIN would be dropped, never an old one forgotten. An entry
+  leaves only once the wall clock also calls its JOIN stale, so a host clock that steps back does
+  not reopen a replay. A JOIN deferred while every free slot is busy stays remembered; only its own retry
   (same `cn`, same address) is read again. A retry of a refused JOIN gets the same refusal from
   memory, and a repeated accepted JOIN gets its answer again at most once a second, only at its own
   address. A guest that the host refused stops, rather than retrying.
@@ -197,13 +201,19 @@ them from standard input.
 One rule set for the userspace exit and the kernel TUN path: the public internet over IPv4 only.
 Never the host itself (its interface addresses and its public address, which is its router's
 WAN side), the networks it sits on (every on-link IPv4 subnet of /16 or narrower, public ones
-too: an office or university LAN), the tunnel network (other guests), private, loopback, link-local or multicast ranges,
+too: an office or university LAN), networks it reaches through another interface than its default
+route (a VPN or tailnet it is connected to), the tunnel network (other guests), private, loopback, link-local or multicast ranges,
 IPv6 destinations, or TCP port 25, nor cloud metadata and platform addresses (169.254.0.0/16,
 168.63.129.16, 100.100.100.200) or 192.0.0.0/24 and 198.18.0.0/15. `--allow-lan` opens the private
 ranges, 192.0.0.0/24 and 198.18.0.0/15, never the cloud addresses; `STRAIT_EXIT_ALLOW_SMTP=1` opens port 25;
 `STRAIT_EXIT_ALLOW_HOST=1` (labs) lets guests reach services on the host's tunnel address. Each
-guest may keep 64 TCP flows open through the userspace exit. Prefixes the host routes into
-another VPN, and services that trust the host's address, are not told apart from the internet.
+guest may keep 64 TCP flows open through the userspace exit. "Another interface" means a source
+address the host does not use toward the internet (judged by the sources toward eight unrouted
+test addresses, so multi-WAN hosts keep all their uplinks). A VPN that carries all of the host's
+traffic, networks reached through another router on the host's own LAN, and services that trust
+the host's address are not told apart from the internet; the other way round, when the host's VPN
+carries everything but sends a few ranges around it (split exclusions), guests are refused those
+ranges.
 
 A guest, in turn, only takes packets from the host that are addressed to its own tunnel address
 and answer something it sent: a TCP segment that opens a connection (SYN without ACK) is dropped,
@@ -246,8 +256,11 @@ go away with the tunnel device.
 
 A full tunnel sends DNS to 1.1.1.1 and 8.8.8.8 through the tunnel: macOS and Windows set those
 resolvers, Linux sets them on the tunnel link for every name through systemd-resolved (without
-it, Linux leaves DNS unchanged and says so; a resolver on the local network is then reached
-outside the tunnel). Android routes all public addresses through the VPN and leaves only the app
+it, Linux points /etc/resolv.conf at them, keeping its search and options lines, and puts the
+original back afterwards; the original is saved first in a root-only folder that survives a reboot,
+so after a crash or a power loss the next session, or `nat-tunnel recover`, puts it back; if a DHCP
+client rewrites the file meanwhile, its version is kept). With systemd-resolved, names under a routing domain of the physical link (such as
+a company's internal domain) still go to that link's resolver. Android routes all public addresses through the VPN and leaves only the app
 itself (the tunnel's own packets) out.
 
 The Xray carrier forwards visitors without the key to its REALITY target: an explicit

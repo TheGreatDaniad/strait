@@ -139,7 +139,8 @@ pub fn is_own_address(ip: IpAddr) -> bool {
 /// The host's public addresses as seen from outside (STUN): its router's WAN side.
 static PUBLIC: std::sync::Mutex<Vec<IpAddr>> = std::sync::Mutex::new(Vec::new());
 /// `is_own_address` answers, kept briefly (the kernel path asks per packet).
-static OWN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<IpAddr, (bool, std::time::Instant)>>> = std::sync::Mutex::new(None);
+/// (own address, reached through another interface, when asked).
+static OWN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<IpAddr, (bool, bool, std::time::Instant)>>> = std::sync::Mutex::new(None);
 
 /// Remember a public address of this host (its router's WAN address, from STUN).
 pub fn note_public_addr(ip: IpAddr) {
@@ -223,7 +224,52 @@ fn on_link(ip: Ipv4Addr) -> bool {
     g.as_ref().is_some_and(|(nets, _)| nets.iter().any(|&(net, len)| x & (u32::MAX << (32 - len)) == net))
 }
 
-/// This machine, its router's public side, or (unless `--allow-lan`) a network it sits on?
+/// The source address this machine would use toward `dst` (no packet is sent).
+fn source_toward(dst: Ipv4Addr) -> Option<IpAddr> {
+    let s = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    s.connect((dst, 9)).ok()?;
+    Some(s.local_addr().ok()?.ip())
+}
+
+/// Addresses no host routes on purpose (documentation and benchmark ranges, spread so that
+/// per-destination multipath picks every default route): their sources are "the internet's".
+const INTERNET_PROBES: [Ipv4Addr; 8] = [
+    Ipv4Addr::new(192, 0, 2, 1),
+    Ipv4Addr::new(192, 0, 2, 77),
+    Ipv4Addr::new(198, 51, 100, 1),
+    Ipv4Addr::new(198, 51, 100, 133),
+    Ipv4Addr::new(203, 0, 113, 1),
+    Ipv4Addr::new(203, 0, 113, 201),
+    Ipv4Addr::new(198, 18, 0, 1),
+    Ipv4Addr::new(198, 19, 255, 1),
+];
+
+/// The source addresses this machine uses toward the internet, refreshed every 30 s.
+static INTERNET_SOURCES: std::sync::Mutex<Option<(Vec<IpAddr>, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+fn internet_sources() -> Vec<IpAddr> {
+    if let Some((v, at)) = INTERNET_SOURCES.lock().unwrap().as_ref() {
+        if at.elapsed() < Duration::from_secs(30) {
+            return v.clone();
+        }
+    }
+    let mut v: Vec<IpAddr> = INTERNET_PROBES.iter().filter_map(|&p| source_toward(p)).collect();
+    v.sort();
+    v.dedup();
+    *INTERNET_SOURCES.lock().unwrap() = Some((v.clone(), std::time::Instant::now()));
+    v
+}
+
+/// Does this machine reach `dst` through another interface than its default routes (a VPN, a
+/// tailnet, a second network)? Those are networks the host belongs to, not the internet. When a
+/// lookup fails nothing is concluded.
+fn routed_elsewhere(dst: Ipv4Addr) -> bool {
+    let internet = internet_sources();
+    !internet.is_empty() && source_toward(dst).is_some_and(|s| !internet.contains(&s))
+}
+
+/// This machine, its router's public side, or (unless `--allow-lan`) a network it sits on or
+/// reaches through another interface?
 fn is_self(ip: IpAddr) -> bool {
     if ip.is_loopback() {
         return false; // its own opt-in decides
@@ -231,24 +277,31 @@ fn is_self(ip: IpAddr) -> bool {
     if PUBLIC.lock().unwrap().contains(&ip) {
         return true;
     }
+    let lan_closed = policy_bits() & POLICY_LAN == 0;
     if let IpAddr::V4(a) = ip {
-        if policy_bits() & POLICY_LAN == 0 && on_link(a) {
+        if lan_closed && on_link(a) {
             return true;
         }
     }
-    let mut c = OWN_CACHE.lock().unwrap();
-    let c = c.get_or_insert_with(Default::default);
-    if let Some((own, at)) = c.get(&ip) {
-        if at.elapsed() < Duration::from_secs(30) {
-            return *own;
+    let fresh = |at: &std::time::Instant| at.elapsed() < Duration::from_secs(30);
+    if let Some(&(own, elsewhere, at)) = OWN_CACHE.lock().unwrap().get_or_insert_with(Default::default).get(&ip) {
+        if fresh(&at) {
+            return own || (lan_closed && elsewhere);
         }
     }
-    if c.len() >= 4096 {
-        c.clear();
-    }
+    // The lookups (a few socket calls) run outside the lock.
     let own = is_own_address(ip);
-    c.insert(ip, (own, std::time::Instant::now()));
-    own
+    let elsewhere = matches!(ip, IpAddr::V4(a) if routed_elsewhere(a));
+    let mut c = OWN_CACHE.lock().unwrap();
+    let c = c.get_or_insert_with(Default::default);
+    if c.len() >= 4096 {
+        c.retain(|_, (_, _, at)| fresh(at));
+        if c.len() >= 4096 {
+            c.clear();
+        }
+    }
+    c.insert(ip, (own, elsewhere, std::time::Instant::now()));
+    own || (lan_closed && elsewhere)
 }
 
 /// May a guest's flow of kind `what` (`tcp` / `udp` / `icmp`) go to `remote`? The address policy,
@@ -276,11 +329,12 @@ pub fn packet_allowed(p: &[u8]) -> bool {
         return what == "icmp" || env_on(&["STRAIT_EXIT_ALLOW_HOST"]);
     }
     let remote = SocketAddr::new(dst.into(), port);
-    flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"]))
+    exit_dest_allowed(remote.ip()) && flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"]))
 }
 
 fn check_dest(remote: SocketAddr, what: &str) -> io::Result<()> {
-    if flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"])) {
+    // The address policy first: `is_self` costs socket calls, only for addresses that pass it.
+    if exit_dest_allowed(remote.ip()) && flow_allowed(remote, what, is_self(remote.ip()), env_on(&["STRAIT_EXIT_ALLOW_SMTP"])) {
         Ok(())
     } else {
         note_refused(remote.ip(), what);
@@ -752,6 +806,10 @@ mod policy_tests {
         ];
         assert_eq!(on_link_prefixes(&nets), vec![(u32::from(Ipv4Addr::new(198, 51, 100, 0)), 24)]);
         assert!(!interface_nets().is_empty(), "this machine has at least one IPv4 address");
+        // The internet goes the default way; loopback does not (another interface).
+        if !internet_sources().is_empty() {
+            assert!(!routed_elsewhere(Ipv4Addr::new(93, 184, 216, 34)) && routed_elsewhere(Ipv4Addr::LOCALHOST));
+        }
         assert!(!flow_allowed("10.7.0.5:80".parse().unwrap(), "tcp", false, false), "the tunnel network");
     }
 
