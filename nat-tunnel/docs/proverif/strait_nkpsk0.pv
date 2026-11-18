@@ -13,9 +13,11 @@
    Abstractions (what the model leaves out or simplifies):
    - The AEAD's associated data is the sender's ephemeral key, not Noise's transcript hash h.
    - One host with one host key hk; one honest guest identity (one token), any number of sessions.
-   - The host key is only used here as the Noise static key. In the code it also derives the
-     per-invite record and TLS signing subkeys (key blinding) and the token MAC key; there is no
-     signing oracle on it in the model, and those uses are not modelled.
+   - The host key is used here as the Noise static key and to open guests' rendezvous records: the
+     host runs X25519 on any key the attacker sends and returns what that record says (an oracle
+     on the same scalar as es). In the code it also derives the per-invite record, DHT and TLS
+     signing subkeys (key blinding) and the token MAC key; there is no signing oracle on it in the
+     model, and those uses are not modelled.
    - The token is an opaque secret: the host does not check its MAC, so the host accepts any token,
      the attacker's own included. The properties below are about the honest guest's token.
    - The outer datagram (the client nonce cn and its invite-key tag), the timestamp check and the
@@ -36,6 +38,7 @@ fun mixe(bitstring, G): bitstring.          (* psk handshakes MixKey(e) as well 
 fun mixdh(bitstring, G): bitstring.
 fun kenc(bitstring): bitstring.             (* the current cipher key *)
 fun ksession(bitstring): bitstring.         (* Split(): the transport key *)
+fun krec(G, G): bitstring.                  (* guest-record key: HKDF(X25519(e, host), e) *)
 
 fun enc(bitstring, G, bitstring): bitstring.
 reduc forall k: bitstring, ad: G, m: bitstring; dec(k, ad, enc(k, ad, m)) = m.
@@ -105,8 +108,16 @@ let Host(sh: bitstring) =
        guest of the attacker's the host sends the attacker's own data, which is no secret). *)
     if t = token then out(c, enc(k, EH, h2g)).
 
+(* The host opens any guest record (the attacker's included) and acts on what it says: an X25519
+   oracle on the host key. Whether a guest's address stays secret is not a query: a network
+   attacker sees where the host then sends, which this model cannot tell apart from a leak. *)
+let HostRecords(sh: bitstring) =
+    in(c, (ER: G, ct: bitstring));
+    let pt = dec(krec(exp(ER, sh), ER), ER, ct) in
+    out(c, pt).
+
 process
     new sh: bitstring;
     let hk = exp(g, sh) in
     out(c, hk);
-    ( (!Guest(hk)) | (!Host(sh)) | (phase 1; out(c, sh)) )
+    ( (!Guest(hk)) | (!Host(sh)) | (!HostRecords(sh)) | (phase 1; out(c, sh)) )

@@ -5,9 +5,10 @@
 //!   key is the same key in X25519 form (`to_scalar_bytes` / `to_montgomery`). The client encrypts
 //!   to that key, so only its holder can complete the handshake: knowing the invite is not enough
 //!   to pose as the host. An invite without `hk` is refused.
-//! * One key, one use each: the host key itself signs nothing. Rendezvous records and the
-//!   WebSocket transport's TLS handshake are signed with per-invite subkeys ([`Subkey`]), and
-//!   personal-invite tokens use an HMAC key derived from it ([`token_key`]).
+//! * The host key itself signs nothing: its only direct use is X25519 key exchange (the Noise
+//!   static key, and opening guests' rendezvous records, [`dh_as_host`]). Rendezvous records, DHT
+//!   items and the WebSocket transport's TLS handshake are signed with per-invite subkeys
+//!   ([`Subkey`]), and personal-invite tokens use an HMAC key derived from it ([`token_key`]).
 //! * Both sides add a fresh ephemeral key, so a recorded session stays unreadable when the
 //!   invite or the host key leaks later.
 //!
@@ -20,7 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 const PATTERN: &str = "Noise_NKpsk0_25519_ChaChaPoly_SHA256";
-const PROLOGUE: &[u8] = b"strait-join-v3";
+/// Followed by the JOIN's nonce `cn`: message 1 is bound to the `cn` it travels with, so it cannot
+/// be re-wrapped under another (`cn` is outside Noise otherwise, and every invite holder can make the
+/// outer tag).
+const PROLOGUE: &[u8] = b"strait-join-v4";
 /// Ephemeral key + AEAD tag: what Noise adds to each message's payload.
 pub const OVERHEAD: usize = 48;
 pub const TOKEN_LEN: usize = 24;
@@ -46,9 +50,13 @@ fn hmac(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn builder<'a>(psk: &'a [u8; 32]) -> Result<snow::Builder<'a>, Failed> {
+fn prologue(cn: &[u8]) -> Vec<u8> {
+    [PROLOGUE, cn].concat()
+}
+
+fn builder<'a>(psk: &'a [u8; 32], prologue: &'a [u8]) -> Result<snow::Builder<'a>, Failed> {
     let p: snow::params::NoiseParams = PATTERN.parse().map_err(|_| Failed)?;
-    snow::Builder::new(p).psk(0, psk).and_then(|b| b.prologue(PROLOGUE)).map_err(|_| Failed)
+    snow::Builder::new(p).psk(0, psk).and_then(|b| b.prologue(prologue)).map_err(|_| Failed)
 }
 
 /// One session key from Noise's two directional keys (the tunnel separates directions by nonce).
@@ -218,6 +226,7 @@ pub fn fresh_since(ts: u32, now: u32, started: u32) -> bool {
 /// Client side, between message 1 and message 2.
 pub struct ClientHs {
     psk: [u8; 32],
+    prologue: Vec<u8>,
     rs: [u8; 32],
     /// The ephemeral private key: the state is rebuilt from it for each answer, so a forged
     /// message 2 (which spends a Noise state) cannot end a join.
@@ -228,11 +237,11 @@ pub struct ClientHs {
 }
 
 impl ClientHs {
-    /// `hk` is the invite's host key (Ed25519 public).
-    pub fn new(psk: &[u8; 32], hk: &[u8; 32], payload: &[u8]) -> Result<Self, Failed> {
+    /// `hk` is the invite's host key (Ed25519 public); `cn` the JOIN's nonce.
+    pub fn new(psk: &[u8; 32], hk: &[u8; 32], cn: &[u8], payload: &[u8]) -> Result<Self, Failed> {
         let rs = noise_public(hk)?;
         let e = zeroize::Zeroizing::new(x25519_dalek::StaticSecret::random().to_bytes());
-        let mut hs = Self { psk: *psk, rs, e, payload: payload.to_vec(), msg1: Vec::new() };
+        let mut hs = Self { psk: *psk, prologue: prologue(cn), rs, e, payload: payload.to_vec(), msg1: Vec::new() };
         let (_, msg1) = hs.state()?;
         hs.msg1 = msg1;
         Ok(hs)
@@ -240,7 +249,7 @@ impl ClientHs {
 
     /// A fresh initiator state that has written message 1 (the same bytes every time).
     fn state(&self) -> Result<(snow::HandshakeState, Vec<u8>), Failed> {
-        let mut state = builder(&self.psk)?
+        let mut state = builder(&self.psk, &self.prologue)?
             .remote_public_key(&self.rs)
             // Despite its name this is safe here: `e` is a fresh random key for this handshake only
             // (made in `new`, never reused), and setting it lets message 1 be rebuilt byte for byte
@@ -270,10 +279,12 @@ pub struct HostHs {
 }
 
 impl HostHs {
-    /// Read message 1; returns its payload (the guest's clock, then its token if it has one).
-    pub fn read(psk: &[u8; 32], host_key: &[u8; 32], msg1: &[u8]) -> Result<(Self, Vec<u8>), Failed> {
+    /// Read message 1 that came with nonce `cn`; returns its payload (the guest's clock, then its
+    /// token if it has one).
+    pub fn read(psk: &[u8; 32], host_key: &[u8; 32], cn: &[u8], msg1: &[u8]) -> Result<(Self, Vec<u8>), Failed> {
         let sk = noise_private(host_key);
-        let mut state = builder(psk)?.local_private_key(&sk[..]).and_then(|b| b.build_responder()).map_err(|_| Failed)?;
+        let pro = prologue(cn);
+        let mut state = builder(psk, &pro)?.local_private_key(&sk[..]).and_then(|b| b.build_responder()).map_err(|_| Failed)?;
         let mut payload = vec![0u8; msg1.len()];
         let n = state.read_message(msg1, &mut payload).map_err(|_| Failed)?;
         payload.truncate(n);
@@ -361,15 +372,17 @@ mod tests {
     use super::*;
 
     const PSK: [u8; 32] = [7; 32];
+    const CN: &[u8] = &[5; 16];
 
     /// A forged message 2 does not spend the guest's handshake: the real answer still completes it.
     #[test]
     fn a_forged_answer_does_not_end_the_join() {
         let host = new_host_key();
-        let mut c = ClientHs::new(&PSK, &public_of(&host), b"p").unwrap();
+        let mut c = ClientHs::new(&PSK, &public_of(&host), CN, b"p").unwrap();
         let first = c.msg1.clone();
         assert!(c.finish(&[0u8; 48]).is_err());
-        let (hs, p) = HostHs::read(&PSK, &host, &c.msg1).unwrap();
+        assert!(HostHs::read(&PSK, &host, &[6; 16], &c.msg1).is_err(), "message 1 is bound to its cn");
+        let (hs, p) = HostHs::read(&PSK, &host, CN, &c.msg1).unwrap();
         assert_eq!((p.as_slice(), c.msg1 == first), (&b"p"[..], true));
         let (m2, k) = hs.write(b"ok").unwrap();
         let (pl, k2) = c.finish(&m2).unwrap();
@@ -379,9 +392,9 @@ mod tests {
     #[test]
     fn both_sides_agree_and_payloads_arrive() {
         let host = new_host_key();
-        let mut c = ClientHs::new(&PSK, &public_of(&host), b"token").unwrap();
+        let mut c = ClientHs::new(&PSK, &public_of(&host), CN, b"token").unwrap();
         assert_eq!(c.msg1.len(), 5 + OVERHEAD);
-        let (h, p1) = HostHs::read(&PSK, &host, &c.msg1).unwrap();
+        let (h, p1) = HostHs::read(&PSK, &host, CN, &c.msg1).unwrap();
         assert_eq!(p1, b"token");
         let (msg2, hk) = h.write(b"slot").unwrap();
         let (p2, ck) = c.finish(&msg2).unwrap();
@@ -392,12 +405,12 @@ mod tests {
     #[test]
     fn a_host_without_the_static_key_is_refused() {
         let (real, fake) = (new_host_key(), new_host_key());
-        let mut c = ClientHs::new(&PSK, &public_of(&real), b"").unwrap();
+        let mut c = ClientHs::new(&PSK, &public_of(&real), CN, b"").unwrap();
         // The impostor cannot even read message 1...
-        assert!(HostHs::read(&PSK, &fake, &c.msg1).is_err());
+        assert!(HostHs::read(&PSK, &fake, CN, &c.msg1).is_err());
         // ...and a message 2 from a handshake of its own does not finish the client's.
-        let mut other = ClientHs::new(&PSK, &public_of(&fake), b"").unwrap();
-        let (h, _) = HostHs::read(&PSK, &fake, &other.msg1).unwrap();
+        let mut other = ClientHs::new(&PSK, &public_of(&fake), CN, b"").unwrap();
+        let (h, _) = HostHs::read(&PSK, &fake, CN, &other.msg1).unwrap();
         let (msg2, _) = h.write(b"").unwrap();
         assert!(c.finish(&msg2).is_err());
         assert!(other.finish(&msg2).is_ok());
@@ -406,15 +419,15 @@ mod tests {
     #[test]
     fn wrong_invite_key_and_tampering_fail() {
         let host = new_host_key();
-        let c = ClientHs::new(&PSK, &public_of(&host), b"x").unwrap();
-        assert!(HostHs::read(&[8; 32], &host, &c.msg1).is_err());
+        let c = ClientHs::new(&PSK, &public_of(&host), CN, b"x").unwrap();
+        assert!(HostHs::read(&[8; 32], &host, CN, &c.msg1).is_err());
         let mut bad = c.msg1.clone();
         bad[40] ^= 1;
-        assert!(HostHs::read(&PSK, &host, &bad).is_err());
+        assert!(HostHs::read(&PSK, &host, CN, &bad).is_err());
         // A low-order ephemeral key (all zero) is refused.
         let mut zero = c.msg1.clone();
         zero[..32].fill(0);
-        assert!(HostHs::read(&PSK, &host, &zero).is_err());
+        assert!(HostHs::read(&PSK, &host, CN, &zero).is_err());
     }
 
     /// The Noise key really is the X25519 form of the Ed25519 key in the invite.
@@ -448,7 +461,7 @@ mod tests {
         // The identity point (y = 1) is a valid encoding of a weak key: refused.
         let mut ident = [0u8; 32];
         ident[0] = 1;
-        assert!(!valid_public(&ident) && ClientHs::new(&PSK, &ident, b"").is_err(), "a low-order hk is refused");
+        assert!(!valid_public(&ident) && ClientHs::new(&PSK, &ident, CN, b"").is_err(), "a low-order hk is refused");
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub struct XrayParams {
     /// Client: the host's address and port.
     pub server_addr: String,
     pub server_port: u16,
-    /// Host: REALITY target (self-steal `127.0.0.1:8443` by default); never an `https://` URL.
+    /// Host: REALITY target (the placeholder below is always replaced by `choose_target`); never an `https://` URL.
     pub target: String,
     /// REALITY server name (the real site's domain).
     pub server_name: String,

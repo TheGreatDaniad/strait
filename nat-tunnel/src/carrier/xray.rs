@@ -9,7 +9,7 @@
 //! otherwise a warning and the original path is run. Not covered: Windows (no ownership check),
 //! macOS code signing of the copy. Config files live in the same run dir (0600), removed on drop.
 //!
-//! Host: the REALITY target (`xray_target`, from `target=` or `NAT_TUNNEL_XRAY_TARGET`) must answer on TCP at start; unset, the host tries 127.0.0.1:8443 then `<sni>:443`, else it refuses to start.
+//! Host: the REALITY target (`xray_target`, from `target=` or `NAT_TUNNEL_XRAY_TARGET`) must answer on TCP at start; unset, the host tries `<sni>:443` (never a local address on its own), else it refuses to start.
 //! Spec params: `xray_bin` (required, absolute), `invite_key` (required, 32 hex), `xray_sni`
 //! (required), `xray_sha256`, `xray_run_dir`, `xray_mode`, `xray_fp`, `xray_target`, `xray_xudp`,
 //! `xray_demux` (`header` default | `none`), `xray_log`, and timing knobs `xray_warmup_ms`, `xray_xhttp` (JSON merged into xhttpSettings), `xray_start_timeout_ms`,
@@ -368,7 +368,9 @@ async fn target_reachable(target: &str) -> bool {
 
 /// REALITY forwards every visitor without the key to `target`; if that is dead, probes see a closed
 /// door and clients just time out. So the host picks a target that answers, or refuses to start:
-/// the explicit `xray_target`, else a local self-steal site on 127.0.0.1:8443, else `<sni>:443`.
+/// the explicit `xray_target`, else `<sni>:443`. Never a local address on its own: whatever listens
+/// there (a router controller, a development server) would be spliced to every visitor on the
+/// internet. A local self-steal site must be named explicitly.
 async fn choose_target(explicit: Option<&str>, sni: &str) -> Result<String, CarrierError> {
     if let Some(t) = explicit {
         return if target_reachable(t).await {
@@ -378,13 +380,11 @@ async fn choose_target(explicit: Option<&str>, sni: &str) -> Result<String, Carr
         };
     }
     let public = format!("{sni}:443");
-    for t in ["127.0.0.1:8443", public.as_str()] {
-        if target_reachable(t).await {
-            return Ok(t.to_string());
-        }
+    if target_reachable(&public).await {
+        return Ok(public);
     }
     Err(failed(format!(
-        "no REALITY target is reachable from this host (tried 127.0.0.1:8443 and {public}): clients would only see timeouts. Set one with target=host:port (for example www.cloudflare.com:443) or NAT_TUNNEL_XRAY_TARGET"
+        "no REALITY target is reachable from this host (tried {public}): clients would only see timeouts. Set one with target=host:port (for example www.cloudflare.com:443) or NAT_TUNNEL_XRAY_TARGET"
     )))
 }
 

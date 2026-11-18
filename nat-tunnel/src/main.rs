@@ -1016,6 +1016,18 @@ fn tun_config(
         Some(peer) => Some(peer.parse()?),
         None => None,
     };
+    // Each value ends up in route commands (an administrator PowerShell line on Windows): only an
+    // IPv4 address or network passes, written back in canonical form.
+    let bypass = bypass
+        .iter()
+        .map(|b| {
+            let (a, p) = b.split_once('/').unwrap_or((b.as_str(), "32"));
+            match (a.trim().parse::<std::net::Ipv4Addr>(), p.trim().parse::<u8>()) {
+                (Ok(a), Ok(p)) if p <= 32 => Ok(format!("{a}/{p}")),
+                _ => Err(format!("--tun-bypass {b:?} is not an IPv4 address or network (a.b.c.d or a.b.c.d/n)")),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(tunmode::TunConfig {
         addr,
         prefix,
@@ -1030,6 +1042,16 @@ fn tun_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_bypass_takes_only_ipv4_networks() {
+        let cfg = |b: &str| tun_config(Some("10.7.0.2/24".into()), None, None, vec![b.into()], None, None);
+        assert_eq!(cfg("192.0.2.0/24").unwrap().unwrap().bypass, vec!["192.0.2.0/24".to_string()]);
+        assert_eq!(cfg("198.51.100.7").unwrap().unwrap().bypass, vec!["198.51.100.7/32".to_string()]);
+        for bad in ["1.2.3.4'; Remove-Item C:\\ -Recurse; '", "-net", "1.2.3.4/33", "::1/128", "example.com"] {
+            assert!(cfg(bad).is_err(), "{bad}");
+        }
+    }
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("nat-tunnel").chain(args.iter().copied()))

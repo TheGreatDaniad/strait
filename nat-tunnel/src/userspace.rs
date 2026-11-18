@@ -150,13 +150,91 @@ pub fn note_public_addr(ip: IpAddr) {
     }
 }
 
-/// This machine, or its router's public side?
+/// IPv4 subnets on this machine's interfaces (network, prefix length), refreshed every 30 s.
+static ON_LINK: std::sync::Mutex<Option<(Vec<(u32, u8)>, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// On-link prefixes no shorter than this are refused as the host's own network.
+const ON_LINK_MIN_PREFIX: u8 = 16;
+
+/// (address, netmask) of every IPv4 interface address.
+#[cfg(unix)]
+fn interface_nets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut out = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return out;
+    }
+    let mut p = head;
+    while !p.is_null() {
+        let ifa = unsafe { &*p };
+        let v4 = |sa: *const libc::sockaddr| -> Option<Ipv4Addr> {
+            (!sa.is_null() && unsafe { (*sa).sa_family } as i32 == libc::AF_INET)
+                .then(|| Ipv4Addr::from(u32::from_be(unsafe { (*(sa as *const libc::sockaddr_in)).sin_addr.s_addr })))
+        };
+        if let (Some(a), Some(m)) = (v4(ifa.ifa_addr), v4(ifa.ifa_netmask)) {
+            out.push((a, m));
+        }
+        p = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(head) };
+    out
+}
+
+#[cfg(windows)]
+fn interface_nets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpAddrTable, MIB_IPADDRROW_XP, MIB_IPADDRTABLE};
+    let mut size = 0u32;
+    unsafe { GetIpAddrTable(std::ptr::null_mut(), &mut size, 0) };
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+    let table = buf.as_mut_ptr() as *mut MIB_IPADDRTABLE;
+    if unsafe { GetIpAddrTable(table, &mut size, 0) } != 0 {
+        return Vec::new();
+    }
+    let n = unsafe { (*table).dwNumEntries } as usize;
+    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr() as *const MIB_IPADDRROW_XP, n) };
+    rows.iter().map(|r| (Ipv4Addr::from(r.dwAddr.to_ne_bytes()), Ipv4Addr::from(r.dwMask.to_ne_bytes()))).collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn interface_nets() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    Vec::new()
+}
+
+/// The on-link networks worth refusing: prefixes of `ON_LINK_MIN_PREFIX` bits or more, not loopback.
+fn on_link_prefixes(nets: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<(u32, u8)> {
+    nets.iter()
+        .filter(|(a, _)| !a.is_loopback() && !a.is_unspecified())
+        .map(|(a, m)| (u32::from(*a) & u32::from(*m), u32::from(*m).leading_ones() as u8))
+        .filter(|&(_, len)| (ON_LINK_MIN_PREFIX..32).contains(&len))
+        .collect()
+}
+
+/// Is `ip` on one of this machine's networks (a LAN that uses public addresses, a university or
+/// office subnet)? Those are the host's neighbours, not the internet.
+fn on_link(ip: Ipv4Addr) -> bool {
+    let mut g = ON_LINK.lock().unwrap();
+    if g.as_ref().is_none_or(|(_, at)| at.elapsed() >= Duration::from_secs(30)) {
+        *g = Some((on_link_prefixes(&interface_nets()), std::time::Instant::now()));
+    }
+    let x = u32::from(ip);
+    g.as_ref().is_some_and(|(nets, _)| nets.iter().any(|&(net, len)| x & (u32::MAX << (32 - len)) == net))
+}
+
+/// This machine, its router's public side, or (unless `--allow-lan`) a network it sits on?
 fn is_self(ip: IpAddr) -> bool {
     if ip.is_loopback() {
         return false; // its own opt-in decides
     }
     if PUBLIC.lock().unwrap().contains(&ip) {
         return true;
+    }
+    if let IpAddr::V4(a) = ip {
+        if policy_bits() & POLICY_LAN == 0 && on_link(a) {
+            return true;
+        }
     }
     let mut c = OWN_CACHE.lock().unwrap();
     let c = c.get_or_insert_with(Default::default);
@@ -665,6 +743,15 @@ mod policy_tests {
         assert!(!flow_allowed(mail, "tcp", false, false) && flow_allowed(mail, "tcp", false, true));
         assert!(flow_allowed(mail, "udp", false, false), "the mail rule is TCP only");
         assert!(is_own_address("127.0.0.1".parse().unwrap()) && !is_own_address("203.0.113.77".parse().unwrap()));
+        // On-link networks: a public /24 the host sits on is refused, a huge or host-only prefix is not.
+        let nets = [
+            (Ipv4Addr::new(198, 51, 100, 7), Ipv4Addr::new(255, 255, 255, 0)),
+            (Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(255, 0, 0, 0)),
+            (Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::new(255, 255, 255, 255)),
+            (Ipv4Addr::new(100, 1, 2, 3), Ipv4Addr::new(255, 0, 0, 0)),
+        ];
+        assert_eq!(on_link_prefixes(&nets), vec![(u32::from(Ipv4Addr::new(198, 51, 100, 0)), 24)]);
+        assert!(!interface_nets().is_empty(), "this machine has at least one IPv4 address");
         assert!(!flow_allowed("10.7.0.5:80".parse().unwrap(), "tcp", false, false), "the tunnel network");
     }
 

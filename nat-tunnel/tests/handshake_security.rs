@@ -286,9 +286,7 @@ async fn personal_invites_admit_expire_and_can_be_withdrawn() {
     policy.revoked.lock().unwrap().insert(7);
     let r = with_host(&mut h, Tunnel::connect(opts(addr, KEY, with(Token { id: 7, expires: 0 })))).await;
     assert!(refused(r), "withdrawn");
-    // Withdrawing does not disconnect by itself; the host's remove does.
-    assert_eq!(h.peer_count(), 1);
-    h.kick_guest(7).await;
+    // Withdrawing also ends the live session (the host re-checks admission every tick).
     assert_eq!(h.peer_count(), 0);
     // Without a token the shared invite still works, unless the host takes personal invites only.
     let t = with_host(&mut h, Tunnel::connect(opts(addr, KEY, named(&key, None)))).await;

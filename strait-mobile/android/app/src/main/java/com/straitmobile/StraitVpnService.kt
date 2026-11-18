@@ -13,7 +13,6 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import java.io.File
-import java.net.InetAddress
 
 class StraitVpnService : VpnService() {
   private var process: Process? = null
@@ -185,17 +184,16 @@ class StraitVpnService : VpnService() {
 
     // Route public IPv4 space through the VPN. RFC1918, loopback, link-local
     // and multicast stay on the local network.
-    // Transport endpoints (host and/or signal servers) must stay on the
-    // physical network, otherwise the tunnel's own UDP packets are captured
-    // by the tunnel and it loops.
-    val endpoints = (inviteEndpoints(invite) + listOfNotNull(learnedPeer)).mapNotNull {
-      try {
-        InetAddress.getByName(it.substringBeforeLast(':'))
-      } catch (_: Exception) {
-        null
-      }
+    // The tunnel's own packets must stay on the physical network, or they loop
+    // back into the tunnel: this app (the core runs under its uid) is left out
+    // of the VPN, so nothing else has to be, not even the endpoints' networks.
+    try {
+      builder.addDisallowedApplication(packageName)
+    } catch (e: Exception) {
+      Log.e(TAG, "could not leave this app out of the VPN", e)
+      return null
     }
-    addPublicRoutes(builder, endpoints)
+    addPublicRoutes(builder)
     if (blockIPv6) {
       builder.addAddress("fd00::2", 128)
       builder.addRoute("::", 0)
@@ -203,38 +201,11 @@ class StraitVpnService : VpnService() {
     return builder.establish()
   }
 
-  /// Endpoints carried by the invite: direct hosts first, then signal servers.
-  /// Both the current `STRAIT2|key|hosts|signals`  form and the legacy
-  /// `server:port|room|key` form are supported.
-  private fun inviteEndpoints(invite: String): List<String> {
-    val text = invite.trim()
-    if (!text.startsWith("STRAIT2|")) {
-      // Legacy: `server:port|room|key`; the first field is the endpoint.
-      val first = text.split('|').firstOrNull()?.trim().orEmpty()
-      return if (first.contains(':')) listOf(first) else emptyList()
-    }
-    val fields = text.removePrefix("STRAIT2|").split('|')
-    // Carrier entries `id@host:port;k=v` (7th field) name more transport endpoints; `%XX` escapes are not expected in hosts.
-    val cr = fields.getOrNull(5).orEmpty().split(',').mapNotNull {
-      it.substringBefore(';').substringAfter('@', "").ifEmpty { null }
-    }.joinToString(",")
-    return (fields.getOrNull(1).orEmpty() + "," + fields.getOrNull(2).orEmpty() + "," + cr)
-        .split(',')
-        .map { it.trim() }
-        .filter { it.contains(':') }
-  }
-
-  private fun addPublicRoutes(builder: Builder, relayIps: List<InetAddress>) {
-    // 1..223, excluding private/loopback/link-local blocks and the relay's
-    // own /8. The relay must stay on the physical network, otherwise the
-    // tunnel's own UDP packets are routed back into the tunnel and loop.
-    val relayOctets = relayIps.mapNotNull {
-      it.address.firstOrNull()?.toInt()?.and(0xff)
-    }.toSet()
+  private fun addPublicRoutes(builder: Builder) {
+    // 1..223, excluding private/loopback/link-local blocks.
     for (i in 1..223) {
       when {
         i == 10 || i == 127 || i == 169 || i == 172 || i == 192 -> Unit
-        relayOctets.contains(i) -> Unit
         else -> builder.addRoute("$i.0.0.0", 8)
       }
     }
@@ -255,10 +226,6 @@ class StraitVpnService : VpnService() {
     builder.addRoute("192.172.0.0", 14)
     builder.addRoute("192.176.0.0", 12)
     builder.addRoute("192.192.0.0", 10)
-
-    // The relay's /8 is left entirely on the physical network. This is
-    // conservative, but guarantees the transport socket cannot be captured
-    // by the VPN (a protected transport fd is the long-term fix).
   }
 
   private fun ipv4String(value: Int): String =

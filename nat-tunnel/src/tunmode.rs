@@ -215,9 +215,8 @@ struct DnsRestore {
 
 #[cfg(target_os = "macos")]
 impl DnsRestore {
-    /// Remember the primary service's resolvers, then point DNS at public
-    /// servers reachable through the tunnel. DNS then travels inside it.
-    fn capture_and_apply(device: &str) -> Option<Self> {
+    /// Remember the primary service's resolvers (see `apply`).
+    fn capture(device: &str) -> Option<Self> {
         let service = primary_service(device)?;
         let original = run_capture("networksetup", &["-getdnsservers", &service])?;
         let servers = if original.contains("There aren't any DNS Servers") {
@@ -231,23 +230,19 @@ impl DnsRestore {
                 .collect()
         };
 
-        let restore = Self {
-            service: service.clone(),
-            servers,
-        };
+        Some(Self { service, servers })
+    }
 
-        if run_capture(
-            "networksetup",
-            &["-setdnsservers", &service, "1.1.1.1", "8.8.8.8"],
-        )
-        .is_some()
-        {
+    /// Point DNS at public servers reachable through the tunnel: DNS then travels inside it.
+    fn apply(&self) -> bool {
+        let service = &self.service;
+        if run_capture("networksetup", &["-setdnsservers", service, "1.1.1.1", "8.8.8.8"]).is_some() {
             flush_dns();
             log::info!("DNS set to 1.1.1.1/8.8.8.8 on {service} (through the tunnel)");
-            Some(restore)
+            true
         } else {
             log::warn!("could not set DNS on {service}; leaving resolvers unchanged");
-            None
+            false
         }
     }
 
@@ -273,9 +268,8 @@ struct V6Restore {
 
 #[cfg(target_os = "macos")]
 impl V6Restore {
-    /// Disable IPv6 on the physical service so apps stop trying IPv6 first.
-    /// A silent black hole made some apps hang instead of falling back.
-    fn capture_and_disable(device: &str) -> Option<Self> {
+    /// The physical service, when its IPv6 is automatic (see `disable`).
+    fn capture(device: &str) -> Option<Self> {
         let service = primary_service(device)?;
         let info = run_capture("networksetup", &["-getinfo", &service])?;
         let automatic = info
@@ -285,12 +279,17 @@ impl V6Restore {
             log::info!("IPv6 on {service} is not automatic; leaving it unchanged");
             return None;
         }
-        if run_capture("networksetup", &["-setv6off", &service]).is_some() {
-            log::info!("IPv6 disabled on {service} for the tunnel session");
-            Some(Self { service })
-        } else {
-            None
+        Some(Self { service })
+    }
+
+    /// Disable IPv6 on the physical service so apps stop trying IPv6 first.
+    /// A silent black hole made some apps hang instead of falling back.
+    fn disable(&self) -> bool {
+        let ok = run_capture("networksetup", &["-setv6off", &self.service]).is_some();
+        if ok {
+            log::info!("IPv6 disabled on {} for the tunnel session", self.service);
         }
+        ok
     }
 
     fn restore(&self) {
@@ -371,19 +370,19 @@ fn dns_servers(text: &str) -> Vec<String> {
 
 #[cfg(windows)]
 impl WindowsDns {
-    /// Remember the physical adapter's resolvers, then point DNS at servers
-    /// that the new default route sends through the tunnel.
-    fn capture_and_apply(device: &str, tun: &str) -> Option<Self> {
+    /// Remember the physical adapter's resolvers (see `apply`).
+    fn capture(device: &str) -> Option<Self> {
         let original = powershell(&format!(
             "(Get-DnsClientServerAddress -InterfaceIndex {device} -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses"
         ))?;
         let servers = dns_servers(&original);
 
-        let restore = Self {
-            interface: device.to_string(),
-            servers,
-        };
+        Some(Self { interface: device.to_string(), servers })
+    }
 
+    /// Point DNS at servers that the new default route sends through the tunnel.
+    fn apply(&self, tun: &str) -> bool {
+        let device = &self.interface;
         let applied = powershell(&format!(
             "Set-DnsClientServerAddress -InterfaceIndex {device} -ServerAddresses 1.1.1.1,8.8.8.8 -ErrorAction Stop; \
              Set-DnsClientServerAddress -InterfaceIndex {tun} -ServerAddresses 1.1.1.1,8.8.8.8 -ErrorAction SilentlyContinue; \
@@ -391,10 +390,10 @@ impl WindowsDns {
         ));
         if applied.is_some() {
             log::info!("DNS set to 1.1.1.1/8.8.8.8 (through the tunnel)");
-            Some(restore)
+            true
         } else {
             log::warn!("could not set DNS; leaving resolvers unchanged");
-            None
+            false
         }
     }
 
@@ -429,24 +428,37 @@ struct WindowsV6 {
 
 #[cfg(windows)]
 impl WindowsV6 {
-    /// Disable IPv6 on every adapter except the tunnel, so no app can send IPv6 around the
-    /// IPv4-only tunnel (a second adapter, or one that connects later, included); apps fall back
-    /// to IPv4.
-    fn capture_and_disable(_device: &str) -> Option<Self> {
+    /// Every adapter except the tunnel whose IPv6 is on (see `disable`). An adapter added during
+    /// the session is not covered.
+    fn capture(_device: &str) -> Option<Self> {
         let out = powershell(
-            "$done = @(); Get-NetAdapter -IncludeHidden -ErrorAction Stop | \
+            "$on = @(); Get-NetAdapter -IncludeHidden -ErrorAction Stop | \
              Where-Object { $_.InterfaceDescription -notmatch 'Wintun' -and $_.Name -notmatch 'nat-tunnel' } | \
              ForEach-Object { $b = $_ | Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue; \
-               if ($b -and $b.Enabled) { $_ | Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue; $done += $_.ifIndex } }; \
-             $done -join ','",
+               if ($b -and $b.Enabled) { $on += $_.ifIndex } }; \
+             $on -join ','",
         )?;
         let interfaces: Vec<String> = out.trim().split(',').map(str::trim).filter(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())).map(str::to_string).collect();
         if interfaces.is_empty() {
             log::info!("IPv6 is already off on every adapter");
             return None;
         }
-        log::info!("IPv6 disabled on interfaces {} for the tunnel session", interfaces.join(", "));
         Some(Self { interfaces })
+    }
+
+    /// Disable IPv6 on those adapters, so no app can send IPv6 around the IPv4-only tunnel; apps
+    /// fall back to IPv4.
+    fn disable(&self) -> bool {
+        let list = self.interfaces.join(",");
+        let ok = powershell(&format!(
+            "Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {{ @({list}) -contains $_.ifIndex }} | \
+             Disable-NetAdapterBinding -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction SilentlyContinue"
+        ))
+        .is_some();
+        if ok {
+            log::info!("IPv6 disabled on interfaces {list} for the tunnel session");
+        }
+        ok
     }
 
     fn restore(&self) {
@@ -754,16 +766,20 @@ struct MacState {
     /// (service, original resolvers; empty = DHCP)
     dns: Option<(String, Vec<String>)>,
     v6: Option<String>,
+    /// The IPv4 default the tunnel replaced: (gateway, device).
+    #[serde(default)]
+    default: Option<(String, String)>,
 }
 
 #[cfg(target_os = "macos")]
 const MAC_STATE: &str = "/Library/Application Support/Strait/restore.json";
 
 #[cfg(target_os = "macos")]
-fn save_mac_state(dns: &Option<DnsRestore>, v6: &Option<V6Restore>) {
+fn save_mac_state(dns: &Option<DnsRestore>, v6: &Option<V6Restore>, gateway: &str, device: &str) {
     let state = MacState {
         dns: dns.as_ref().map(|d| (d.service.clone(), d.servers.clone())),
         v6: v6.as_ref().map(|v| v.service.clone()),
+        default: Some((gateway.to_string(), device.to_string())),
     };
     save_root_state(MAC_STATE, &state);
 }
@@ -785,8 +801,8 @@ fn save_root_state(path: &str, state: &impl serde::Serialize) {
     }
 }
 
-/// Crash recovery (Linux). The routes, the fwmark rule and table 100 outlive a killed process and
-/// the deleted IPv4 default does not come back by itself. Kept in /run (gone after a reboot, like
+/// Crash recovery (Linux). The bypass routes, the IPv6 reject routes, the fwmark rule and table 100
+/// outlive a killed process (the tunnel's own routes go with its device). Kept in /run (gone after a reboot, like
 /// the routes) while a full tunnel runs; the next full tunnel (or `recover`) puts them back.
 #[cfg(target_os = "linux")]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -798,7 +814,25 @@ struct LinuxState {
 }
 
 #[cfg(target_os = "linux")]
-const LINUX_STATE: &str = "/run/strait/restore.json";
+// Its own folder: `save_root_state` makes it 0700, and /run/strait/<uid> (`privileged::state_dir`)
+// must stay reachable for the window, which reads the tunnel's log there.
+const LINUX_STATE: &str = "/run/strait-restore/restore.json";
+
+/// Send every DNS name to 1.1.1.1/8.8.8.8 on the tunnel link (systemd-resolved), so lookups travel
+/// inside the tunnel even when the system resolver is a LAN address the tunnel bypasses. The
+/// setting belongs to the link and goes away with it. Without systemd-resolved, DNS is unchanged.
+#[cfg(target_os = "linux")]
+fn linux_tunnel_dns(tun: &str) {
+    let set = [
+        vec!["resolvectl", "dns", tun, "1.1.1.1", "8.8.8.8"],
+        vec!["resolvectl", "domain", tun, "~."],
+        vec!["resolvectl", "default-route", tun, "true"],
+    ];
+    match set.iter().try_for_each(|a| run_route(a)) {
+        Ok(()) => log::info!("DNS set to 1.1.1.1/8.8.8.8 on {tun} for every name (through the tunnel)"),
+        Err(e) => log::warn!("DNS unchanged ({e}): without systemd-resolved, lookups to a resolver on the local network leave outside the tunnel"),
+    }
+}
 
 /// Undo the routes of a full tunnel that did not exit cleanly. True when there was a file.
 #[cfg(target_os = "linux")]
@@ -820,8 +854,11 @@ fn recover_mac_state() -> bool {
     let path = std::path::Path::new(MAC_STATE);
     let Ok(text) = std::fs::read_to_string(path) else { return false };
     if let Ok(state) = serde_json::from_str::<MacState>(&text) {
-        log::warn!("restoring DNS/IPv6 left by a previous session that did not exit cleanly");
+        log::warn!("restoring DNS/IPv6/routes left by a previous session that did not exit cleanly");
         remove_v6_halves();
+        if let Some((gateway, device)) = &state.default {
+            restore_default(gateway, device);
+        }
         if let Some((service, servers)) = state.dns {
             DnsRestore { service, servers }.restore();
         }
@@ -855,7 +892,7 @@ struct RouteRestore {
 
 impl RouteRestore {
     fn capture(gateway: &str, device: &str, tun: &str, bypass: &[String]) -> Self {
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         let _ = tun;
         let ipv6 = capture_ipv6_default();
         #[cfg(target_os = "macos")]
@@ -865,28 +902,28 @@ impl RouteRestore {
             LINUX_STATE,
             &LinuxState { gateway: gateway.into(), device: device.into(), ipv6: ipv6.clone(), bypass: bypass.to_vec() },
         );
+        // The recovery file is written before anything changes, so a kill at any point leaves
+        // a record of how to undo it.
         #[cfg(target_os = "macos")]
-        let dns = DnsRestore::capture_and_apply(device);
-        #[cfg(windows)]
-        let dns = WindowsDns::capture_and_apply(device, tun);
-        #[cfg(target_os = "macos")]
-        let v6 = V6Restore::capture_and_disable(device);
-        #[cfg(target_os = "macos")]
-        save_mac_state(&dns, &v6);
-        #[cfg(windows)]
-        let v6 = WindowsV6::capture_and_disable(device);
+        let (dns, v6) = {
+            let (dns, v6) = (DnsRestore::capture(device), V6Restore::capture(device));
+            save_mac_state(&dns, &v6, gateway, device);
+            (dns.filter(DnsRestore::apply), v6.filter(V6Restore::disable))
+        };
         #[cfg(windows)]
         let (dns, v6) = {
             let state = StaleState {
-                dns,
-                v6,
+                dns: WindowsDns::capture(device),
+                v6: WindowsV6::capture(device),
                 bypass: bypass.to_vec(),
                 gateway: gateway.to_string(),
                 device: device.to_string(),
             };
             save_state(&state);
-            (state.dns, state.v6)
+            (state.dns.filter(|d| d.apply(tun)), state.v6.filter(WindowsV6::disable))
         };
+        #[cfg(target_os = "linux")]
+        linux_tunnel_dns(tun);
         Self {
             gateway: gateway.to_string(),
             device: device.to_string(),
@@ -1234,10 +1271,9 @@ fn original_ipv6_default(text: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn restore_default(gateway: &str, device: &str) {
-    let _ = run_route(&[
-        "ip", "route", "replace", "default", "via", gateway, "dev", device,
-    ]);
+fn restore_default(_gateway: &str, _device: &str) {
+    // The system default was never changed (see `route_default`), and the tunnel's two /1 routes
+    // go away with its device: only the fwmark rule and table 100 are left to remove.
     let _ = run_route(&["ip", "rule", "del", "fwmark", "0x1", "lookup", MARK_TABLE]);
     let _ = run_route(&["ip", "route", "flush", "table", MARK_TABLE]);
 }
@@ -1482,18 +1518,15 @@ fn route_bypass(net: &str, gateway: &str, device: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Linux: two /1 routes through the tunnel beat any default, whatever its metric, so the system's
+/// own default (with its DHCP proto, source and metric) is never replaced and needs no restoring.
 #[cfg(target_os = "linux")]
 fn route_default(dev: &str, peer: Ipv4Addr) -> io::Result<()> {
-    run_route(&[
-        "ip",
-        "route",
-        "replace",
-        "default",
-        "via",
-        &peer.to_string(),
-        "dev",
-        dev,
-    ])
+    let peer = peer.to_string();
+    for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+        run_route(&["ip", "route", "replace", half, "via", &peer, "dev", dev])?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

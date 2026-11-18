@@ -6,9 +6,11 @@
 //!
 //! The identifiers a service sees (topics, the info-hash, DHT keys) also depend on the UTC day
 //! (`info = label || "@" || day`), so an operator cannot link the sessions of one invite across
-//! days. Host blobs carry an Ed25519 signature by the host key (the invite's `hk`) after the
-//! AEAD part: a guest accepts a host candidate only if the host signed it, so an invite holder
-//! cannot point guests at an address of their choosing.
+//! days. Host blobs carry an Ed25519 signature by the host's record subkey for this invite
+//! (derived from the invite's `hk`, see `handshake::Subkey`) after the AEAD part: a guest accepts
+//! a host candidate only if the host signed it, so an invite holder cannot point guests at an
+//! address of their choosing. Guest blobs are sealed to the host's X25519 key (a fresh key in
+//! front, an HMAC under the record key behind), so only the host reads a guest's address.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

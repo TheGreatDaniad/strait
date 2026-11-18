@@ -46,6 +46,7 @@ keepalive every 10 s), and opens a new connection to the forwarded service for e
 | psk | `SHA-256("strait-mux-v3" ‖ invite key)` |
 | host static key | X25519 form of the host key; the guest takes it from `hk` |
 | guest | one fresh ephemeral key per join attempt |
+| prologue | `"strait-join-v4" ‖ cn`: message 1 is bound to the nonce it travels with |
 
 ```text
 JOIN    0xF8 | cn (16) | Noise message 1 (e, es; payload: clock (4) | optional token (24)) | tag (16)
@@ -54,7 +55,8 @@ ACCEPT  0xF9 | cn (16) | Noise message 2 (e, ee; payload: slot (2) | cn (16) | v
 
 `tag` is `HMAC(tag key, label ‖ fields)[..16]` with `tag key = HMAC(psk, "strait-outer-tag-v1")`
 (never the psk itself): a cheap check, so only an invite holder makes the host run a key exchange.
-`cn` is outside Noise and authenticated only by this tag, which every invite holder can make. The verdict is 0 accepted, 1 full, 2 refused (withdrawn, expired or
+`cn` is also in the Noise prologue, so a captured message 1 cannot be re-wrapped under another
+`cn`: it would not decrypt. The verdict is 0 accepted, 1 full, 2 refused (withdrawn, expired or
 foreign personal invite; personal invites only), 3 clock. A refusal is message 2 like an
 acceptance, so only the host can send one. The session key is
 `HMAC(k1, "strait-session-v3" ‖ k2)` over Noise's two transport keys.
@@ -66,19 +68,27 @@ What this gives:
   invite is not enough to pose as the host, or to make a guest give up.
 - Both sides contribute a fresh key, so a recording stays unreadable if the invite or the host key
   leaks later, and no peer can read another peer's traffic.
-- Message 1 carries the guest's clock: the host refuses a JOIN more than 10 minutes off. It
-  remembers the ephemeral key of every message 1 it opened before deciding anything (not `cn`,
-  which an invite holder could replace), so a recorded JOIN, fresh or stale and however re-wrapped,
-  costs it one key exchange; a retry of a refused JOIN gets the same refusal from memory, and a
-  repeated accepted JOIN gets its answer again at most once a second, only at its own address. The
-  memory starts empty, so a host also refuses a JOIN made before it started (with 60 s of slack for
-  a slow clock): a recording from before a restart is stale too. A guest that the host refused
-  stops, rather than retrying.
+- Message 1 carries the guest's clock: the host refuses a JOIN more than 10 minutes off, or made
+  before the host started (with 60 s of slack): its memory starts empty, so a recording from before
+  a restart is stale too. A waiting guest renews its JOIN every 30 s, so a host that starts or
+  restarts while it waits still finds it fresh.
+- The host remembers the ephemeral key of every fresh message 1 it opened, before deciding
+  anything, for 22 minutes (longer than a JOIN stays fresh): a recorded JOIN costs it one key
+  exchange. A stale JOIN is refused every time and not remembered, so a flood of them cannot push
+  fresh ones out. The memory holds 262,144 JOINs; if a flood of fresh ones ever filled it, the clock
+  of every JOIN forgotten early becomes a low-water mark, and a JOIN made at or before it is refused
+  as stale. A JOIN deferred while every free slot is busy stays remembered; only its own retry
+  (same `cn`, same address) is read again. A retry of a refused JOIN gets the same refusal from
+  memory, and a repeated accepted JOIN gets its answer again at most once a second, only at its own
+  address. A guest that the host refused stops, rather than retrying.
 - An accepted join takes an unconfirmed slot at once, for up to 20 s, and keeps it only once a
   packet under its session key arrives, so a replayed JOIN cannot keep a slot.
-- One network (an IPv4 address, an IPv6 /48) may start 20 new handshakes per 10 s, hold three
-  quarters of the slots, and hold four unconfirmed joins per invite. The host tracks 4096 networks at once and then
-  forgets the older half: many senders slow each other down but never lock everyone out. One
+- One network (an IPv4 address, an IPv6 /48) may start 20 new handshakes per 10 s and its wider
+  network (IPv4 /24, IPv6 /32) 80, hold three quarters of the slots, and hold four unconfirmed
+  joins per invite. The host tracks 4096 networks at once and then forgets the older half, and
+  reads at most 5000 handshakes per 10 s in all (about 25 ms of CPU a second): many senders slow
+  each other down and cannot exhaust the host; a flood from hundreds of networks can hold off new
+  joins while it lasts, never sessions already up. One
   personal invite may start 20 new sessions per 10 s wherever it joins from. A full host frees an
   unconfirmed slot of the same source, or one older than 3 s; a join younger than that is never
   pushed out by someone else's. Joins through a local sidecar (xray) have no known network: they
@@ -88,6 +98,19 @@ What this gives:
   filled one slot per personal invite.
 - A guest's pending handshake survives a forged answer: it rebuilds its Noise state from the same
   ephemeral key for each answer it tries.
+- Which older session a new join replaces (the same device restarting, the same personal invite)
+  is decided on the address the JOIN came from, before a data packet can move the session.
+  Afterwards the session follows its authenticated packets to a new address, as WireGuard does.
+- Admission is re-checked every tick, not only at the join: a session ends when its personal
+  invite expires or is withdrawn, and shared-invite sessions end once the host takes personal
+  invites only (removing someone turns that on). Nothing else ends a live session: key rotation,
+  JOIN renewal and the daily changes of records and certificates never interrupt one.
+- Forward mode: a new JOIN, even from the current guest's own address, replaces the live session
+  only once its first packet under the new key arrives. A JOIN alone (perhaps spoofed) cannot end
+  it.
+- Signal server: once an authenticated packet has come in, only such packets move a guest's
+  idea of where the host is; the server's PEER messages no longer can. Addresses the server names
+  are punched within the same budget as sealed records (see Rendezvous records).
 
 ## Personal invites
 
@@ -105,6 +128,7 @@ the wire only inside Noise message 1, encrypted to the host.
 - While the shared invite is allowed, anyone holding a personal invite also holds the shared one
   (drop the token and it is the shared invite), so the one-device rule and removal bind only on a
   host that takes personal invites only. Removing someone turns that on.
+- A session ends when its personal invite expires or is withdrawn, not only at the next join.
 - A personal invite works on one device at a time: while its session was heard from in the last
   40 s, a join with the same token from another address is refused as full; a silent session is
   replaced once the new one confirms. A copy can still be used while the owner is offline.
@@ -135,6 +159,8 @@ them from standard input.
   `HKDF(salt = record key, X25519(fresh key, host Noise key) ‖ fresh public key)`, the fresh public
   key in front, and a 16-byte HMAC under the record key at the end, checked before the key
   exchange, so only an invite holder makes the host do one. Other invite holders cannot read it.
+  It is sealed to the host key itself, so it is not forward secret: someone who archives records
+  and later gets the host key learns where guests connected from.
 - Host records are sealed with ChaCha20-Poly1305 under a key from the invite key, and carry an
   Ed25519 signature over `"strait-record-v1" ‖ nonce ‖ ciphertext` by the host's record subkey for
   this invite. A guest accepts a host record only with a valid signature. Without the invite key
@@ -145,32 +171,39 @@ them from standard input.
 - Trackers (`trk`) cannot carry a signature and announce in cleartext: they are never offered in
   the app, come with a warning on the command line, and a guest never port-scans or fans out at an
   address that only an unsigned source reported. A guest keeps at most 8 such addresses at once;
-  a host punches only addresses from sealed client records: at most 64 new addresses an hour and
-  8 ports of each, never a port below 1024 (UDP, and TCP for the WebSocket carrier), and
-  port-sprays at most 16 new addresses an hour. An invite holder can use up that budget, which
-  then stops a host behind NAT from reaching new guests until the hour ends or it shares again.
+  a host punches only addresses from sealed client records or the signal server: at most 64 new
+  addresses an hour and 8 ports of each, never a port below 1024 (UDP, and TCP for the WebSocket
+  carrier), and port-sprays at most 16 new addresses an hour. The budget is one per host, so an
+  invite holder can use it up, which then stops a host behind NAT from reaching new guests until
+  the hour ends or it shares again.
 - On the command line, trackers (`trk`) announce guests' addresses in cleartext under the invite's
   info-hash, so any invite holder can list them; the app never uses trackers.
 - Any invite holder can block the guests' shared DHT slot for a 10-minute window with a maximal
   sequence number; guests then find the host through the other services.
 - The address a host signs comes from STUN only when two servers agree on it (or only one is
-  configured).
-- A host record carries its signing time inside the signature and is refused 2 minutes later.
+  configured); after that the server that agreed keeps it current on its own.
+- A host record carries its signing time inside the signature and is refused 2 minutes later; on
+  the DHT, which a host republishes every few minutes, up to 7 minutes later.
 - The birthday scan a symmetric-NAT host needs sends to ports 1024 and up of at most 2 addresses
   from signed records, for at most 3 minutes, and a guest scans one address at most 3 times an hour.
 - The signal-server room changes every UTC day, like the other identifiers; the server does not
-  let another address replace a host registration that is still live.
+  let another address replace a host registration that is still live. Registrations are not
+  authenticated, so an invite holder (or anyone who sees the room on the wire) can register as the
+  host first and keep the real host from being found there; guests then find it through the other
+  services.
 
 ## What a guest can reach through the host
 
 One rule set for the userspace exit and the kernel TUN path: the public internet over IPv4 only.
 Never the host itself (its interface addresses and its public address, which is its router's
-WAN side), the tunnel network (other guests), private, loopback, link-local or multicast ranges,
+WAN side), the networks it sits on (every on-link IPv4 subnet of /16 or narrower, public ones
+too: an office or university LAN), the tunnel network (other guests), private, loopback, link-local or multicast ranges,
 IPv6 destinations, or TCP port 25, nor cloud metadata and platform addresses (169.254.0.0/16,
 168.63.129.16, 100.100.100.200) or 192.0.0.0/24 and 198.18.0.0/15. `--allow-lan` opens the private
 ranges, 192.0.0.0/24 and 198.18.0.0/15, never the cloud addresses; `STRAIT_EXIT_ALLOW_SMTP=1` opens port 25;
 `STRAIT_EXIT_ALLOW_HOST=1` (labs) lets guests reach services on the host's tunnel address. Each
-guest may keep 64 TCP flows open through the userspace exit.
+guest may keep 64 TCP flows open through the userspace exit. Prefixes the host routes into
+another VPN, and services that trust the host's address, are not told apart from the internet.
 
 A guest, in turn, only takes packets from the host that are addressed to its own tunnel address
 and answer something it sent: a TCP segment that opens a connection (SYN without ACK) is dropped,
@@ -183,12 +216,15 @@ fragmented is lost; DNS keeps answers under 1232 bytes, and TCP and QUIC avoid f
 
 ## WebSocket carrier identity
 
-The `ws` carrier's TLS certificate is made with the host's TLS subkey for the current invite, not
-the host key. A guest ignores the certificate's contents and checks the TLS 1.3 handshake signature
-against the subkey it derives from `hk` and the invite key, so only the host can complete TLS;
-holding the invite is not enough. A prober without the invite still completes TLS and sees a
-self-signed certificate, which tells it nothing about `hk` or the host's records, and changes with
-the invite: where active probing matters, the Xray (REALITY) carrier, or `tls=ca` behind a real
+The `ws` carrier's TLS certificate is made with the host's TLS subkey for the current invite and
+UTC day, not the host key. A guest ignores the certificate's contents and checks the TLS 1.3
+handshake signature against the subkeys it derives from `hk`, the invite key and yesterday, today
+and tomorrow, so only the host can complete TLS; holding the invite is not enough. A connection
+already up keeps its TLS session across midnight. A prober without the invite still completes TLS
+and sees a self-signed certificate, which tells it nothing about `hk` or the host's records, and
+changes every day and with the invite: the same host can be recognised by its certificate for one
+day at most. The host accepts at most 8 pending TLS handshakes per IPv4 /24 or IPv6 /64, 256 in
+all. Where active probing matters, where active probing matters, the Xray (REALITY) carrier, or `tls=ca` behind a real
 certificate, is the choice.
 
 ## Privileges
@@ -203,12 +239,25 @@ code-signed yet): what approves it is the password prompt. Root writes
 its log only into `/var/run/strait/<uid>`, a folder it creates itself. It receives the rendezvous
 and carrier choices only, never a path to another program. Windows still runs the whole window as
 administrator. The tunnel's log files are 0600 and belong to the user, so other users of the
-computer cannot read them.
+computer cannot read them. Crash-recovery state (DNS, IPv6, routes) is written before anything
+changes, so a kill at any moment can be undone; on macOS it includes the IPv4 default route. On
+Linux the system's default route is never changed: two /1 routes through the tunnel take over and
+go away with the tunnel device.
+
+A full tunnel sends DNS to 1.1.1.1 and 8.8.8.8 through the tunnel: macOS and Windows set those
+resolvers, Linux sets them on the tunnel link for every name through systemd-resolved (without
+it, Linux leaves DNS unchanged and says so; a resolver on the local network is then reached
+outside the tunnel). Android routes all public addresses through the VPN and leaves only the app
+itself (the tunnel's own packets) out.
+
+The Xray carrier forwards visitors without the key to its REALITY target: an explicit
+`target=`, else `<sni>:443`, never a local address on its own.
 
 ## Formal model
 
 `docs/proverif/strait_nkpsk0.pv` is a symbolic ProVerif model of the join against an attacker who
-holds the invite, and who gets the host key once every session is over. ProVerif 2.05 proves that
+holds the invite, who can have the host open guest records of its making (an X25519 oracle on the
+host key), and who gets the host key once every session is over. ProVerif 2.05 proves that
 the guest's token stays secret while the host key does; that traffic in both directions stays
 secret, also after the host key leaks; that a guest that finishes a join has talked to the holder
 of the host key (injective agreement on both ephemeral keys and the session key); that every
@@ -223,7 +272,7 @@ above.
 
 ## Not covered
 
-- An invite holder can replay a signed host record within its 2 minutes.
+- An invite holder can replay a signed host record within its 2 minutes (7 on the DHT).
 - A malicious host can point its guests' birthday scan at an address of its choice, within the
   limits above (high ports, 3 minutes, 3 times an hour).
 - A copy of a personal invite works while its owner is not connected.
@@ -233,7 +282,16 @@ above.
 - The record and TLS subkeys are related to the host key's X25519 use (see Host key).
 - Root checks that its copy of the tunnel program matches what the window staged, not that it is
   genuine: the app is not code-signed yet.
-- Holders of the shared invite on two networks can fill a host (see Handshake).
+- Holders of the shared invite on two networks can fill a host (see Handshake), and any invite
+  holder can use up the host's hourly punch budget (see Rendezvous records).
+- Guest rendezvous records are not forward secret (see Rendezvous records).
+- Signal-server registrations are not authenticated (see Rendezvous records).
+- A session follows its authenticated packets to a new address at once (NAT rebinding); an
+  attacker on the path who races one copied packet can move it until the guest's next packet.
+- When the tunnel device is rebuilt (a new address or MTU), traffic leaves outside the tunnel for
+  a moment, as it does when Strait stops.
+- Android logs the tunnel's messages (with addresses) to logcat, which adb and bug reports can
+  read.
 - A WebSocket host behind a reverse proxy sees every guest at the proxy's address: the per-address
   cap of 16 connections does not apply there, only the total of 256.
 - Nothing here has been audited by an outside party.

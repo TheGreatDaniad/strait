@@ -269,12 +269,13 @@ pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
         s.err.display().to_string(),
         s.pid_file.display().to_string(),
         s.log.display().to_string(),
+        s.state_dir.parent().unwrap_or(Path::new("/")).display().to_string(),
     ];
     let env: Vec<String> = s.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     if strs.iter().chain(&env).map(String::as_str).chain(args.iter().map(String::as_str)).any(|x| x.contains('\0')) {
         return Err("argument contains a NUL byte".into());
     }
-    let [stage, dir, dest, state, err, pid, log] = strs.map(|x| sh_quote(&x));
+    let [stage, dir, dest, state, err, pid, log, parent] = strs.map(|x| sh_quote(&x));
     let uid = s.uid;
     let group = sh_quote(s.group);
     let sha = sh_quote(s.sha256);
@@ -282,9 +283,10 @@ pub fn shell_command(s: &ShellSpec, args: &[String]) -> Result<String, String> {
     let hash = format!("\"$({} 2>/dev/null <{dest} | cut -d' ' -f1)\" = {sha}", s.hash_cmd);
     let env: Vec<String> = env.iter().map(|e| sh_quote(e)).collect();
     let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
-    // `rm -f` first: root then creates the folder itself, so nothing planted there survives.
+    // The parent is made root-owned first (on macOS /var/run is group-writable by daemon), then
+    // `rm -rf`: root creates the folder itself, so nothing planted there survives.
     Ok(format!(
-        "rm -rf {state} && mkdir -p -m 0755 {state} && (umask 077 && : >{err} && : >{log}) && chown {uid} {err} {log} \
+        "install -d -m 0755 -o root -g {group} {parent} && rm -rf {state} && mkdir -p -m 0755 {state} && (umask 077 && : >{err} && : >{log}) && chown -h {uid} {err} {log} \
          || {{ echo 'cannot create the state folder' >&2; exit 1; }}; \
          {{ [ {hash} ] || {{ install -d -m 0755 -o root -g {group} {dir} && install -m 0755 -o root -g {group} {stage} {dest}; }}; [ {hash} ]; }} >>{err} 2>&1 \
          || {{ rm -f {dest}; echo 'integrity check failed' >>{err}; echo 'integrity check failed' >&2; exit 1; }}; \
@@ -666,8 +668,8 @@ if [ $d = 1 ]; then mkdir -p "$t"; else cp "$s" "$t"; fi"#,
         let bin = shims(&fx.root, true);
         std::fs::create_dir_all(&fx.dest_dir).unwrap();
         std::fs::copy(&fx.stage, &fx.dest).unwrap();
-        // A broken `install` proves it was not called.
-        std::fs::write(bin.join("install"), "#!/bin/sh\nexit 9\n").unwrap();
+        // An `install` that only makes folders proves the program was not copied.
+        std::fs::write(bin.join("install"), "#!/bin/sh\n[ \"$1\" = -d ] || exit 9\nfor a; do t=$a; done; mkdir -p \"$t\"\n").unwrap();
         assert!(run_sh(&line(&fx, &fx.sha, &["guest".into()]), &bin).success());
         wait_for_file(&bin.join("launched"));
     }

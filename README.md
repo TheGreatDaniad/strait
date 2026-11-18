@@ -84,7 +84,7 @@ Yes, that is the point. Everything they do online leaves from your connection wi
 No. The host refuses every packet a guest sends to the host's own addresses: its tunnel address (10.7.0.1), its local network address and its public address. The only exception is ping to 10.7.0.1, so the guest can check the tunnel works. The rule is the same in the kernel and the userspace exit, on Linux, macOS and Windows.
 
 **Can my friend reach my printer, my NAS, my cameras or my router's settings page?**
-No. Private ranges (10/8, 172.16/12, 192.168/16), link-local addresses, multicast and every IPv6 destination are refused. Your router's public address is refused too, so your friend cannot reach its admin page or your port forwards from the outside. You can open the local network on purpose with `--allow-lan`; the app never does it for you.
+No. Private ranges (10/8, 172.16/12, 192.168/16), every network your computer sits on (also one with public addresses, as at a university or office), link-local addresses, multicast and every IPv6 destination are refused. Your router's public address is refused too, so your friend cannot reach its admin page or your port forwards from the outside. You can open the local network on purpose with `--allow-lan`; the app never does it for you.
 
 **Can my friend see or reach my other guests?**
 No. Each guest gets its own address, packets between guest addresses are refused at the host, and each session has its own keys. Even with the same shared invite, one guest cannot read another's traffic.
@@ -99,7 +99,7 @@ Not to mail servers directly: outgoing TCP port 25 is blocked, the port spam goe
 A shared invite works for anyone who has it, up to the number of guests you allow. That is why personal invites exist: one per person, each with its own id. On a host that takes personal invites only (removing someone turns this on), a personal invite works on one device at a time: a copy is refused as "full" while its owner is connected. A copy can still be used while the owner is offline, and you see it under that person's name. While the shared invite is still allowed, a personal invite also works as the shared invite.
 
 **Can I throw my friend out for good?**
-Yes. **Remove** disconnects them, withdraws their personal invite, and switches on "personal invites only" so they cannot come back with the shared invite. The removal survives restarts, and "personal invites only" stays on until you change every invite (a removed person's invite still holds the shared invite key). A removed guest's app stops trying once the host refuses it. **Change every invite** goes further: it starts a new sharing session with a new invite key, so every old invite, shared or personal, stops working. A removed person then cannot even read where you can be found.
+Yes. **Remove** disconnects them, withdraws their personal invite, and switches on "personal invites only", which also ends any session opened with the shared invite, so they cannot stay or come back with it. The removal survives restarts, and "personal invites only" stays on until you change every invite (a removed person's invite still holds the shared invite key). A removed guest's app stops trying once the host refuses it. **Change every invite** goes further: it starts a new sharing session with a new invite key, so every old invite, shared or personal, stops working. A removed person then cannot even read where you can be found.
 
 **Can my friend pretend to be me to my other guests?**
 No. Every invite names your host key, and only your device holds the private half. The handshake, the signed meeting notes and the WebSocket TLS all check it (the last two through keys derived from it for each invite), so a guest refuses anyone else.
@@ -143,7 +143,7 @@ The host learns your public IP address (the devices connect directly), when you 
 To send all your traffic through the tunnel, Strait has to change routes, which needs your password once per connection. Only the small tunnel process runs as root: it is a copy root installed and checked against the program the window staged (that stops a swap in between; it does not prove the program is genuine, which is what the password prompt approves), it receives the invite through a private file (never the command line, where other users could read it), and it writes its log only into a folder root created. The window itself stays an ordinary program on macOS and Linux.
 
 **What happens if the tunnel drops?**
-Your normal connection is used again. Strait has no kill switch yet, so in that moment your traffic leaves from your own address. While connected, IPv6 is switched off on every network adapter (Windows) or refused by routes (macOS, Linux), because the tunnel carries IPv4 only.
+Your normal connection is used again. Strait has no kill switch yet, so in that moment your traffic leaves from your own address. While connected, IPv6 is switched off on every network adapter (Windows) or refused by routes (macOS, Linux), because the tunnel carries IPv4 only, and DNS goes to 1.1.1.1 and 8.8.8.8 through the tunnel (on Linux through systemd-resolved). Refreshing keys, records and certificates never interrupts a running connection, so a game or a call keeps going.
 
 ### What can everyone else do?
 
@@ -181,6 +181,11 @@ These are known and stated in the design notes; none of them lets anyone read a 
 - **Related keys.** The meeting-note and TLS keys are derived from the host key by key blinding, and the host key's X25519 form is the handshake key. No published proof covers that exact combination.
 - **The tunnel program is not code-signed.** Root checks that its copy matches what the window staged, not that it is genuine.
 - **Fragmented replies are dropped** by the guest; ordinary DNS, TCP and QUIC avoid fragmentation.
+- **Guest meeting notes are not forward secret.** They are sealed to the host key; someone who archives them and later steals that key learns where guests connected from.
+- **One punch budget per host.** Any invite holder can use up the host's 64 addresses an hour, which stops a host behind NAT from reaching new guests until the hour ends.
+- **Signal-server registrations are not authenticated.** Someone with the invite can take the host's place there; guests then find the host through the other services.
+- **A tunnel rebuild** (new address or MTU) lets traffic out for a moment, as when Strait stops.
+- **Without systemd-resolved, Linux keeps its DNS settings,** so a resolver on the local network is reached outside the tunnel.
 - **Not tested by a person at the screen:** the macOS password prompt for the tunnel process, and the Windows window on a real desktop.
 
 More detail, layer by layer: [docs/SECURITY_MEASURES.md](docs/SECURITY_MEASURES.md).
@@ -290,10 +295,10 @@ A packet-tunnel VPN on iOS needs a paid Apple Developer team.
 
 ## Test results (AWS NAT lab)
 
-**0.7.0 security round** (same lab): every invite, exit, inbound and privilege check passes (details in the
-[release notes](https://github.com/TheGreatDaniad/strait/releases/tag/v0.7.0) and
+**0.8.0 security round** (same lab): every invite, exit, inbound and privilege check passes (details in the
+[release notes](https://github.com/TheGreatDaniad/strait/releases/tag/v0.8.0) and
 [docs/SECURITY_MEASURES.md](docs/SECURITY_MEASURES.md)); direct connections 12 of 12; through Nostr, MQTT and ntfy 17 of 20, the
-failures being WebSocket with a symmetric NAT on one side; a Windows guest reaches 282 Mbit/s. The tables below are from the
+failures being WebSocket with a symmetric NAT on one side; a Windows guest reaches 264 Mbit/s; an 18-minute game-like session (64 packets a second) across 9 key rotations, with another guest joining midway, lost no packet and never paused for more than 46 ms. The tables below are from the
 v0.4.0 run, which measured every NAT pair.
 
 Measured on AWS, not an emulator: 16 "houses" in 3 regions (Linux arm64 and Windows Server 2022), each behind its own NAT and

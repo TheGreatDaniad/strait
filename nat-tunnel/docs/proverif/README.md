@@ -2,8 +2,9 @@
 
 `strait_nkpsk0.pv` models the join (Noise `NKpsk0` with the personal-invite token in message 1)
 against an attacker who controls the network and holds the invite (the psk and `hk`), but not the
-host key or the honest guest's token. In a second phase, after every session, the attacker also
-gets the host key: this checks forward secrecy. The header of the file lists what the model leaves
+host key or the honest guest's token. The host also opens guests' rendezvous records for the
+attacker (an X25519 oracle on the host key, the same scalar as the handshake's `es`). In a second
+phase, after every session, the attacker also gets the host key: this checks forward secrecy. The header of the file lists what the model leaves
 out or simplifies.
 
 Run with ProVerif 2.05 (`opam install proverif`):

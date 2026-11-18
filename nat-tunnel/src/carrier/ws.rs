@@ -85,8 +85,24 @@ use crate::tunnel::handshake::{subkey_public, Subkey, SUBKEY_TLS};
 pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 8 * 1024;
 const MAX_PENDING_HANDSHAKES: usize = 256;
-/// Pending handshakes one source address may hold (a NAT with a few guests still fits).
+/// Pending handshakes one source network (IPv4 /24, IPv6 /64) may hold: a NAT with a few guests
+/// still fits, and one sender needs many networks to take every slot (each held up to
+/// `HEAD_TIMEOUT`).
 const MAX_PENDING_PER_IP: u8 = 8;
+
+/// The network a pending handshake counts against.
+fn pending_net(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(v) => {
+            let o = v.octets();
+            std::net::Ipv4Addr::new(o[0], o[1], o[2], 0).into()
+        }
+        std::net::IpAddr::V6(v) => {
+            let s = v.segments();
+            std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0).into()
+        }
+    }
+}
 /// Upgraded connections the host keeps at once, in all and per source IP (loopback, i.e. a
 /// reverse proxy, has no per-IP cap); extras are refused. Above `max_clients` (a u8) on purpose.
 const MAX_CONNS: usize = 256;
@@ -287,14 +303,15 @@ pub struct Identity {
     pub token: String,
     seed: [u8; 32],
     serial: [u8; 16],
-    /// The host's TLS subkey for this invite; replaces the derived seed when set.
-    subkey: Option<Arc<Subkey>>,
+    /// Host: the host key and the invite key, from which each day's TLS subkey is made; replaces
+    /// the derived seed when set.
+    host: Option<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)>,
 }
 
 impl Identity {
-    /// Use the host's TLS subkey for invite `key` instead of the derived seed.
+    /// Use the host's TLS subkeys for invite `key` instead of the derived seed.
     fn with_host_key(mut self, sk: Option<&[u8; 32]>, key: &[u8]) -> Identity {
-        self.subkey = sk.map(|sk| Arc::new(Subkey::new(sk, key, SUBKEY_TLS)));
+        self.host = sk.map(|sk| (zeroize::Zeroizing::new(*sk), key.to_vec()));
         self
     }
 
@@ -307,7 +324,7 @@ impl Identity {
         out("tls-seed", &mut seed);
         out("tls-serial", &mut serial);
         serial[0] &= 0x7f; // positive DER INTEGER
-        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial, subkey: None }
+        Identity { path: format!("/{}", hex(&p)), token: hex(&t), seed, serial, host: None }
     }
 
     /// The deterministic self-signed certificate (DER) and its signing key (PKCS#8 DER) for the
@@ -399,18 +416,65 @@ impl rustls::sign::Signer for SubkeySigner {
     }
 }
 
+/// UTC day number: the TLS subkey changes with it.
+fn utc_day() -> u32 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) / 86_400) as u32
+}
+
+/// The context of the TLS subkey for invite `key` on `day`: so a certificate does not link one
+/// host across days (or invites) for someone who only probes it.
+fn tls_context(key: &[u8], day: u32) -> Vec<u8> {
+    [key, &day.to_be_bytes()].concat()
+}
+
+/// Host: today's certificate, made with today's TLS subkey on the first handshake of the day.
+/// Only new handshakes see a new certificate; a connection already up keeps its TLS session.
+struct DailyCert {
+    id: Identity,
+    today: Mutex<Option<(u32, Arc<rustls::sign::CertifiedKey>)>>,
+}
+
+impl std::fmt::Debug for DailyCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DailyCert(..)")
+    }
+}
+
+impl DailyCert {
+    fn for_day(&self, day: u32) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let (sk, key) = self.id.host.as_ref()?;
+        let signer = SubkeySigner::new(&Arc::new(Subkey::new(sk, &tls_context(key, day), SUBKEY_TLS)));
+        let cert = self.id.self_signed(&rcgen::KeyPair::from_remote(Box::new(signer.clone())).ok()?).ok()?;
+        Some(Arc::new(rustls::sign::CertifiedKey::new(vec![cert.into()], Arc::new(signer))))
+    }
+}
+
+impl rustls::server::ResolvesServerCert for DailyCert {
+    fn resolve(&self, _hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let day = utc_day();
+        let mut g = self.today.lock().unwrap();
+        if let Some((d, ck)) = g.as_ref() {
+            if *d == day {
+                return Some(ck.clone());
+            }
+        }
+        let ck = self.for_day(day)?;
+        *g = Some((day, ck.clone()));
+        Some(ck)
+    }
+}
+
 fn server_tls(id: &Identity) -> Result<tokio_rustls::TlsAcceptor, CarrierError> {
     let tls = |e: rustls::Error| CarrierError::Failed(format!("ws: tls: {e}"));
     let b = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(tls)?
         .with_no_client_auth();
-    let mut c = match &id.subkey {
-        Some(sub) => {
-            let signer = SubkeySigner::new(sub);
-            let cert = id.self_signed(&rcgen::KeyPair::from_remote(Box::new(signer.clone())).map_err(cert_err)?)?;
-            let ck = rustls::sign::CertifiedKey::new(vec![cert.into()], Arc::new(signer));
-            b.with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(ck)))
+    let mut c = match &id.host {
+        Some(_) => {
+            let daily = DailyCert { id: id.clone(), today: Mutex::new(None) };
+            daily.for_day(utc_day()).ok_or_else(|| CarrierError::Failed("ws: certificate: cannot make the TLS subkey's certificate".into()))?;
+            b.with_cert_resolver(Arc::new(daily))
         }
         None => {
             let (cert, key) = id.cert()?;
@@ -464,11 +528,11 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
 }
 
 /// Client check when the invite names the host key: the certificate's contents do not matter, the
-/// TLS 1.3 handshake signature must verify under the host's TLS subkey for this invite (so the
-/// server holds the host key).
+/// TLS 1.3 handshake signature must verify under the host's TLS subkey for this invite and
+/// yesterday, today or tomorrow (clocks and midnight) (so the server holds the host key).
 #[derive(Debug)]
 struct HostKeyVerifier {
-    subkey: [u8; 32],
+    subkeys: Vec<[u8; 32]>,
 }
 
 impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
@@ -498,7 +562,7 @@ impl rustls::client::danger::ServerCertVerifier for HostKeyVerifier {
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         let sig: Option<&[u8; 64]> = d.signature().try_into().ok();
         match sig {
-            Some(sig) if d.scheme == rustls::SignatureScheme::ED25519 && crate::tunnel::handshake::verify_sig(&self.subkey, m, sig) => {
+            Some(sig) if d.scheme == rustls::SignatureScheme::ED25519 && self.subkeys.iter().any(|k| crate::tunnel::handshake::verify_sig(k, m, sig)) => {
                 Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
             }
             _ => Err(rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature)),
@@ -519,8 +583,13 @@ fn client_tls(cfg: &Cfg, id: &Identity) -> Result<tokio_rustls::TlsConnector, Ca
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         b.with_root_certificates(roots).with_no_client_auth()
     } else if let Some(hk) = cfg.tls_hk {
-        let subkey = subkey_public(&hk, &cfg.key, SUBKEY_TLS).ok_or_else(|| CarrierError::Failed("ws: the invite's host key is not valid".into()))?;
-        b.dangerous().with_custom_certificate_verifier(Arc::new(HostKeyVerifier { subkey })).with_no_client_auth()
+        let today = utc_day();
+        let subkeys = [today.wrapping_sub(1), today, today.wrapping_add(1)]
+            .iter()
+            .map(|&d| subkey_public(&hk, &tls_context(&cfg.key, d), SUBKEY_TLS))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| CarrierError::Failed("ws: the invite's host key is not valid".into()))?;
+        b.dangerous().with_custom_certificate_verifier(Arc::new(HostKeyVerifier { subkeys })).with_no_client_auth()
     } else {
         let want = id.cert()?.0;
         b.dangerous()
@@ -897,7 +966,7 @@ pub async fn listen_ws(spec: &CarrierSpec) -> Result<WsCarrier, CarrierError> {
             let slot = if ip.is_loopback() {
                 None
             } else {
-                match by_ip.take(ip) {
+                match by_ip.take(pending_net(ip)) {
                     Some(sl) => Some(sl),
                     None => continue,
                 }
@@ -1188,23 +1257,23 @@ mod pending_tests {
         assert_eq!(a.pin_hex(), b.pin_hex());
     }
 
-    /// The host's certificate carries its TLS subkey for this invite, never the host key, and the
-    /// key changes with the invite (so certificates do not link a host across invites).
+    /// The host's certificate carries its TLS subkey for this invite and day, never the host key,
+    /// and the key changes with the invite and the day (so certificates do not link a host across
+    /// invites or days).
     #[test]
-    fn host_certificate_is_a_per_invite_subkey() {
+    fn host_certificate_is_a_per_invite_per_day_subkey() {
         let sk = crate::tunnel::handshake::new_host_key();
         let hk = crate::tunnel::handshake::public_of(&sk);
-        let der = |invite: &[u8]| {
-            let id = Identity::derive(invite).with_host_key(Some(&sk), invite);
-            let signer = SubkeySigner::new(id.subkey.as_ref().unwrap());
-            (id.self_signed(&rcgen::KeyPair::from_remote(Box::new(signer.clone())).unwrap()).unwrap(), signer.public)
+        let der = |invite: &[u8], day: u32| {
+            let daily = DailyCert { id: Identity::derive(invite).with_host_key(Some(&sk), invite), today: Mutex::new(None) };
+            daily.for_day(day).unwrap().cert[0].as_ref().to_vec()
         };
-        let (a, pa) = der(b"invite-a");
-        let (b, pb) = der(b"invite-b");
+        let key = |invite: &[u8], day: u32| subkey_public(&hk, &tls_context(invite, day), SUBKEY_TLS).unwrap();
         let has = |c: &[u8], k: &[u8; 32]| c.windows(32).any(|w| w == k);
-        assert!(has(&a, &pa) && has(&b, &pb) && pa != pb);
-        assert!(!has(&a, &hk) && !has(&b, &hk));
-        assert_eq!(Some(pa), subkey_public(&hk, b"invite-a", SUBKEY_TLS));
+        let (a, b, a2) = (der(b"invite-a", 20_000), der(b"invite-b", 20_000), der(b"invite-a", 20_001));
+        assert!(has(&a, &key(b"invite-a", 20_000)) && has(&b, &key(b"invite-b", 20_000)) && has(&a2, &key(b"invite-a", 20_001)));
+        assert!(key(b"invite-a", 20_000) != key(b"invite-b", 20_000) && key(b"invite-a", 20_000) != key(b"invite-a", 20_001));
+        assert!(!has(&a, &hk) && !has(&b, &hk) && !has(&a2, &hk));
     }
 }
 

@@ -1278,7 +1278,7 @@ fn addr4(b: &[u8]) -> [u8; 4] {
 /// None for a malformed header.
 fn l4(p: &[u8]) -> Option<(u8, usize, u16)> {
     let ihl = ((*p.first()? & 0x0f) as usize) * 4;
-    (p.len() >= 20 && ihl >= 20 && p.len() >= ihl).then(|| (p[9], ihl, u16::from_be_bytes([p[6], p[7]]) & 0x3fff))
+    (p.len() >= 20 && p[0] >> 4 == 4 && ihl >= 20 && p.len() >= ihl).then(|| (p[9], ihl, u16::from_be_bytes([p[6], p[7]]) & 0x3fff))
 }
 
 impl GuestInbound {
